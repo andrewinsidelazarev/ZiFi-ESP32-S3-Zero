@@ -2,7 +2,6 @@
 .to-delete/
 .pio/
 .test-build/
-Build/
 baselines/
 
 # Python & OS artifacts
@@ -17,9 +16,10 @@ __pycache__/
 /smb-*.txt
 /zifi-*.txt
 
-# Assembler listings and symbols (binaries .WMF and .sna are tracked)
+# Assembler listings and symbols (binaries .WMF, .spg, and .sna are tracked)
 *.lst
 *.sym
+*.l
 
 # KiCad temporary & backup files
 *.kicad_prl
