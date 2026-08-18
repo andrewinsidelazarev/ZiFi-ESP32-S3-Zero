@@ -3456,39 +3456,6 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     return 0;
   }
 
-  // Финальный READ подтверждает весь сетевой запрос. Промежуточный
-  // STATUS_PENDING здесь намеренно не отправляется: он немедленно возвращал
-  // Windows кредит, Explorer накапливал около пяти запросов и долго держал
-  // индикатор на нуле.
-  // Windows CopyFile не повторяет хвост короткого успешного READ: аппаратная
-  // проверка оставляла только 16 352 байта на каждый 256-КиБ блок файла.
-  const bool needsAsync = wanted >= physicalWindow ||
-                          self->asyncReadCount != 0 ||
-                          offset != handle->position;
-  if (needsAsync) {
-    const uint64_t messageId = smb2_get_last_request_message_id(smb2);
-    if (messageId == 0) {
-      return replyStatus(smb2, SMB2_READ,
-                         SMB2_STATUS_INSUFFICIENT_RESOURCES);
-    }
-    const int asyncIndex = self->allocateAsyncRead();
-    if (asyncIndex < 0) {
-      return replyStatus(smb2, SMB2_READ,
-                         SMB2_STATUS_INSUFFICIENT_RESOURCES);
-    }
-    AsyncRead& pending = self->asyncReads[asyncIndex];
-    pending.used = true;
-    pending.context = smb2;
-    pending.messageId = messageId;
-    pending.slot = slot;
-    pending.generation = handle->generation;
-    pending.offset = offset;
-    pending.length = wanted;
-    pending.lastProgressMs = millis();
-    ++self->asyncReadCount;
-    self->pollAsyncRead();
-    return 1;
-  }
   if (!self->activateRead(slot, offset)) {
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_IO_DEVICE_ERROR);
   }
