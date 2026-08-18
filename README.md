@@ -45,6 +45,7 @@ WebDAV ещё не включён. Сетевой файловый listener за
 | **Первая прошивка (USB)** | [**`firmware.factory.bin`**](firmware/firmware.factory.bin) | Полный 4 МБ образ для первой прошивки ESP32-S3 через USB Type-C (смещение `0x0`) |
 | **Обновление по Wi-Fi (OTA)** | [**`firmware.bin`**](firmware/firmware.bin) | Образ приложения для сетевого обновления ([SHA-256](firmware/firmware.sha256)) |
 | **Сетевой апдейтер** | [**`update.sna`**](firmware/update.sna) | Snapshot для ZX-Evolution, запускающий приём OTA-обновления |
+| **Скрипт-прошивальщик (OTA)** | [**`esp_tool.py`**](tools/esp_tool.py) | Python-утилита для прошивки ESP32-S3 по Wi-Fi и выгрузки логов |
 | **SMB-сервер (Windows)** | [**`ZIFISMB.WMF`**](SMB%20Server/build/ZIFISMB.WMF) | Плагин Wild Commander: доступ к SD-карте по сети `\\ZX-Evo\SD` |
 | **FTP-сервер** | [**`ZIFIFTP.WMF`**](FTP%20Server/build/ZIFIFTP.WMF) | Плагин Wild Commander: полнофункциональный FTP-сервер |
 | **Синхронизация времени** | [**`NTPTIME.WMF`**](NTP%20Time%20Sync/build/NTPTIME.WMF) | Плагин Wild Commander: синхронизация часов RTC через интернет |
