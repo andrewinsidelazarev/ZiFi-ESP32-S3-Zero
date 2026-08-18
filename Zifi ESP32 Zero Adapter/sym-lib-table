@@ -1,0 +1,5 @@
+(sym_lib_table
+  (lib (name "ZifiAdapter")(type "KiCad")
+    (uri "${KIPRJMOD}/Libraries/Symbols/ZifiAdapter.kicad_sym")
+    (options "")(descr "ZiFi ESP32-S3-Zero adapter symbols"))
+)

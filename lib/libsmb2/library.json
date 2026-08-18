@@ -1,0 +1,26 @@
+{
+  "name": "libsmb2-zifi",
+  "version": "6.1.0",
+  "description": "Зафиксированная копия libsmb2 с серверной частью для ZiFi",
+  "build": {
+    "srcDir": "lib",
+    "includeDir": "include",
+    "srcFilter": [
+      "+<*.c>",
+      "-<aes_apple.c>",
+      "-<krb5-wrapper.c>"
+    ],
+    "flags": [
+      "-Iinclude/smb2",
+      "-Iinclude/esp",
+      "-DESP_PLATFORM",
+      "-DHAVE_CONFIG_H",
+      "-DNEED_READV",
+      "-DNEED_WRITEV",
+      "-DNEED_GETLOGIN_R",
+      "-DNEED_RANDOM",
+      "-DNEED_SRANDOM",
+      "-D_U_=__attribute__((unused))"
+    ]
+  }
+}

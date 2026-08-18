@@ -1,0 +1,30 @@
+# Local trash & intermediate build directories
+.to-delete/
+.pio/
+.test-build/
+Build/
+baselines/
+
+# Python & OS artifacts
+__pycache__/
+*.py[cod]
+*.etl
+*.pcapng
+*.cab
+*.log
+*.tmp
+*.bak
+/smb-*.txt
+/zifi-*.txt
+
+# Assembler listings and symbols (binaries .WMF and .sna are tracked)
+*.lst
+*.sym
+
+# KiCad temporary & backup files
+*.kicad_prl
+*-backups/
+*.kicad_sch-bak
+*.kicad_pcb-bak
+~*.lck
+

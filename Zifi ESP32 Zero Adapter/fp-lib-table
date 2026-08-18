@@ -1,0 +1,5 @@
+(fp_lib_table
+  (lib (name "ZifiAdapter")(type "KiCad")
+    (uri "${KIPRJMOD}/Libraries/Footprints/ZifiAdapter.pretty")
+    (options "")(descr "ZiFi ESP32-S3-Zero adapter footprints"))
+)
