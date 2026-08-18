@@ -1,0 +1,4505 @@
+	device zxspectrum128
+
+;; temp pages:
+splash_gfx_page		equ #20
+Gfx_vid_page		equ #c0
+menu_gfx_page		equ #d0
+highlight_menu_page	equ #d1
+Text_page		equ #d8
+Vid_page		equ #e0
+Sprite_page		equ #f0
+Mouse_pal_num		equ #f0
+
+sd_driver_page		equ #0f
+cursor_adr		equ #c000
+cursor_page		equ #10	
+
+music_players_page	equ 3
+music_page		equ #1d	; 2 pages for music
+list_ram_page		equ #1f
+download_page		equ #20	; allocate #28 pages for 640rb TRD
+
+get_buffer		equ #4000
+window_height		equ #0d
+window_start_Yl		equ #0100
+window_start_Y		equ high window_start_Yl
+
+bigbuff			equ #c000
+
+download_sites		equ 1
+gfx_sites		equ 2
+music_sites		equ 3
+press_sites		equ 4
+highlight_size		equ 1408
+search_textpage_adr	equ #0108
+		
+do_nothing		equ 0
+view_downloaded_list	equ 1
+view_text		equ 2
+save_file		equ 3
+play_music		equ 4
+view_gfx		equ 5
+
+start_paging_page	equ 1
+analizator_screen_adr	equ #c2e0-4
+progress_bar_screen_adr	equ #0012
+
+
+		org #8000
+start
+//		call write_rtc
+		ld sp,#bfff
+		call all_init
+ 		call set_256c_mode		
+		call sd_init
+		ei
+ 		ld b,60
+ 		call wait
+		; В оригинале int_main включался раньше очистки Text_page. Если прерывание
+		; попадало в это короткое окно, текстовый экран на один кадр показывал
+		; старое содержимое RAM — тот самый случайный мусор перед сообщениями.
+		di
+ 		call gfx_init
+		call set_text_colors
+		ld hl,int_main
+		ld (#beff),hl
+		ei
+		call load_ini
+		call init_zifi
+		ld a,(mouse_button)
+		cpl
+		and #f0
+		ld (wheel_old+1),a
+		; Текущая дата нужна каталогу загрузок всегда. Поле time:none запрещает
+		; только запись RTC; запрос NTP и каталог ГГГГ-ММ-ДД остаются рабочими.
+		call sync_clock
+		call set_Textpage
+		ld hl,ready_message
+		ld b,1
+		call zifi_echo
+main
+sites_sw	ld a,0
+		or a
+		call nz,sites_list	; показать список сайтов для раздела
+
+load_sw		ld a,0
+		or a
+		jp z,main_ex
+		call modem_load_file
+	
+		ld a,(do_after_load+1)
+		cp save_file
+		jr c,do_after_load
+		call create_filename
+do_after_load	ld a,0
+		cp save_file
+		jr c,1f
+		push af
+		call save_downloaded_file
+		pop af
+1		cp view_downloaded_list
+		call z,create_link_list
+		cp view_text
+		call z,text_view
+		cp play_music
+		call z,music_loaded
+		cp view_gfx
+		call z,view_image
+
+main_ex		call wait_frame
+
+do_start_music	ld a,1
+		or a
+		call z,music_init
+
+; off music before loading new music file
+do_init_music	ld a,0
+		or a
+		jr z,main
+		call music_init
+		xor a
+		ld (music_sw+1),a
+		ld (is_music_play+1),a
+		ld (do_init_music+1),a
+		jp main
+
+; Синхронизация часов. Время даёт прошивка командой NET_NTP: она сама ходит к
+; серверам точного времени и сама применяет смещение из поля time: файла
+; zifi.ini.
+;
+; Самообновление с zifi.vtrd.in удалено намеренно. Оттуда оригинал брал заодно и
+; дату, но лежит там оригинальная AT-версия zifi.spg: её установка затёрла бы
+; этот порт программой, не работающей с нашей Native C++ прошивкой. И проверять
+; там версию нашего порта тем более нечего.
+sync_clock	ld hl,msg_time_query
+		ld b,1
+		call zifi_echo
+		call Net_GetTime
+		jr c,sync_clock_failed
+
+		; Разложить ГГГГММДДЧЧММСС так, как читает write_rtc. Имя каталога
+		; строится отдельно: RTC ждёт ДД_ММ_ГГГГ, а для алфавитной сортировки
+		; загрузок нужен порядок ГГГГ-ММ-ДД.
+		ld a,download_page
+		call set_page1
+		ld hl,ProtoBuf
+		ld de,get_buffer+4
+		call ntp_to_rtc_layout
+		ld hl,ProtoBuf
+		ld de,DIR_date+1
+		call ntp_to_download_dir
+
+		; time:none не мешает создать датированный каталог, но часы пользователя
+		; в этом режиме трогать нельзя.
+		ld a,(update_rtc_sw+1)
+		or a
+		jr z,sync_clock_directory_ready
+
+		; Смещение GMT прошивка уже применила: прибавить его второй раз
+		; значит увезти часы на две зоны.
+		xor a
+		ld (gmt_time+1),a
+		call write_rtc
+		call set_Textpage
+		ld hl,msg_time_set
+		ld b,1
+		call zifi_echo
+
+sync_clock_directory_ready
+		jp set_download_dir
+
+sync_clock_failed
+		call set_Textpage
+		ld hl,msg_time_failed
+		ld b,1
+		call zifi_echo
+		jp set_download_dir
+
+; ГГГГММДДЧЧММСС (HL) -> ДД_ММ_ГГГГЧЧММ (DE): именно такой порядок разбирает
+; write_rtc. Формат каталога намеренно формируется другой процедурой ниже.
+ntp_to_rtc_layout
+		push hl
+		ld bc,6
+		add hl,bc
+		ldi			; ДД
+		ldi
+		ld a,"_"
+		ld (de),a
+		inc de
+		pop hl
+		push hl
+		ld bc,4
+		add hl,bc
+		ldi			; ММ
+		ldi
+		ld a,"_"
+		ld (de),a
+		inc de
+		pop hl
+		push hl
+		ldi			; ГГГГ
+		ldi
+		ldi
+		ldi
+		pop hl
+		ld bc,8
+		add hl,bc
+		ldi			; ЧЧ
+		ldi
+		ldi			; ММ
+		ldi
+		ret
+
+; ГГГГММДДЧЧММСС (HL) -> ГГГГ-ММ-ДД,0 (DE). Год стоит первым, поэтому обычная
+; алфавитная сортировка каталогов одновременно является сортировкой по дате.
+ntp_to_download_dir
+		ld bc,4
+		ldir			; ГГГГ
+		ld a,"-"
+		ld (de),a
+		inc de
+		ld bc,2
+		ldir			; ММ
+		ld a,"-"
+		ld (de),a
+		inc de
+		ld bc,2
+		ldir			; ДД
+		xor a
+		ld (de),a
+		ret
+
+; Флаг из поля time: файла zifi.ini: ноль — часы не трогать. Обращение идёт по
+; смещению +1, как было у самомодифицирующегося «ld a,0» в прежнем autoupdate.
+update_rtc_sw	ds 1
+		db 0
+
+; В консоли — то, что произошло на самом деле: какая команда ушла прошивке и
+; чем она ответила. Ни одной «проверки обновлений»: порт за ними не ходит.
+banner_msg		db "ZiFi 0.733 Native C++ ESP8266",0,0
+wifi_send_ini_msg	db "zifi.ini sent to ESP, it joins Wi-Fi",0,0
+wifi_connected		db "ESP reports Wi-Fi up",0,0
+wifi_failed_msg		db "ESP reports Wi-Fi down",0,0
+esp_silent_msg		db "ESP does not answer PING",0,0
+msg_time_query		db "Asking ESP for NTP time",0,0
+msg_time_set		db "Clock set from NTP",0,0
+msg_time_failed		db "No NTP time from ESP, clock kept",0,0
+ready_message		db "Startup finished, menu active",0,0
+
+
+
+; Разбор hex-строки и подсчёт CRC16 удалены вместе с самообновлением: они
+; проверяли контрольную сумму файла, который приходил с zifi.vtrd.in.
+
+create_filename			; and check extension for scl scr sxg others
+		; Имя файла берётся из пути запроса. Раньше он выковыривался из
+		; готового текста «GET … HTTP/1.0» отсчётом тринадцати байт назад;
+		; теперь путь лежит отдельной строкой с нулём.
+		ld hl,request_path
+1		ld a,(hl)
+		or a
+		jr z,1f
+		inc hl
+		jr 1b
+1		dec hl
+1		ld a,(hl)			; check  \ / : * ? " < > |
+		cp "\\"
+		jr z,1f
+		cp "/"
+		jr z,1f
+		cp ":"
+		jr z,1f
+		cp "*"
+		jr z,1f
+		cp "?"
+		jr z,1f
+		dec hl
+		jr 1b
+1
+		inc hl		
+		ld de,FILE_NAME		; file_name create
+2		ld a,(hl)
+		or a			; путь кончается нулём, а не пробелом
+		jr z,1f
+		cp ' '
+		jr z,1f
+		ld (de),a
+		inc hl
+		inc de
+		jr 2b
+
+1		
+		xor a
+		ld (de),a
+
+		; Просмотрщик ждёт указатель на первую букву расширения: для .sxg
+		; затем проверяет 'x', а для .scr — 'r'. После перехода с готовой
+		; строки HTTP на request_path здесь по ошибке сохранялся указатель на
+		; завершающий ноль, поэтому файл записывался, но view_image сразу
+		; возвращался. Ищем последнюю точку уже в готовом имени — это также
+		; работает, когда сервер заменяет расширение префиксом .xxx.
+		ld hl,FILE_NAME
+		ld (ix+thread.file_ext),hl	; безопасное значение, если точки нет
+create_filename_find_ext
+		ld a,(hl)
+		or a
+		jr z,create_filename_ext_ready
+		inc hl
+		cp "."
+		jr nz,create_filename_find_ext
+		ld (ix+thread.file_ext),hl
+		jr create_filename_find_ext
+create_filename_ext_ready
+
+		ld a,(ix+thread.page)	; check unzip extension
+		call set_page1
+		ld hl,(ix+thread.adress)
+		ld a,"."
+		cp (hl)
+		ret nz
+		inc hl
+1		dec de
+		ld a,(de)
+		cp '.'
+		jr nz,1b
+		inc de
+		ld b,3
+1		ld a,(hl)
+		ld (de),a
+		inc hl
+		inc de
+		djnz 1b
+		xor a
+		ld (de),a
+		ld (ix+thread.adress),hl
+
+; all lenght - 4bytes of extension
+		ld a,(ix+thread.full_len_high)	; a - high 16bit lenght
+		ld hl,(ix+thread.full_len)	; hl - low 16bit lenght
+		ld de,4
+		or a
+		sbc hl,de
+		sbc a,0
+		ld (ix+thread.full_len_high),a	; a - high 16bit lenght
+		ld (ix+thread.full_len),hl	; hl - low 16bit lenght
+		ret
+
+/*
+Address         Mode Name Description
+0x00EF..0xBFEF  R    DR   Data register. Get byte from input FIFO. Input FIFO must not be empty (IFR > 0).
+0x00EF..0xBFEF  W    DR   Data register. Put byte into output FIFO. Output FIFO must not be full (OFR > 0).
+
+Address Mode Name Description
+0xC0EF  R    IFR  Input FIFO Used Register. 0 - input FIFO is empty, 255 - input FIFO is full.
+0xC1EF  R    OFR  Output FIFO Free Register. 0 - output FIFO is full, 255 - output FIFO is empty.
+
+Address Mode Name Description
+0xC7EF  W    CR   Command register. Command set depends on API mode selected.
+*/
+modem_load_file
+		xor a
+		ld (pause_music+1),a
+		ld l,a
+		ld h,a
+		ld ix,read_threads
+		ld (ix+thread.full_len),hl
+		ld (ix+thread.full_len_high),a
+		ld a,(do_after_load+1)
+		cp play_music
+		jr nz,1f
+		ld a,(is_music_play+1)
+		or a
+		jr z,1f
+		call set_music_pages
+		call music_player_mute
+		call restore_music_pages
+		xor a
+		ld (music_sw+1),a
+		ld (is_music_play+1),a
+		ld (do_init_music+1),a
+
+1		
+; show link
+;		ld hl,cmd_conn2site_adr
+;		ld de,#1e00		; show link
+;		call show_line_get_buffer
+;		ld hl,modem_command
+;		ld de,#1000		; show link
+;		call show_line_get_buffer
+load_ram_page	ld a,0
+		ld (clr_load_mem1+1),a
+		ld (clr_load_mem2+1),a
+		call set_page3
+		call off_int_dma
+		ld hl,0
+		ld (#c000),hl
+		ld hl,clr_load_mem
+		call set_ports
+		ld de,download_icon
+		call set_icon
+		ld hl,cancel_icon_copy
+		call set_ports
+		call on_int_dma
+		ld hl,progress_bar_screen_adr-1
+		ld (progress_bar+1),hl
+		ld b,4
+		call view_progress_bar
+
+; добавляем строку поиска первой и устанавливаем адрес загрузки после неё
+		ld hl,#0000			; main download adress
+
+		ld a,(do_after_load+1)
+		cp view_downloaded_list
+		jr nz,1f
+		ld a,download_page
+		call set_page0_lite
+		ld de,0
+		ld bc,list_search_db_end-list_search_db
+		ld hl,list_search_db
+		ldir
+		ex de,hl			; download adress for lists. after "Search:"
+1		ld (zipd_adr+1),hl
+
+		call zifi_get
+
+
+; bc: hl - lenght of readed data
+		ld ix,read_threads
+		ld a,c
+		ld (ix+thread.full_len_high),a	; bc - high 16bit lenght
+		ld (ix+thread.full_len),hl	; hl - low 16bit lenght
+		or h
+		or l
+		jr nz,1f
+;		ld a,do_nothing
+		ld (do_after_load+1),a		; do NOTHING
+
+1		xor a
+		ld (ix+thread.num),a
+		ld a,(load_ram_page+1)
+		ld (ix+thread.page),a
+		call set_page1
+		ld hl,status_copy		; clear statusbar gfx
+		call set_ports
+		xor a
+		ld (load_sw+1),a
+		ld hl,get_buffer
+		ld (ix+thread.adress),hl	; адрес данных ZiFi без заголовков
+		ld a,(do_after_load+1)
+		cp view_downloaded_list
+		ret nz
+
+		call off_int_dma
+		ld hl,link_page_copy		; copy donwloaded list to list_page
+		call set_ports
+		jp on_int_dma
+
+
+; Скачать файл.
+; Вход:  cmd_conn2site_adr — адрес сервера, request_path — путь на нём,
+;        load_ram_page — первая страница приёмника, zipd_adr — смещение в ней.
+; Выход: C — старший байт длины, HL — младшие 16 бит (как и было в оригинале).
+;
+; Подключение, текст запроса и отбрасывание заголовка HTTP делает ESP одной
+; командой NET_HTTP_GET. Z80 остаётся забирать тело порциями и раскладывать его
+; по страницам — ни склейки запроса, ни посимвольного поиска CR/LF/CR/LF.
+zifi_get	call wait_frame
+		ld a,(load_ram_page+1)
+		ld (zipd_page+1),a
+		call set_page0
+		inc a
+		call set_page1
+		ld hl,0
+		ld (readed_len_low+1),hl
+		xor a
+		ld (readed_len_high+1),a
+
+		call Net_HttpGet
+		jr c,zifi_get_open_failed
+		or a
+		jr z,zifi_get_open_failed
+
+; Тянуть данные, пока сервер не закроет соединение.
+zifi_get_pump	call Net_Recv
+		jr c,zifi_get_recv_failed	; молчание/ошибка прошивки — обрыв
+		or a
+		jr nz,zifi_get_done	; сервер закрыл соединение
+		ld bc,(NetChunkLen)
+		ld a,b
+		or c
+		jr z,zifi_get_pump	; данных пока нет, спросим ещё раз
+		ld hl,ProtoBuf+1	; после байта признака конца
+
+; store_body_byte сохраняет HL/DE/BC, поэтому цикл обходится без стека.
+zifi_get_store	ld a,(hl)
+		call store_body_byte
+		inc hl
+		dec bc
+		ld a,b
+		or c
+		jr nz,zifi_get_store
+
+		ld hl,(NetChunkLen)
+		ld b,h
+		call view_progress_bar
+		jr zifi_get_pump
+
+zifi_get_open_failed
+		ld hl,net_open_failed_msg
+		jr zifi_get_failed
+zifi_get_recv_failed
+		ld hl,net_recv_failed_msg
+
+; Ошибка остаётся видна во встроенной консоли zifi.spg. Если ESP прислал
+; Ошибка остаётся видна во встроенной консоли zifi.spg: под названием операции
+; печатается её причина.
+zifi_get_failed
+		ld b,1
+		call zifi_log
+		call net_report_reason
+		call Net_Close
+		jr zifi_get_return
+
+; Причина отказа: если ESP присылала пакет #EE, печатается её текст, например
+; "recv:104"; иначе спрашиваем GET_STEP — метку шага, на котором встал
+; обработчик. Один код на все операции: подключение, передача, приём и пинг
+; докладывают одинаково, и «висит без объяснений» не бывает.
+net_report_reason
+		ld a,(ProtoErr)
+		or a
+		jr nz,.show_error
+		call Net_GetStep
+		jr nc,.step_reply
+		ld hl,net_diag_no_reply_msg
+		ld b,1
+		jp zifi_log
+.step_reply
+		ld a,(ProtoErr)
+		or a
+		jr nz,.show_error
+		ld hl,net_diag_empty_msg
+		ld b,1
+		jp zifi_log
+.show_error
+		ld hl,ProtoErrText
+		ld b,1
+		jp zifi_log
+
+zifi_get_done	call Net_Close
+		ld a,(readed_len_high+1)
+		or a
+		jr nz,zifi_get_return
+		ld hl,(readed_len_low+1)
+		ld a,h
+		or l
+		jr nz,zifi_get_return
+		ld hl,net_empty_body_msg
+		ld b,1
+		call zifi_log
+zifi_get_return	ld a,(readed_len_high+1)
+		ld c,a
+		ld hl,(readed_len_low+1)
+		ret
+
+net_open_failed_msg	db "HTTP request failed",0,0
+net_recv_failed_msg	db "NET_RECV failed",0,0
+net_empty_body_msg	db "NET EOF: empty HTTP body",0,0
+net_diag_no_reply_msg	db "GET_STEP: no reply",0,0
+net_diag_empty_msg	db "GET_STEP: no error text",0,0
+
+; Во время загрузки PAGE0 занят страницей файла. Обычный zifi_echo писал бы
+; сообщение именно туда, а не в видимую консоль. Временно подключаем текстовую
+; страницу без изменения сохранённого номера PAGE0 и обязательно возвращаем
+; страницу загрузки после печати. set_Textpage_lite загружает порт PAGE0 в BC,
+; поэтому B (число печатаемых строк) нужно сохранить: иначе print шёл дальше
+; нулевого конца строки и показывал соседние сообщения и машинный код.
+zifi_log
+		push bc
+		call set_Textpage_lite
+		pop bc
+		call zifi_echo
+		jp restore_page0
+
+
+
+; Положить байт тела файла в страничную память и увеличить счётчик принятого.
+; Разбор заголовка HTTP отсюда убран: его отбрасывает ESP, и до Z80 доходит
+; только тело. Раньше здесь работал автомат поиска CR/LF/CR/LF на четыре
+; состояния — почти сотня строк, каждая со своим поводом ошибиться.
+; Регистры HL/DE/BC сохраняются, поэтому цикл вызова обходится без стека.
+store_body_byte
+		push hl
+		push de
+		push bc
+		ld hl,(zipd_adr+1)
+		ld (hl),a
+		inc hl
+		ld a,h
+		cp #40
+		jr c,store_body_address
+		sub #40
+		ld h,a
+		ld a,(zipd_page+1)
+		inc a
+		ld (zipd_page+1),a
+		call set_page0
+		inc a
+		call set_page1
+store_body_address
+		ld (zipd_adr+1),hl
+
+		ld hl,(readed_len_low+1)
+		inc hl
+		ld (readed_len_low+1),hl
+		ld a,h
+		or l
+		jr nz,store_body_done
+		ld a,(readed_len_high+1)
+		inc a
+		ld (readed_len_high+1),a
+
+store_body_done
+		pop bc
+		pop de
+		pop hl
+		ret
+
+
+wifi_cancel_download_ex
+		ld sp,#bfff
+		xor a
+		ld (load_sw+1),a
+		ld (wifi_cancel_download+1),a
+		ld hl,status_copy		; clear statusbar gfx
+		call set_ports
+		jp main
+
+
+
+zifi_echo	ld de,#1000
+		call print
+		ld a,d
+		cp 24
+		jr c,1f
+		ld hl,text_up_copy
+		call set_ports
+		ld hl,24*256
+		call clear_text_line
+		ld a,22
+1		ld (zifi_echo+2),a
+		ret
+
+print		ld a,(hl)
+		cp #ff
+		ret z
+		ld a,b
+		or a
+		jr nz,1f
+		ld b,1
+1		push de
+print1		ld a,(hl)
+		inc hl
+		cp #0d+1
+		jr c,print2
+		ld (de),a
+		inc de
+		jr print1 
+
+print2		ld a,(hl)
+		cp #0d+1
+		jr nc,1f
+		inc hl
+1		pop de
+		inc d
+		djnz print
+		ret
+
+
+; Флаг отмены закачки: взводится кнопкой Cancel, проверяется в ожидании
+; ответа прошивки. Смещение +1 сохранено от оригинала — там это был операнд
+; самомодифицирующегося «ld a,0» внутри ожидания байта из очереди.
+wifi_cancel_download	ds 1
+			db 0
+
+
+
+
+
+
+set_icon	ld a,e
+		ld (status_icon_copy+1),a
+		ld a,d
+		ld (status_icon_copy+3),a
+		ld hl,status_icon_copy
+		jp set_ports
+
+wait		call wait_frame
+		djnz wait
+		ret
+
+view_progress_bar
+		ld a,b
+		or a
+		ret z
+		
+		push hl
+		push bc
+		push bc
+		ld a,Vid_page+9
+		call set_page0_lite
+		pop bc
+progress_bar	ld hl,0
+		inc hl
+		bit 7,l
+		jr z,1f
+		ld l,low progress_bar_screen_adr
+		ld a,(progress_bar_color+1)
+		xor #18
+		ld (progress_bar_color+1),a
+1		ld (progress_bar+1),hl
+progress_bar_color
+		ld a,#74
+		ld (hl),0
+		inc h
+		inc h
+		dup 3
+		ld (hl),a
+;		inc l
+;		ld (hl),a
+;		dec l
+		inc h
+		inc h
+		edup
+		ld (hl),0
+		inc h
+		inc h
+		djnz progress_bar
+		call restore_page0
+		pop bc
+		pop hl
+		ret
+
+
+
+
+/*
++#0000 #04 #7f+"SXG" - 4 байта сигнатура, что это формат файла SXG
++#0004 #01 1 байт версия формата
++#0005 #01 1 байт цвет фона (используется для очистки)
++#0006 #01 1 байт тип упаковки данных (#00 - данные не пакованы)
++#0007 #01 1 байт формат изображения (1 - 16ц, 2 - 256ц)
++#0008 #02 2 байта ширина изображения
++#000a #02 2 байта высота изображения
+
+(далее указываются смещения, для того, что бы можно было расширить заголовок)
++#000c #02 смещение от текущего адреса до начала данных палитры
++#000e #02 смещение от текущего адреса до начала данных битмап
+Собственно начало данных палитры +#0010 #0200 512 байт палитра
+и начало данных битмап +#0210 #xxxx данные битмап
+*/
+
+init_view_image	
+		ld hl,int_gfx_view
+		ld (#beff),hl
+		xor a
+		ld bc,VSINTL
+		out (c),a
+		inc b
+		out (c),a
+		jp wait_frame
+
+view_image	ld ix,read_threads
+		ld a,(ix+thread.page)
+		call set_page1
+		ld a,Gfx_vid_page
+		call set_page3
+
+		ld hl,(ix+thread.file_ext)
+		inc hl
+		ld a,"x"		; sxg / scr
+		cpi
+		jr z,view_sxg_image
+		ld a,"r"
+		cpi 
+		ret nz
+
+view_scr_image		
+		ld hl,(ix+thread.adress)
+		ld de,#c000
+		ld bc,#1b00
+		ldir
+		call init_view_image
+		xor a
+		ld (gfx_vmode+1),a
+		ld (gfx_border+1),a
+		ld a,#0f
+		ld (gfx_vpal+1),a	; palsel
+		jp show_gfx
+
+
+; ----- SXG viewer -------------
+
+view_sxg_image	call init_view_image
+		ld hl,(ix+thread.adress)
+		ld de,5
+		add hl,de
+		push hl
+		ld a,(hl)	; background? #4005
+		ld l,a
+		ld h,a
+		ld (gfx_border+1),a
+		ld (#c000),hl
+		ld hl,clr_gfx_screen
+		call set_ports
+		ld b,#28
+		ld a,#ff
+		out (c),a
+		ld b,#27
+		ld a,%00000100
+		OUT (C),a
+		call dma_stats
+		pop hl
+		inc hl
+		inc hl	; #4007
+; 		push	af
+;		ld	(clrColor+1),a
+;		ld	a,(hl)	; Тип упаковки данных (#00 - не пакованы)
+		ld a,(hl)		; Video color mode
+		ld c,a
+		inc hl
+		cp 2
+
+; 16c mode
+		ld b,DMA_RAM + DMA_DALGN	; dma mode
+		ld a,1				; high byte pal adress
+		ld de,#0f08			; 32byte for pal dma send, 8 for palsel
+		jr nz,3f
+		xor a
+		ld b,DMA_RAM + DMA_DALGN + DMA_ASZ
+		ld de,#ff00
+
+3		ld (view_image_pals_vpal_adr+1),a
+		ld (color_type+1),a
+		ld a,b
+		ld (gfx_copy_type+1),a
+		ld (gfx_copy_t2+1),a
+		ld a,e
+		ld (gfx_vpal+1),a
+		ld a,d
+		ld (view_image_pals_vpal+1),a
+		or a
+		rl e
+		rl e
+		rl e
+		rl e
+		ld a,e
+		ld (gfx_border+1),a
+/*		
+		ld	(imageMode),a
+		push	hl
+		call	setImageMode
+		pop	hl
+		cp	#ff					; error -> exit
+		ret	z
+*/
+		ld	e,(hl)					; Width 0-512
+		inc	hl
+		ld	d,(hl)
+		inc	hl
+
+		ld a,VID_360X288
+		or c
+		ld (gfx_vmode+1),a
+		push hl
+		push bc
+		ld hl,360
+		or a
+		sbc hl,de
+		srl l
+		xor a
+		sub l
+		or a
+		jr z,1f
+		ld bc,GXOFFSL
+		out (c),a
+		inc b
+		ld a,1
+		out (c),a
+1		pop bc
+		pop hl
+/*
+; 	#168 - 360; #140 - 320; #100- 256
+		ld a,#68
+		cp e
+		jr nz,1f
+		ld a,VID_360X288
+		jr 2f
+
+1	
+;		ld a,#40
+;		cp e
+;		jr nz,
+		ld a,VID_320X240	; standart resolution
+2		or c
+		ld (gfx_vmode+1),a
+*/
+		srl d
+		rr e
+color_type	ld a,0
+		or a
+		jr z,4f
+		srl d
+		rr e		; Width 0-512 /4
+4		ld a,e
+		dec a
+		ld (gfx_copy_w+1),a
+
+		ld	e,(hl)					; Height 0-512
+		inc	hl
+		ld	d,(hl)
+		inc	hl
+		push hl
+		ld hl,288
+		or a
+		sbc hl,de
+		srl l
+		xor a
+		sub l
+		or a
+		jr z,1f
+		ld bc,GYOFFSL
+		out (c),a
+		inc b
+		ld a,1
+		out (c),a
+1		pop hl
+		bit 0,d
+		jr z,1f
+		ld a,#ff
+		jr 2f
+
+1		xor a
+		dec e
+2		ld (gfx_copy_h+1),a
+		dec e
+		ld a,e
+		ld (gfx_copy_h2+1),a
+
+		ld	c,(hl)					; Указатель (смещение) на начало данных палитры
+		inc	hl
+		ld	b,(hl)
+		inc	hl
+		push	hl
+		add	hl,bc					; Начало данных палитры
+		ld a,l
+		ld (view_image_pals+1),a
+		ld a,h
+		ld (view_image_pals+3),a
+		ld hl,view_image_pals
+		call set_ports
+;gPalNum		ld	b,#01					; Номер экрана для кого грузить палитру
+;		ld	a,setGfxPalette
+;		call	cliKernel
+		pop	hl
+		ld	c,(hl)					; Указатель (смещение) на начало данных bitmap
+		inc	hl
+		ld	b,(hl)
+		inc	hl
+		add	hl,bc					; Начало данных bitmap
+		ld a,l
+		ld (gfx_copy+1),a
+		ld a,h
+		ld (gfx_copy+3),a
+
+		ld hl,gfx_copy
+		call set_ports
+gfx_copy_h2	ld a,0
+		ld b,#28
+		out (c),a
+		dec b
+gfx_copy_t2	ld a,DMA_RAM + DMA_DALGN
+		out (c),a
+		call dma_stats
+
+show_gfx	call wait_frame
+gfx_vmode	ld a,0
+		ld bc,VCONFIG
+		out (c),a
+
+		ld b,high PALSEL
+gfx_vpal	ld a,#08
+		out (c),a
+
+		ld b,high TSCONFIG
+		ld a,0
+		out (c),a
+		ld b,high BORDER
+gfx_border	ld a,0
+		out (c),a
+		ld a,Gfx_vid_page
+		ld b,high VPAGE
+		out (c),a
+		
+		call pause
+		LD BC,#FADF
+3		IN A,(C)     ;читаем порт кнопок
+		and 3
+		cp 3
+		jr z,3b
+		call pause
+		ld hl,int_main
+		ld (#beff),hl
+
+		xor a
+		ld bc,GXOFFSL
+		out (c),a
+		inc b
+		out (c),a
+		inc b
+		out (c),a
+		inc b
+		out (c),a
+
+		ld b,high TSCONFIG
+		ld a,TSU_SEN
+		out (c),a
+		ld hl,all_pals
+		call set_ports
+		ld hl,zx_pals
+		jp set_ports
+
+pause		ld b,#0a
+		call wait_frame
+		djnz $-3
+		ret
+text_view	ld ix,read_threads
+;		main_list_url
+
+		ld a,download_page
+		call set_page1
+text_view_in	xor a
+		ld (lmb_click_sw+1),a
+		ld (do_after_load+1),a
+		inc a
+		ld (text_scroll+1),a
+		call set_text_colors
+		xor a
+		call set_page3
+		call set_Textpage
+		call parse_text
+;		ld hl,(ix+thread.adress)
+;		ld ix,#c000;2		; text line buffer adresses
+;		ld (ix+0),l
+;		ld (ix+1),h
+
+		ld hl,#c000
+		ld de,window_start_Yl	; text page
+		ld b,window_height*4	; rows
+		call show_text_line
+		ld hl,window_height*2
+		ld (text_up_line_adr+1),hl
+		ld a,l
+		ld (text_up+1),a
+		ret
+
+parse_text	ld de,(ix+thread.adress)
+		ld hl,#c000		; text line buffer adresses
+		ld b,download_page
+parse_text0	ld c,0
+		ld (hl),e
+		inc hl
+		ld (hl),d
+		inc hl
+		ld (hl),b
+		inc hl
+parse_text1	ld a,(de)
+		or a
+		jr z,parse_text_ex
+		cp #ff
+		jr z,parse_text_ex
+		cp #0d
+		jr z,parse_text_cr
+		cp #0a
+		jr z,parse_text_lf
+		jr parse_text2
+
+; Пресса встречается и с CR/LF, и только с LF. Старый разборщик признавал
+; концом строки только CR/LF и при одиночном LF продолжал одну огромную строку.
+parse_text_cr	inc de
+		ld a,(de)
+		cp #0a
+		jr nz,parse_text4
+parse_text_lf	inc de
+		jr parse_text4
+		
+parse_text2	inc de
+		bit 7,d
+		jr z,parse_text3
+		ld d,#40
+		inc b
+		ld a,b
+		push bc
+		call set_page1
+		pop bc
+parse_text3	inc c
+		ld a,c
+		cp 80
+		jr nz,parse_text1
+parse_text4	ld (hl),c
+		inc hl
+		jr parse_text0
+
+parse_text_ex	xor a
+		ld (hl),a
+		inc hl
+		ld (hl),a
+		ret
+/*
+		ld de,window_start_Yl	; text page
+		ld bc,(window_height*2)*256+80		; rows col, chars in row
+		call show_text_line
+*/		
+show_text_line	ld (show_text_line_adr+1),de
+show_text_line1	ld e,(hl)
+		inc hl
+		ld d,(hl)
+		inc hl
+		ld a,d
+		or e
+		ret z
+		ld a,(hl)
+		inc hl
+		push bc
+		call set_page1
+		ld c,(hl)
+		inc hl
+		ld a,c
+		or a
+		jr z,show_text_line2
+		push hl
+		ex de,hl
+show_text_line_adr
+		ld de,0
+		ld a,d
+		ld b,0
+		ldir
+		inc a
+		ld (show_text_line_adr+2),a
+		pop hl
+show_text_line2	pop bc
+		djnz show_text_line1
+		ld a,1
+		ret
+/*
+show_text_line	ld a,(hl)
+		or a
+		ret z
+		cp #ff
+		ret z
+		cp #0d
+		jr nz,text_view2
+		inc hl
+		inc hl
+text_nl		ld a,0
+		or a
+		jr z,text_nl2
+		inc ix
+		inc ix
+		ld (ix+0),l
+		ld (ix+1),h
+text_nl2	inc d
+		ld e,0
+		ld c,80
+		dec b
+		jr nz,show_text_line
+		ld a,1
+		or a
+		ret
+
+text_view2	ld (de),a
+		inc hl
+		inc de
+		dec c
+		jr z,text_nl
+		jr show_text_line
+*/
+
+
+text_up		ld a,1
+		or a
+		ret z
+
+		ld a,download_page
+		call set_page1
+		ld hl,text_up_copy
+		call set_ports
+		ld hl,window_start_Yl+((window_height-1)*2*256)
+		push hl
+		call clear_text_line
+		pop de
+;		ld a,1
+;		ld (text_nl+1),a
+
+text_up_line_adr
+		ld hl,0
+		add hl,hl
+		add hl,hl		
+		ld a,h
+		add #c0
+		ld h,a
+		push hl
+		ld hl,(text_up_line_adr+1)
+		inc hl
+		inc hl
+		ld (text_up_line_adr+1),hl
+		xor a
+		call set_page3
+		call set_Textpage_lite
+		pop hl
+		ld bc,2*256+80		; rows col, chars in row
+		call show_text_line
+		or a
+		ld (text_up+1),a
+		ret
+
+
+text_down	ld hl,(text_up_line_adr+1)
+		ld de,window_height*2
+		or a
+		sbc hl,de
+		jr nz,1f
+;		cp window_height*2
+;		jr nz,1f
+		xor a
+		ret
+		
+1		ld hl,(text_up_line_adr+1)
+		dec hl
+		dec hl
+		ld (text_up_line_adr+1),hl
+		or a
+		sbc hl,de
+		add hl,hl
+		add hl,hl
+		ld a,h
+		or #c0
+		ld h,a
+		push hl
+		ld a,download_page
+		ld (text_up+1),a
+		call set_page1
+		call text_dma_down
+		xor a
+		call set_page3
+		call set_Textpage_lite
+		pop hl
+		ld de,window_start_Yl
+		ld b,2	; rows
+		jp show_text_line
+		
+text_dma_down	ld hl,text_down_copy
+		call set_ports
+		ld d,window_start_Y+window_height*2-4
+		ld e,window_start_Y+window_height*2-2
+		ld a,window_height*2-1
+td1		exa
+		ld b,high DMASADDRH 
+		out (c),d
+		ld b,high DMADADDRH 
+		out (c),e
+		dec d
+		dec e
+;		dec d
+;		dec e
+		ld b,#27
+		ld a,DMA_RAM
+		out (c),a
+		call dma_stats
+		exa
+		dec a
+		jr nz,td1
+		call set_Textpage_lite
+		ld hl,#180
+		ld a,7
+		ld (hl),a
+		inc l
+		jr nz,$-2
+		jp restore_page0
+
+; 	in hl - adress:
+;	http://zxaaa.untergrund.net/get.php?f=DEMO6/a_brief_history_of_vacuum_cleaner_nozzle_attachments.zip
+
+; Разобрать URL: адрес сервера и путь, каждый строкой с нулём на конце. Текст
+; HTTP-запроса тут больше не собирается — его составляет ESP по этим двум полям.
+parse_url	ld de,cmd_conn2site_adr
+pu1		ld a,(hl)	; пропустить http://
+		inc hl
+		cp "/"
+		jr nz,pu1
+		inc hl		; вторая косая
+		ld bc,"//"
+		call find_copy_char	; адрес до первой косой пути
+		ex de,hl
+		ld (hl),0
+		ex de,hl
+		; Путь копируется вместе с ведущей косой: именно так его ждёт ESP.
+		ld de,request_path
+		ld bc,#0d0a
+		call find_copy_char
+		ex de,hl
+		ld (hl),0
+		ret
+
+; Длину раньше переводили в десятичную строку для AT+CIPSEND=<len>. Теперь она
+; уходит в пакете двоичным полем, а нулевой байт как признак конца запроса не
+; годится: от предыдущего, более длинного URL в буфере остаётся хвост.
+
+Num1:		ld	a,'0'-1
+Num2:		inc	a
+		add	hl,bc
+		jr	c,Num2
+		sbc	hl,bc
+		ret
+		
+find_copy_char	ld a,(hl)
+		cp c
+		ret z
+		cp b
+		ret z
+		ld (de),a
+		inc hl
+		inc de
+		jr find_copy_char
+
+; Раньше сюда дописывался хвост AT-команды: кавычка, запятая, порт, CR/LF.
+; Теперь адрес сервера — обычная строка с нулём на конце, порт задаёт NET_OPEN.
+create_link_suffix
+		db    0,0,0,0,0,0,0
+
+
+copy_ini	ld a,(hl)
+		cp #0d+1
+		ret c
+		ld (de),a
+		inc hl
+		inc de
+		jr copy_ini
+
+cp_ini		ld a,(de)
+		or a
+		jr z,cp_ini1
+		cp (hl)
+		jr nz,error_ini
+		inc hl
+		inc de
+		jr cp_ini
+
+cp_ini1		inc de
+cp_ini2		ld a,(hl)
+		cp #20
+		ret nz
+		inc hl
+		jr cp_ini2
+
+
+error_ini	ld a,2
+		out (#fe),a
+		pop hl
+		call set_Textpage
+		ld hl,error_ini_text
+		ld b,1
+		call zifi_echo
+		ei 
+		jr $
+
+ini_db		db "SSID:",0
+		db "password:",0
+ini_db_time	db "time:",0
+error_ini_text	db "Error parsing ini file",0
+
+site_list	dw download_site_list,gfx_site_list,music_site_list,press_site_list
+
+download_site_list	
+		db "Games: vtrd.in ",#0d,#0a, "http://ex.vtrd.in/vt/export.php?t=g",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Games: prods.tslabs.info - ZX Enhanced",#0d,#0a, "http://prods.tslabs.info/prods_zifi.php?t=2",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Demos: bbb.retroscene.org",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=0",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Classic demos",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=1",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Most liked",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=2",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Most favorited",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=3",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " ZX Enhanced",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=4",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+
+		db "Demo Packs: vtrd.in",#0d,#0a, "http://ex.vtrd.in/vt/export.php?t=d",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Demos: prods.tslabs.info - ZX Enhanced",#0d,#0a, "http://prods.tslabs.info/prods_zifi.php?t=1",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Demos: pouet.net - ZX Spectrum",#0d,#0a, "http://zifi.vtrd.in/pouet.php?src=pouet_zx",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Demos: pouet.net - ZX Enhanced",#0d,#0a, "http://zifi.vtrd.in/pouet.php?src=pouet_zxe",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "System: vtrd.in",#0d,#0a, "http://ex.vtrd.in/vt/export.php?t=s",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a		
+		db #00
+
+gfx_site_list	db "Graphics: zxart.ee",#0d,#0a, "http://zxart.ee/zxnet/?a=g",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Most popular",#0d,#0a, "http://zxart.ee/zxnet/?a=g&o=p",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Top-rated",#0d,#0a, "http://zxart.ee/zxnet/?a=g&o=r",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " First places",#0d,#0a, "http://zxart.ee/zxnet/?a=g&o=w",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Top of last year published",#0d,#0a, "http://zxart.ee/zxnet/?a=g&o=y",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+
+		db " - Multicolour graphic & Timex",#0d,#0a, "http://zxart.ee/zxnet/?a=g&t=multi",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " - Colorful pictures",#0d,#0a, "http://zxart.ee/zxnet/?a=g&t=color",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " - Lowres graphics",#0d,#0a, "http://zxart.ee/zxnet/?a=g&t=lowres",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " - Pixel graphics",#0d,#0a, "http://zxart.ee/zxnet/?a=g&t=pixel",#0d,#0a, view_gfx,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+
+		db #00
+music_site_list	db "Music database: zxart.ee",#0d,#0a, "http://zxart.ee/zxnet/?a=m",#0d,#0a, play_music,music_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Most popular",#0d,#0a, "http://zxart.ee/zxnet/?a=m&o=p",#0d,#0a, play_music,music_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Top-rated",#0d,#0a, "http://zxart.ee/zxnet/?a=m&o=r",#0d,#0a, play_music,music_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " First places",#0d,#0a, "http://zxart.ee/zxnet/?a=m&o=w",#0d,#0a, play_music,music_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " Top of last year published",#0d,#0a, "http://zxart.ee/zxnet/?a=m&o=y",#0d,#0a, play_music,music_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db " --+ TurboSound Music +--",#0d,#0a, "http://zxart.ee/zxnet/?a=m&f=ts",#0d,#0a, play_music,music_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		
+		
+		db #00
+press_site_list	db "Hype: hype.retroscene.org",#0d,#0a, "http://zifi.vtrd.in/get.php?src=hype",#0d,#0a, view_text,download_page, #0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Emags: vtrd.in", #0d,#0a, "http://ex.vtrd.in/vt/export.php?t=p",#0d,#0a, save_file,download_page, #0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Z80 Telegram Log", #0d,#0a, "http://zifi.vtrd.in/tlg.php",#0d,#0a, view_text,download_page, #0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "IRC Logs", #0d,#0a, "http://irclog.dimkam.ru/zifi.php?src=z80",#0d,#0a, view_downloaded_list,download_page, #0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "RSS Channels", #0d,#0a, "http://irclog.dimkam.ru/zrss.php",#0d,#0a, view_text,download_page, #0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+
+
+		db #00
+
+
+hl_menu_src	db #1a,0
+		db #1b,0
+hl_menu_desc	db #1d,0
+		db #1e,0
+		db #1c,highlight_menu_page
+		db #1f,Vid_page
+		db #26,88/2-1
+		db #28,16-1
+		db #27,DMA_RAM + DMA_DALGN +DMA_ASZ
+		db #ff
+
+hl_menu_adr	dw 0,#c000+88
+		dw highlight_size,#e000+88
+		dw highlight_size*2,#c000+88+88+8
+		dw highlight_size*3,#e000+88+88+8
+
+sites_list	dec a		; highlight menu gfx
+		push af
+		add a,a
+		add a,a
+		ld l,a
+		ld h,0
+		ld de,hl_menu_adr
+		add hl,de
+		ld de,hl_menu_src+1
+		ld b,4
+1		ld a,(hl)
+		ld (de),a
+		inc hl
+		inc de
+		inc de
+		djnz 1b
+		ld hl,menu_copy
+		call set_ports
+		ld hl,hl_menu_src
+		call set_ports
+
+		ld a,download_page
+		ld (load_ram_page+1),a
+		xor a
+		ld (scroll_sw+1),a	; switch off mouse scrolls
+		call set_text_colors
+				; clear text screen
+		pop af
+		add a,a
+		ld l,a
+		ld h,0
+		ld de,site_list
+		add hl,de
+		ld a,(hl)
+		inc hl
+		ld h,(hl)
+		ld l,a
+		push hl
+		ld de,link_adreses
+		call parse_get
+		ld a,c
+		ld (all_lines_counter+1),a
+		ld (sum_list_lines+1),a
+		ld ix,link_adreses
+		ld b,a
+		dec b
+		pop hl
+		ld de,window_start_Yl
+2		push bc
+		call show_line_get_buffer
+		pop bc
+		djnz 2b
+		xor a
+		ld (sites_sw+1),a
+		ld (click_offset+1),a	; GYOFFSL =0 
+		ld (show_now_play_link+1),a
+		ld a,view_downloaded_list
+		ld (do_after_load+1),a
+		ret
+
+set_text_colors
+		call off_int_dma
+		call set_Textpage
+		ld hl,0
+		ld (#0000),hl
+		ld hl,clr_text_screen
+		call set_ports
+		
+		ld hl,#0080
+set_text_colors_color
+		ld a,#07
+1		ld (hl),a
+		inc l
+		jr nz,1b
+		ld l,#80
+		inc h
+		bit 5,h
+		jr z,1b
+		jp on_int_dma
+
+create_link_list
+		ld a,1
+		ld (scroll_sw+1),a
+		xor a
+		ld (text_scroll+1),a
+		ld (link_num+1),a
+		ld (click_offset+1),a		
+		ld hl,(ix+thread.adress)
+		push hl
+		ld de,link_adreses
+		call parse_get
+		ld a,c
+		ld (sum_list_lines+1),a
+		cp window_height		; check num of prods < window list for scrolls
+		jr nc,1f
+		xor a
+		jr 2f
+
+1		sub window_height
+2		ld (all_lines_counter+1),a
+
+		ld a,c
+		call set_text_colors
+
+		ld ix,link_adreses
+		pop hl
+		ld de,window_start_Yl
+		ld b,window_height
+2		push bc
+		call show_line_get_buffer
+		pop bc
+		djnz 2b
+
+do_after_link_list		ld a,0				; действие после загрузки 
+				ld (do_after_load+1),a
+				ld c,0
+				cp play_music
+				jr nz,1f
+				ld c,1
+
+1				ld a,c
+				ld (autoplay+1),a
+
+loadpage_after_link_list	ld a,0				; страница для загрузки прода данного раздела
+				ld (load_ram_page+1),a
+		xor a
+		ld (load_sw+1),a
+		ret
+
+find_0d0a	ld hl,get_buffer
+find_0d0a_hl
+ss_cm4		ld a,#0d
+ss_cm3		cpi
+		jr nz,ss_cm3
+		ld a,#0a
+		cpi
+		jr nz,ss_cm4
+		ld a,#0d
+		cpi
+		jr nz,ss_cm4
+		ld a,#0a
+		cpi
+		jr nz,ss_cm4
+		ret
+
+/*
+		ld hl,get_buffer
+		ld de,link_adreses
+		; 0 -  number of link
+		; 1,2 - adress of link name
+		; 3,4 - adress of link url
+		; 5 - count of chars date+author lenght
+*/
+
+list_up
+text_scroll	ld a,0
+		or a
+		jp nz,text_up
+link_num	ld a,0
+all_lines_counter
+		cp 0
+		ret z
+		inc a
+		ld (link_num+1),a		
+		add window_height-1
+		call calc_link_num
+		ld hl,text_up_copy
+		call set_ports
+		ld hl,window_start_Yl+((window_height-1)*2*256)
+		push hl
+		call clear_text_line
+		pop de
+		ld l,(ix+1)
+		ld h,(ix+2)
+		call show_line_get_buffer
+		ld a,1
+		ret
+
+calc_link_num	ld l,a
+		ld h,0
+		add hl,hl
+		push hl
+		add hl,hl
+		pop de
+		add hl,de
+		ex de,hl
+		ld ix,link_adreses
+		add ix,de
+		ret
+
+list_down	ld a,(text_scroll+1)
+		or a
+		jp nz,text_down
+		ld a,(link_num+1)
+		or a
+		ret z
+		dec a
+		ld (link_num+1),a
+		call calc_link_num
+		call text_dma_down
+/*
+		ld hl,get_buffer
+		ld de,link_adreses
+		; 0 -  number of link
+		; 1,2 - adress of link name
+		; 3,4 - adress of link url
+		; 5 - count of chars date+author lenght
+*/
+down_link
+		ld hl,window_start_Yl
+		push hl
+		call clear_text_line
+		pop de
+		ld l,(ix+1)
+		ld h,(ix+2)
+		call show_line_get_buffer
+		ld a,1
+		ret
+
+; ------- page 0
+set_Textpage_lite
+		ld a,Text_page
+		jr set_page0_lite
+
+set_Textpage	ld a,Text_page
+		jr set_page0
+
+set_page0	ld (restore_page0+1),a
+set_page0_lite	ld bc,PAGE0
+		out (c),a
+		ret
+
+restore_page0	ld a,0
+		jr set_page0_lite
+
+; -------  page 1
+set_buffer_page	ld a,list_ram_page
+set_page1	ld (restore_page1+1),a
+set_page1_lite	ld bc,PAGE1
+		out (c),a
+		ret
+
+restore_page1	ld a,0
+		jr set_page1_lite
+
+; -------  page 3
+
+
+set_page3	ld (restore_page3+1),a
+set_page3_lite	ld bc,PAGE3
+		out (c),a
+		ret
+
+restore_page3	ld a,0
+		jr set_page3_lite
+
+set_music_pages	ld a,music_page
+		call set_page0
+		inc a
+		call set_page1
+		ld a,music_players_page
+		jp set_page3
+restore_music_pages
+		xor a
+		call set_page0
+		ld a,list_ram_page
+		jp set_page1
+		
+/*
+set_music_pages	ld a,(restore_page0+1)
+		ld (rest_p0+1),a
+		ld a,(restore_page1+1)
+		ld (rest_p1+1),a
+		ld a,(restore_page3+1)
+		ld (rest_p3+1),a
+
+		ld a,music_page
+		call set_page0
+		inc a
+		call set_page1
+		ld a,music_players_page
+		jp set_page3
+restore_music_pages
+rest_p0		ld a,0
+		call set_page0
+rest_p3		ld a,0
+		call set_page3
+rest_p1		ld a,list_ram_page
+		jp set_page1
+*/
+
+
+
+set_music_pages_lite	
+		ld a,music_page
+		call set_page0_lite
+		inc a
+		call set_page1_lite
+		ld a,music_players_page
+		jp set_page3_lite
+
+restore_music_pages_lite
+		call restore_page0
+		call restore_page1
+		jp restore_page3
+
+/*
+		ld hl,get_buffer
+		ld de,link_adreses
+		; 0 -  number of link
+		; 1,2 - adress of link name
+		; 3,4 - adress of link url
+		; 5 - type of a site_list
+*/
+parse_get	
+		call set_buffer_page
+		ld c,1
+parse_get1	ld a,(hl)
+		cp #0a
+		jr c,parse_get_ex
+		cp #0d
+		jr z,parse_get_ex
+		ld a,c
+		ld (de),a	; number of link
+		inc de
+		call save_parsed	; adress of link name
+		call scan_0d
+		call save_parsed	; adress of link url
+		call scan_0d		; date adr
+		call scan_0d		; author
+		call scan_0d		; city
+		inc de
+		call scan_0d			; next record
+		inc c
+		jr parse_get1
+
+parse_get_ex	ld a,c
+		ld (de),a	; number of link
+		inc de
+save_parsed	ld a,l
+		ld (de),a	; adress of link adress
+		inc de
+		ld a,h
+		ld (de),a
+		inc de
+		ret
+
+scan_0d		ld a,(hl)
+		inc hl
+		cp #0a
+		jr nz,scan_0d
+;		inc hl		; #0a
+		ret
+
+clear_text_line	ld d,h
+		inc d
+		ld e,l
+		call set_Textpage_lite
+		xor a
+		ld b,#80
+1		ld (hl),a
+		ld (de),a
+		inc l
+		inc e
+		djnz 1b
+		jp restore_page0
+
+show_line_get_buffer
+		call set_Textpage_lite
+		ld a,list_ram_page
+		call set_page1_lite
+		ld a,(hl)	; end of list
+		or a
+		jp z,slgb_ex
+		push de
+		ld a,6+8
+		call drawString	; name
+		call scan_0d	; propusk: links
+
+		ld a,(hl)
+		cp #0b	; пропуск всех пустых строк сразу (для списка ссылок раздела и поиска)
+		jr nc,show_get_buf4
+		or a
+		jr z,show_get_buffer_ex
+		call scan_0d
+		call scan_0d
+		call scan_0d
+		jr show_get_buffer_ex+3
+
+; echo $x++.'.'.$lx['title']."\r\n
+; $lx['url']."\r\n"
+; $lx['year']."\r\n".
+; substr($authors,0,-1)."\r\n";
+; addslashes($lx['city'])."\r\n";
+
+show_get_buf4	ld (show_year_adr+1),hl	; store "year"
+		call scan_0d
+		ld (show_author_adr+1),hl	; store "authors"
+		call scan_0d
+;		ld (show_city_adr+1),hl	; store "city"
+		call scan_0d
+		ld (show_get_buffer_ex+1),hl
+
+show_author_adr	ld hl,0
+		ld a,(hl)	; check "by author"
+		cp #0e
+		jr c,1f
+		push hl
+		ld hl,by_db	; by
+		ld a,4
+		call drawString
+		pop hl
+		ld a,4+8	; authors
+		call drawString
+1		
+show_year_adr	ld hl,0			; year
+		ld a,(hl)	; check "year"
+		cp #0e
+		jr c,1f
+		ld a,","
+		ld (de),a
+		inc de
+		inc de
+		ld a,4
+		call drawString
+1
+
+show_get_buffer_ex
+		ld hl,0
+		ld de,6
+		add ix,de
+		pop de
+		inc d
+		inc d
+slgb_ex		call restore_page0
+		jp restore_page1
+
+
+
+by_db		db " by ",#0a
+
+drawString	; de: screen adress in tiles
+		; hl: string
+		ld (char_color+1),a
+		ld a, 80
+		ld (charz+1), a
+		push de
+		exx
+		pop hl
+		set 7,l
+		exx
+dStr1		ld a,(hl)
+		cp #0a
+		jr z,dStr2
+		cp #0d
+		jr z,dStr3
+		ld (de),a
+		inc e
+		exx
+char_color	ld (hl),0
+		inc l
+		exx
+		inc hl
+charz		ld a, 0
+		dec a
+		ret z
+		ld (charz+1), a
+		jr dStr1
+
+dStr3		inc hl
+dStr2		inc hl		; #0a
+		ret
+
+
+wait_frame	ld a,(frame+1)
+		or a
+		jr z,wait_frame
+		xor a
+		ld (frame+1),a
+		ret
+
+int_gfx_view	push af,hl,de,bc,ix
+		ld a,(frame+1)
+		inc a
+		ld (frame+1),a
+		ld a,(music_sw+1)
+		or a
+		call nz,pt_play
+		pop ix,bc,de,hl,af
+		ei
+		ret
+
+int_main	push af,hl,de,bc,ix,iy
+		ld a,#34
+		ld bc,BORDER
+		out (c),a
+		exx
+		push hl,de,bc
+		exx
+		exa
+		push af
+		exa
+		xor a
+		ld b,high GYOFFSL
+		out (c),a
+		inc b
+		out (c),a
+		call set_256c_mode
+frame		ld a,0
+		inc a
+		ld (frame+1),a
+
+save_mode	ld a,1
+		or a
+		jr z,int_ex2
+mouse_sw	ld a,1
+		or a
+		call nz,mouse_proc
+link_highlight	ld a,0
+		or a
+		call nz,link_highlight_view
+
+int_ex2		ld hl,56+4*8-4
+		ld de,int_text_cor
+int_ex		ld bc,VSINTL
+		out (c),l
+		ld b,high VSINTH
+		out (c),h
+		ex de,hl
+		ld (#beff),hl
+		exa
+		pop af
+		exa
+		exx
+		pop bc,de,hl
+		exx
+		pop iy,ix,bc,de,hl,af
+		ei
+		ret
+
+int_text_cor	push af
+		push hl
+		push bc
+		ld hl,56+4*8
+		ld bc,VSINTL
+		out (c),l
+		ld b,high VSINTH
+		out (c),h
+		ld hl,int_text_on
+		ld (#beff),hl
+		xor a
+		ld (int_text_cor_ex+1),a
+		ei
+int_text_cor_ex	ld a,0
+		or a
+		jr z,int_text_cor_ex
+		pop bc
+		pop hl
+		pop af
+		ret
+
+int_text_on	push af,hl,de,bc,ix,iy
+txt_border	ld a,#f0
+		ld bc,BORDER
+		out (c),a
+		exx
+		push hl,de,bc
+		exx
+		exa
+		push af
+		exa
+		ld a,(click_offset+1)
+		ld b,high GYOFFSL
+		out (c),a
+		ld b,high VCONFIG
+		ld a,VID_TEXT+VID_320X240
+		out (c),a
+;		ld b,high TSCONFIG
+;		ld a,TSU_SEN
+;		out (c),a
+		ld b,high VPAGE
+		ld a,Text_page
+		out (c),a
+		ld b,high PALSEL
+		ld a,#3f
+		out (c),a
+		ld (int_text_cor_ex+1),a
+		ld hl,47+240-1-2
+		ld de,int_text_ofcor
+		jp int_ex
+
+int_text_ofcor	push af
+		push hl
+		push bc
+		ld hl,47+240
+		ld bc,VSINTL
+		out (c),l
+		ld b,high VSINTH
+		out (c),h
+		ld hl,int_text_off
+		ld (#beff),hl
+		xor a
+		ld (int_text_ofcor_ex+1),a
+		ei
+int_text_ofcor_ex	ld a,0
+		or a
+		jr z,int_text_ofcor_ex
+		pop bc
+		pop hl
+		pop af
+		ret
+
+int_text_off	push af,hl,de,bc,ix,iy
+		ld a,#34
+		ld bc,BORDER
+		out (c),a
+		exx
+		push hl,de,bc
+		exx
+		exa
+		push af
+		exa
+		call set_256c_mode
+		ld hl,47+240-1
+		ld b,high GYOFFSL
+		out (c),l
+		inc b
+		out (c),h
+music_sw	ld a,0
+		or a
+		call nz,pt_play
+
+		ld a,(save_mode+1)
+		or a
+		jr z,int_ex3	
+analizator_sw	ld a,1
+		or a
+		call nz,music_analizator
+
+enter_search_sw	ld a,0
+		or a
+		call nz,enter_search
+
+int_ex3		ld hl,0
+		ld de,int_main
+		ld a,1
+		ld (int_text_ofcor_ex+1),a
+		jp int_ex
+
+pt_play		call set_music_pages_lite
+		call music_player_play
+
+show_now_play_link	ld a,0
+		or a
+		jr z,autoplay
+		
+		ld a,(current_list_page+1)
+mus_link_page	cp 0
+		jr nz,autoplay
+
+show_now_play_cnt
+		ld a,0
+		inc a
+		and 7
+		ld (show_now_play_cnt+1),a
+		jr nz,autoplay
+		call set_Textpage_lite
+		ld a,(link_num+1)
+		ld c,a
+		ld a,(autoplay_num+1)
+		sub c
+		cp #0f
+		jr nc,autoplay
+		add a,a
+		inc a
+		ld h,a
+		ld l,#80
+		ld b,80
+1		ld a,(hl)
+		xor #08
+		ld (hl),a
+		inc l
+		djnz 1b
+
+autoplay	ld a,1
+		or a
+		jr z,pt_play_ex
+
+		ld a,(music_setup_vars)
+		bit 7,a
+		jr z,pt_play_ex
+	; loop is passed
+		ld a,(sum_list_lines+1)
+		dec a
+		ld c,a
+autoplay_num	ld a,0
+		inc a
+		cp c
+		jr c,1f
+		ld a,1
+1		ld (autoplay_num+1),a
+		call calc_link_num
+		ld a,list_ram_page
+		call set_page1
+		ld h,(ix+4)
+		ld l,(ix+3)
+		call parse_url
+		ld a,1
+		ld (load_sw+1),a
+pt_play_ex	jp restore_music_pages_lite
+/*
+SETUP	DB 0 ;set bit0, if you want to play without looping
+	     ;(optional);
+	     ;set bit1 for PT2 and reset for PT3 before
+	     ;calling INIT;
+	     ;bits2-3: %00-ABC, %01-ACB, %10-BAC (optional);
+	     ;bits4-5: %00-no TS, %01-2 modules TS, %10-
+	     ;autodetect PT3 TS-format by AlCo (PT 3.7+);
+	     ;Remark: old PT3 TS-format by AlCo (PT 3.6) is not
+	     ;documented and must be converted to new standard.
+	     ;bit6 is set each time, when loop point of 2nd TS
+	     ;module is passed (optional).
+	     ;bit7 is set each time, when loop point of 1st TS
+	     ;or of single module is passed (optional).
+*/
+
+set_256c_mode
+		ld bc,VCONFIG
+		ld a,VID_256C+VID_320X240 ;VID_NOGFX+
+		out (c),a
+		ld b,high VPAGE
+		ld a,Vid_page
+		out (c),a
+		ld b,high PALSEL
+		xor a
+		out (c),a
+		ld b,high TSCONFIG
+		ld a,TSU_SEN
+		out (c),a
+		ret
+
+link_highlight_view
+		ld a,#0a
+		dec a
+		ld (link_highlight_view+1),a
+		ret nz
+
+1		ld a,(link_highlight+1)
+		ld d,a
+		ld a,Text_page
+		call set_page3_lite
+		ld e,#80
+		ld hl,highlight_colors_buff
+		ld bc,80
+		ldir
+		xor a
+		ld (link_highlight+1),a
+		ld a,#0a
+		ld (link_highlight_view+1),a
+		jp restore_page3
+
+music_analizator
+		ld a,Vid_page+9
+		call set_page3_lite
+
+		ld hl,0
+		ld (analizator_screen_adr),hl
+		ld hl,clr_analizator
+		call set_ports_nowait		; clear video mem
+
+		ld hl,ay_volume
+		push hl
+		ld b,3
+2		ld a,(hl)
+		or a
+		jr z,1f
+		dec (hl)
+1		inc hl
+		djnz 2b
+
+		ld hl,ay_volume
+		ld de,#0308
+ma1		LD BC, #FFFD
+		OUT (C), e
+		IN A, (C)
+		and #0f
+		cp (hl)
+		jr c,1f
+		ld (hl),a
+1		inc hl
+		inc e
+		dec d
+		jr nz,ma1
+
+		pop de
+		ld hl,analizator_screen_adr
+		ld c,3
+ma3		ld a,(de)
+		inc a
+		inc de
+		add a,a
+		ld b,a
+		add #40
+ma2		ld (hl),a
+		inc hl
+		djnz ma2
+		ld l,low analizator_screen_adr
+		inc h
+		inc h
+		dec c
+		jr nz,ma3
+		jp restore_page3
+ay_volume	ds 3
+
+
+
+/*
+1  D0 - левая кнопка
+2  D1 - правая кнопка
+4  D2 - средняя кнопка
+
+#10-#f0
+  D4-D7 - wheel
+*/
+
+mouse_buttons
+scroll_sw	ld a,0
+		or a
+		jr z,lmb_old
+
+wheel_old	ld c,#f0
+		ld a,(mouse_button)
+		cpl
+		and #f0
+		cp c
+		jr z,lmb_old
+		ld (wheel_old+1),a
+		sub c
+		jp m,list_up
+		jp nc,list_down
+		jp p,list_down
+		jp list_up
+
+/*
+		jp m,list_down
+		jp nc,list_up
+		jp p,list_up
+		jp list_down
+*/
+lmb_wait	equ #c
+
+lmb_old		ld a,(mouse_button)
+		cpl
+		and 1
+		cp 1 ; lmb pressed
+		jp nz,lmb_release
+lmb_counter	ld a,0
+		inc a
+		cp lmb_wait
+		jr z,drag_start
+		jr nc,lmb_drag
+		ld (lmb_counter+1),a
+		ret
+
+drag_start	ld (lmb_counter+1),a
+		ld a,(mouse_y)
+		ld (drag_start_pos+1),a		; begin pos of drag
+		ld (lmb_line_cnt+1),a
+		ld (lmb_old_line_cnt+1),a
+		ret
+
+lmb_drag	ld a,1
+		or a
+		ret z
+		ld a,(scroll_sw+1)
+		or a
+		ret z
+
+lmb_line_cnt	ld e,0		; current point of prirost + y_coord
+lmb_old_line_cnt
+		ld d,0		; old point of prirost + y_coord
+		ld a,(mouse_y)
+drag_start_pos	sub 0		; begin pos of drag
+		ld l,a	
+		ld h,high mouse_step
+		ld a,e
+		add (hl)	; prirost
+		ld e,a
+		ld (lmb_line_cnt+1),a
+		sub d
+		jp m,ld10
+		cp #10
+		jr c,ld2
+		jr ld01
+
+ld10		cp #f0
+		jr nc,ld2
+		neg
+		sub #10
+		add e
+		; ld a,e
+		ld (lmb_old_line_cnt+1),a
+		call list_down
+		jr nz,ld2
+		ld (lmb_drag+1),a
+		ld (click_offset+1),a
+		jr ex_no_offset
+; +
+
+ld01		ld a,e
+		ld (lmb_old_line_cnt+1),a
+		call list_up
+		jr nz,ld2
+		xor a
+		ld (lmb_drag+1),a
+		ld (click_offset+1),a
+		jr ex_no_offset
+
+ld2		ld a,(lmb_old_line_cnt+1)
+		ld c,a
+		ld a,(lmb_line_cnt+1)
+		sub c
+		and #0f
+		ld (click_offset+1),a
+ex_no_offset	ld a,#02
+		jp lmb_ex2
+
+lmb_release
+		ld a,(lmb_counter+1)
+		or a
+		jp z,lmb_ex
+		cp lmb_wait-1
+		jp nc,lmb_ex
+
+		ld a,(mouse_y)
+		cp 4*8
+		jp c,menu_click
+		cp 240-8
+		jp nc,status_click
+lmb_click_sw	ld a,1
+		or a
+		jp z,lmb_ex
+
+		ld a,(mouse_y)
+		sub 4*8		; Y offset from menu
+click_offset	add 0		; mouse Y offset 0-15
+		srl a
+		srl a
+		srl a
+		srl a
+		ld c,a
+sum_list_lines	ld a,0
+		dec a
+		ld b,a
+		cp c
+		jp z,lmb_ex
+		jp c,lmb_ex
+		ld a,c
+; save txt colors buffer
+		push bc
+		add a,a
+		inc a
+		add #c0
+		ld (link_highlight+1),a
+		ld h,a
+		ld a,Text_page
+		call set_page3_lite
+		ld l,#80
+		ld de,highlight_colors_buff
+		ld bc,80
+		ldir
+		ld l,#80
+		ld a,#0f
+1		ld (hl),a
+		inc l
+		jr nz,1b
+		call restore_page3
+		pop bc
+		ld a,(link_num+1)
+		add c
+		cp b		; all links counter
+		jp z,lmb_ex
+		ld c,a
+		or a
+		jr nz,1f
+
+		ld a,(do_after_load+1)
+		cp view_downloaded_list
+		jr z,1f
+
+		ld a,1				; start enter search word
+		ld (enter_search_sw+1),a
+		call set_Textpage_lite
+		ld hl,search_textpage_adr
+		ld (search_input_adress+1),hl
+		ld a,"_"
+		ld (hl),a
+		inc l
+		xor a
+		ld b,#40
+		ld (hl),a
+		inc l
+		djnz $-2
+		ld hl,highlight_colors_buff+7
+		ld b,#40
+		ld a,7
+2		ld (hl),a
+		inc l
+		djnz 2b
+		jp lmb_ex
+
+1		ld a,(do_after_load+1)
+		cp play_music
+		jr nz,1f
+		ld a,c
+		ld (autoplay_num+1),a
+		ld a,(current_list_page+1)
+		ld (mus_link_page+1),a
+		ld (show_now_play_link+1),a
+
+
+1		ld a,c
+		call calc_link_num
+		ld a,list_ram_page
+		call set_page1
+		ld h,(ix+4)
+		ld l,(ix+3)
+		ld (main_list_url+1),hl
+		ld a,(do_after_link_list+1)	; проверка на текст и установка нового пейджинга
+		cp view_text
+		jr nz,1f
+		call parse_url			
+		jr main_list_url		; paging for text files
+
+1		push hl
+		cp save_file			; проверка на файло для закачки
+		jr nz,not_unzip
+						; проверка на zip
+		ld de,zip_url_buffer_data
+		ld bc,#0d0a
+		call find_copy_char
+		ld a,#0d
+		ld (de),a		
+		ld hl,zip_url_buffer
+
+not_unzip	call parse_url
+		pop hl
+		call scan_0d
+		ld a,(hl)			; проверка на клик по списку сайтов в разделе
+		cp #0d
+		jr nc,1f
+		ld (do_after_link_list+1),a	; тип действия для данного сайта
+		inc hl
+		ld a,(hl)			; пага загрузки для данного сайта
+		ld (loadpage_after_link_list+1),a
+		ld h,(ix+4)
+		ld l,(ix+3)
+		ld (main_site_url+1),hl
+
+main_list_url	ld hl,0
+		ld (current_list_url+1),hl
+		ld bc,#0d0d
+		ld de,current_paging_url
+		call find_copy_char
+		ex de,hl
+		ld (hl),"&"
+		inc hl
+		ld (hl),"p"	; page num
+		inc hl
+		ld (hl),"="
+		inc hl
+		ld (current_paging_page+1),hl
+		ld (hl),"0"
+		inc hl
+		ld (hl),"2"
+		inc hl
+		ld (hl),#0d
+		ld a,start_paging_page
+		ld (current_list_page+1),a
+1		ld a,1
+		ld (load_sw+1),a
+lmb_ex		
+		ld a,1
+		ld (lmb_drag+1),a
+		dec a
+		ld (lmb_counter+1),a
+lmb_ex2		ld (mouse_spr+4),a
+		ret
+
+status_click
+		ld hl,(current_list_url+1)
+		ld a,h
+		or l
+		or a
+		jr z,lmb_ex	; url with link list not loaded
+
+		call mouse_x_div8
+		cp #10
+		jr c,lmb_ex
+		cp #12
+		jr c,cancel_download
+		cp #19
+		jp z,music_play
+		cp #1a
+		jp z,music_stop
+		ld c,a
+
+		ld a,(load_sw+1)	; 1-load now, check for download now 
+		or a
+		jr nz,lmb_ex
+
+		ld a,c
+		cp #21
+		jp z,first_page
+		cp #22
+		jp z,page_back
+		cp #27
+		jp z,page_forward
+		jr lmb_ex
+
+cancel_download	ld a,1
+		ld (wifi_cancel_download+1),a
+		jr lmb_ex
+
+first_page
+current_list_url	
+		ld hl,0
+		call parse_url
+		ld a,start_paging_page
+		ld (current_list_page+1),a
+
+paging_page_ex	ld a,1
+		ld (load_sw+1),a
+		ld a,view_downloaded_list
+		ld (do_after_load+1),a
+		ld a,download_page
+		ld (load_ram_page+1),a
+		jp lmb_ex
+
+page_back	ld a,(current_list_page+1)
+		dec a
+		cp start_paging_page-1		; p=1
+		jp z,lmb_ex
+		ld (current_list_page+1),a
+		jr current_list_page_count
+
+page_forward
+current_list_page
+		ld a,0
+		inc a
+		ld (current_list_page+1),a
+current_list_page_count
+		ld l,a
+		ld h,0
+current_paging_page
+		ld de,0
+		ld bc,-10
+		call Num1
+		ld (de),a
+		inc de
+		ld c,-1
+		call Num1
+		ld (de),a
+		ld hl,current_paging_url
+		call parse_url
+		jr paging_page_ex
+
+
+music_loaded	ld a,1
+		ld (music_play+1),a
+		xor a
+		ld (is_music_play+1),a
+		ld hl,(ix+thread.adress)
+;		res 7,h
+		res 6,h
+		ld (music_adr+1),hl
+music_play	ld a,0		; music is loaded?
+		or a
+		jp z,lmb_ex
+
+is_music_play	ld a,0		; music is inited, check pause/play
+		or a
+		jr nz,pause_music
+		ld (do_start_music+1),a
+		jp lmb_ex
+
+music_stop	ld a,(music_play+1)
+		or a
+		jp z,lmb_ex
+		ld (do_init_music+1),a
+		jp lmb_ex
+
+music_init	call set_music_pages
+music_adr	ld hl,0
+		call music_player_init
+;		call music_player_mute
+		call restore_music_pages
+
+;		ld hl,SETUP
+;		res 0,(hl)		; loop mode
+		ld a,1
+		ld (music_sw+1),a
+		ld (is_music_play+1),a
+		ld (do_start_music+1),a
+		ret
+
+pause_music	ld a,0
+		cpl
+		ld (pause_music+1),a
+		or a
+		jr nz,pause_music1
+
+		ld a,1
+		ld (music_sw+1),a
+		jp lmb_ex
+
+pause_music1	xor a
+		ld (music_sw+1),a
+		call set_music_pages
+		call music_player_mute
+		call restore_music_pages
+		jp lmb_ex
+
+menu_click	srl a
+		srl a
+		srl a
+		srl a
+		ld c,a
+		ld a,(load_sw+1)	; 1-load now, check for download now 
+		or a
+		jp nz,lmb_ex
+		ld a,c
+		call mouse_x_div8
+		cp 11
+		jp c,lmb_ex
+		cp 29
+		jp nc,lmb_ex		; empty left/right menu
+
+		cp 21	; download / graphics
+		jr c,menu_first
+		cp 23	; music/press
+		jp c,lmb_ex	; subdivider
+
+menu_two	ld a,c
+		or a
+		jr nz,menu_two_gfx
+		ld a,music_sites
+
+menu_sw		ld (sites_sw+1),a
+		ld a,download_page
+		ld (load_ram_page+1),a
+		xor a
+		ld (link_num+1),a
+		inc a
+		ld (lmb_click_sw+1),a
+		xor a
+		ld (do_after_link_list+1),a	; тип действия для данного сайта
+		jp lmb_ex
+
+menu_two_gfx	ld a,press_sites
+		jr menu_sw
+
+menu_first	ld a,c
+		or a
+		jr nz,menu_first_music
+		ld a,download_sites
+		jr menu_sw
+
+menu_first_music
+		ld a,gfx_sites
+		jr menu_sw
+
+mouse_x_div8
+		ld hl,(mouse_x)
+		or a
+		srl h
+		rr l
+		srl h
+		rr l
+		srl h
+		rr l
+		ld a,l
+		ret
+
+key_wait	equ #07
+
+enter_search	ld a,1
+		dec a
+		ld (enter_search+1),a
+		ret nz
+		inc a
+		ld (enter_search+1),a
+
+		call Read_Keyboard
+		or a
+		ret z
+		cp enter
+		jr nz,es1
+		xor a			; press ENTER
+		ld (enter_search_sw+1),a
+		ld hl,search_textpage_adr
+		ld (search_input_adress+1),hl
+main_site_url	ld hl,0
+		ld bc,#0d0d
+		ld de,search_url
+		push de
+		call find_copy_char
+		ex de,hl
+		ld (hl),"&"
+		inc hl
+		ld (hl),"s"	; page num
+		inc hl
+		ld (hl),"="
+		inc hl
+		ex de,hl
+		ld hl,search_textpage_adr
+		call copy_ini
+		dec de
+		ld a,#0d
+		ld (de),a
+		pop hl
+		ld (main_list_url+1),hl
+		ld a,view_downloaded_list
+		ld (do_after_load+1),a
+		ld a,download_page;	list_ram_page
+		ld (load_ram_page+1),a
+		call parse_url
+		jp main_list_url		; готовим строку поиска
+
+es1		cp del
+		jr nz,es2
+		ld hl,(search_input_adress+1)
+		ld a," "
+		ld (hl),a
+		dec l
+		ld a,l
+		cp #08		; начало строки поиска - 1
+		jr nc,search_input_adress2
+		ld hl,search_textpage_adr
+		jr search_input_adress2
+
+es2		cp #20
+		ret c
+		push af
+		call set_Textpage_lite
+		pop af
+
+search_input_adress	
+		ld hl,search_textpage_adr
+		ld (hl),a
+		inc l
+		ld a,l
+		cp #08+32
+		ret z
+search_input_adress2
+		ld (search_input_adress+1),hl
+search_input_adress3
+		ld a,"_"
+		ld (hl),a
+		ld a,key_wait
+		ld (enter_search+1),a
+		ret
+
+
+mouse_proc	call mouse_buttons
+		call mouse_pos
+
+		ld a,(mouse_y)
+		ld (mouse_spr),a	; Y
+		cp 8
+		jr nc,mouse_margin_y
+		ld de,#fff8
+		ld b,d
+		ld c,e
+		jr mouse_mrg_y_top
+
+mouse_margin_y	cp 240-16
+		jr c,mouse_margin_y_ex
+		ld de,#0118
+		ld bc,#0008
+
+mouse_mrg_y_top	ld hl,0
+		add hl,bc
+		ld a,h
+		cp d
+		jr nz,mouse_mrg_y_top2
+		ld a,l
+		cp e
+		jr z,mouse_margin_y_ex
+mouse_mrg_y_top2
+		ld (mouse_mrg_y_top+1),hl
+
+mouse_margin_y_ex
+		ld hl,(mouse_x)
+		ld bc,8
+		sub hl,bc
+		jr nc,mouse_margin_x
+		ld bc,#f8f8
+		jr mouse_mrg_x_top
+
+mouse_margin_x	ld hl,(mouse_x)
+		ld bc,320-16
+		sub hl,bc
+		jr c,mouse_margin_x_ex
+		ld bc,#c808
+
+mouse_mrg_x_top	ld a,0
+		add c
+		cp b
+		jr z,mouse_margin_x_ex
+		ld (mouse_mrg_x_top+1),a
+
+mouse_margin_x_ex
+		ld hl,(mouse_x)
+		ld a,l
+		ld (mouse_spr+2),a	; X
+		ld a,(mouse_spr+3)
+		and #fe
+		or h
+		ld (mouse_spr+3),a
+
+mouse_show_sw	ld a,0
+		or a
+		ret nz
+		ld hl,sprites
+		jp set_ports
+
+/*
+  D0 - левая кнопка
+  D1 - правая кнопка
+  D2 - средняя кнопка
+
+ D4-D7 - wheel
+
+Standard Kempston Mouse
+#FADF - buttons
+#FBDF - X coord
+#FFDF - Y coord
+*/
+mouse_pos
+		LD BC,#FADF
+		IN A,(C)     ;читаем порт кнопок
+key_in		ld (mouse_button),a
+
+		LD     BC,#FBDF
+		IN     A,(C)
+MOUSE11		LD     d,0
+		LD     (MOUSE11+1),A
+		sub d
+		CALL   NZ,MOUSE_X_vector
+		LD     B,#FF
+		IN     A,(C)
+
+;		call key_scan
+
+MOUSE12		LD     D,0
+		LD     (MOUSE12+1),A
+		SUB    D
+		CALL   NZ,MOUSE_Y_vector
+		RET
+
+MOUSE_X_vector	JP M,MOUSE35	; Sign Negative (M)
+		ld e,a
+		ld d,0
+		ld hl,(mouse_x)
+		add hl,de
+		ld (mouse_x),hl
+		ld de,320
+		sub hl,de
+		ret c
+1		ld hl,320-1
+		jr 1f
+
+MOUSE35		neg
+		ld e,a
+		ld d,0
+		or a
+		ld hl,(mouse_x)
+		sub hl,de
+		jr nc,1f
+		ld hl,0
+1		ld (mouse_x),hl
+		RET
+
+MOUSE_Y_vector
+		JP M,MOUSE45
+		ld e,a
+		ld d,0
+		or a
+		ld hl,(mouse_y)
+		sub hl,de
+		jr nc,2f
+		ld hl,0
+2		ld (mouse_y),hl
+		ret
+
+MOUSE45
+		neg
+		ld e,a
+		ld d,0
+		ld hl,(mouse_y)
+		add hl,de
+		ld (mouse_y),hl
+		ld de,240
+		sub hl,de
+		ret c
+		ld hl,240-1
+		jr 2b
+
+
+
+koorp		ld a,c
+		and #18
+	;	or #c0
+		ld h,a
+		ld a,c
+		and #07
+		rrca
+		rrca
+		rrca
+		add a,b
+		ld l,a
+		ret 	; 14 байт, 53 такта
+
+
+im2_init	
+		xor a	
+		ld bc,HSINT
+		out (c),a
+		ld bc,VSINTL
+		out (c),a
+		ld bc,VSINTH
+		out (c),a
+		ld e,4
+		ld b,high GXOFFSL
+		call fill_ports
+		ld e,7
+		ld b,high T0XOFFSL
+		call fill_ports
+		call spr_off
+		ld a,#be
+		ld i,a
+		ld hl,int_gfx_view
+		ld (#beff),hl
+		im 2
+		ret
+
+fill_ports	out (c),a
+		inc b
+		dec e
+		jr nz,$-4
+		ret
+
+Read_Keyboard	LD HL,Keyboard_Map      ; Point HL at the keyboard list
+                LD D,8                  ; This is the number of ports (rows) to check
+                LD C,#FE                ; C is always FEh for reading keyboard ports
+Read_Keyboard_0	LD B,(HL)               ; Get the keyboard port address from table
+                INC HL                  ; Increment to list of keys
+                IN A,(C)                ; Read the row of keys in
+                AND #1F                 ; We are only interested in the first five bits
+                LD E,5                  ; This is the number of keys in the row
+Read_Keyboard_1 SRL A                   ; Shift A right; bit 0 sets carry bit
+                JR NC,Read_Keyboard_2   ; If the bit is 0, we've found our key
+                INC HL                  ; Go to next table address
+                DEC E                   ; Decrement key loop counter
+                JR NZ,Read_Keyboard_1   ; Loop around until this row finished
+                DEC D                   ; Decrement row loop counter
+                JR NZ,Read_Keyboard_0   ; Loop around until we are done
+                AND A                   ; Clear A (no key found)
+                RET
+
+Read_Keyboard_2
+		ld a,(hl)
+		cp "0"
+		ret nz
+		ld bc,#fefe
+		in a,(c)
+		bit 0,a
+		ld a,(hl)
+		ret nz
+		ld a,del
+                RET
+/*
+		ld d,0
+		ld bc,#fefe                               ; check for CAPS SHIFT
+		in a,(c)
+		bit 4,a
+		jr nz,1f
+		ld d,#30
+1		ld a,d
+		add e
+*/
+Keyboard_Map:       
+		DB #FB,"q","w","e","r","t"
+		DB #F7,"1","2","3","4","5"
+		DB #EF,"0","9","8","7","6"
+		DB #DF,"p","o","i","u","y"
+		DB #BF,enter,"l","k","j","h"
+		DB #7F," ",sym,"m","n","b"
+		DB #FD,"a","s","d","f","g"
+		DB #FE,caps,"z","x","c","v"
+caps	equ #01
+sym	equ #02
+enter	equ #0d
+del	equ #0c
+/*
+   Рассмотрим рисунок клавиатуры:
+
+N:БИТA| 0| 1| 2| 3| 4| 4| 3| 2| 1| 0|
+------+--+--+--+--+--+--+--+--+--+--+   N_
+N_  3 | 1| 2| 3| 4| 5| 6| 7| 8| 9| 0| 4 П
+П     +--+--+--+--+--+--+--+--+--+--+   О
+О   2 | Q| W| E| R| T| Y| U| I| O| P| 5 Л
+Л     +--+--+--+--+--+--+--+--+--+--+   У
+У   1 | A| S| D| F| G| H| J| K| L|ENT 6 Р
+Р     +--+--+--+--+--+--+--+--+--+--+   Я
+Я   0 |CS| Z| X| C| V| B| N| M|SS|SPC 7 Д
+Д     +--+--+--+--+--+--+--+--+--+--+   А
+А
+         3-#F7             4-#EF
+         2-#FB             5-#DF
+         1-#FD             6-#BF
+         0-#FE             7-#7F
+*/
+
+
+fill_menu	push bc
+fill_menu1	ld (hl),e
+		inc l
+		ld (hl),d
+		inc l
+		djnz fill_menu1
+		inc h
+		ld l,b
+		pop bc
+		dec c
+		jr nz,fill_menu
+		ret
+
+all_init	di
+		ld bc,MEMCONFIG
+		ld a,%00001110
+		out (c),a
+		xor a
+		call set_page0
+		call im2_init
+		call mouse_pos
+		ld bc,PAGE3
+		ld a,Vid_page
+		out (c),a
+		ld hl,#0000		;1111 - white
+		ld (#c000),hl
+		ld hl,init_ts
+		call set_ports
+		ld hl,all_pals
+		call set_ports		
+		ld hl,splash_copy
+		jp set_ports
+
+gfx_init	ld hl,cursor_copy
+		call set_ports
+		ld hl,menu_copy
+		call set_ports
+		ld hl,status_copy
+		call set_ports
+		ld hl,mouse_step
+		xor a
+1		ld b,4
+		ld (hl),a
+		inc l
+		djnz $-2
+		ld (hl),a
+		inc a
+2		inc l
+		bit 7,l
+		jr z,1b
+		ld l,#80
+		ld d,h
+		ld e,#80
+3		ld a,(hl)
+		neg
+		ld (de),a
+		inc e
+		dec l
+		jr nz,3b
+		xor a
+		ld (lmb_click_sw+1),a
+		ret
+
+init_ts		db #20,6
+		db high BORDER,#f0	; border
+		db high SGPAGE, Sprite_page
+		db high CacheConfig,#0c	; cache for #8000 - #c000
+
+
+clr_gfx256_screen
+		defb #1a,0	;
+		defb #1b,0	;
+		defb #1c,Vid_page	;
+		defb #1d,0	;
+		defb #1e,0	;
+		defb #1f,Vid_page	;
+		defb #26,#ff	;
+		defb #28,#ff	;
+		defb #27,%00000100
+		db #ff
+
+clr_load_mem	defb #1a,0	;
+		defb #1b,0	;
+clr_load_mem1	defb #1c,0	;
+		defb #1d,0	;
+		defb #1e,0	;
+clr_load_mem2	defb #1f,0	;
+		defb #26,#ff	;
+		defb #28,32-1	;
+		defb #27,%00000100
+		db #ff
+
+
+gfx_copy	db #1a,0
+		db #1b,0	;#0210 - данные битмап
+		db #1c,download_page
+		db #1d,0
+		db #1e,0
+		db #1f,Gfx_vid_page
+gfx_copy_w	db high DMALEN,0
+gfx_copy_h	db high DMANUM,0
+gfx_copy_type	db #27,DMA_RAM + DMA_DALGN;+DMA_ASZ
+		db #ff
+
+view_image_pals
+		db #1a,0
+		db #1b,0
+		db #1c,download_page
+		db #1d,0
+view_image_pals_vpal_adr
+		db #1e,1
+		db #1f,0
+view_image_pals_vpal
+		db #26,#1f
+		db #28,0
+		db #27,#84
+		db #ff
+
+clr_gfx_screen
+		defb #1a,0	;
+		defb #1b,0	;
+		defb #1c,Gfx_vid_page	;
+		defb #1d,0	;
+		defb #1e,0	;
+		defb #1f,Gfx_vid_page	;
+		defb #26,#ff	;
+		defb #28,#ff	;
+		defb #27,%00000100
+		db #ff
+
+clr_analizator	defb #1a,low analizator_screen_adr	;
+		defb #1b,high analizator_screen_adr	;
+		defb #1c,Vid_page+9
+		defb #1d,low analizator_screen_adr	;
+		defb #1e,high analizator_screen_adr	;
+		defb #1f,Vid_page+9
+		defb high DMALEN ,#f	;
+		defb high DMANUM,3-1	;
+		defb #27,DMA_FILL+DMA_ASZ+DMA_DALGN
+		db #ff
+
+clr_text_screen
+		defb #1a,0	;
+		defb #1b,0	;
+		defb #1c,Text_page	;
+		defb #1d,0	;
+		defb #1e,0	;
+		defb #1f,Text_page	;
+		defb #26,#ff	;
+		defb #28,32-1	;
+		defb #27,%00000100
+		db #ff
+
+link_page_copy	db #1a,0
+		db #1b,0
+		db #1c,download_page
+		db #1d,0
+		db #1e,0
+		db #1f,list_ram_page
+		db #26,#ff
+		db #28,32-1
+		db #27,DMA_RAM
+		db #ff
+
+cursor_copy	db #1a,low cursor_adr
+		db #1b,high cursor_adr
+		db #1c,cursor_page
+		db #1d,0
+		db #1e,0
+		db #1f,Sprite_page
+		db #26,32/4-1
+		db #28,16-1
+		db #27,DMA_RAM + DMA_DALGN
+		db #ff
+
+menu_copy	db #1a,0
+		db #1b,0
+		db #1c,menu_gfx_page
+		db #1d,0
+		db #1e,0
+		db #1f,Vid_page
+		db #26,320/2-1
+		db #28,32-1
+		db #27,DMA_RAM + DMA_DALGN +DMA_ASZ
+		db #ff
+
+splash_copy	db #1a,0
+		db #1b,0
+		db #1c,splash_gfx_page
+		db #1d,40
+		db #1e,0
+		db #1f,Vid_page+2
+		db #26,240/2-1
+		db #28,109-1
+		db #27,DMA_RAM + DMA_DALGN +DMA_ASZ
+		db #ff
+
+status_copy	db #1a,0
+		db #1b,#28
+		db #1c,menu_gfx_page
+		db #1d,0
+		db #1e,#3e-2
+		db #1f,Vid_page+8
+		db #26,320/2-1
+		db #28,9-1
+		db #27,DMA_RAM + DMA_DALGN +DMA_ASZ
+		db #ff
+
+status_icon_copy
+		db #1a,0
+		db #1b,0
+		db #1c,2 
+		db #1d,4
+		db #1e,#3e-2
+		db #1f,Vid_page+8
+		db #26,10/2-1
+		db #28,9-1
+		db #27,DMA_BLT + DMA_DALGN +DMA_ASZ
+		db #ff
+
+cancel_icon_copy
+		db #1a,low cancel_icon
+		db #1b,high cancel_icon
+		db #1c,2 
+		db #1d,4+4+128
+		db #1e,#3e-2
+		db #1f,Vid_page+8
+		db #26,8/2-1
+		db #28,7-1
+		db #27,DMA_BLT + DMA_DALGN +DMA_ASZ
+		db #ff
+
+
+
+sprites		db #1a,low spr_db
+		db #1b,high spr_db
+		db #1c,2
+		db #1d,0
+		db #1e,2
+		db #1f,0
+		db #26,#ff
+		db #28,0
+		db #27,DMA_RAM_SFILE
+		db #ff
+all_pals
+		db #1a,low all_pal_bin
+		db #1b,high all_pal_bin
+		db #1c,2
+		db #1d,0
+		db #1e,0
+		db #1f,0
+		db #26,(256/2)-1
+		db #28,0
+		db #27,#84
+		db #ff
+
+zx_pals
+;		db #1a,low all_pal_bin
+;		db #1b,high all_pal_bin
+;		db #1c,2
+		db #1d,#e0
+		db #1e,1
+		db #1f,0
+		db #26,#0f
+		db #28,0
+		db #27,#84
+		db #ff
+
+text_up_copy	db #1a,0
+		db #1b,window_start_Y+2
+		db #1c,Text_page
+		db #1d,0
+		db #1e,window_start_Y
+		db #1f,Text_page
+		db #26,#80-1
+		db #28,window_height*2-1	;-1
+		db #27,DMA_RAM
+		db #ff
+
+text_down_copy	db #1a,0	;low #c000+window_height*2*256
+		db #1c,Text_page
+		db #1d,0	;low #c200+window_height*2*256
+		db #1f,Text_page
+		db #26,#7f
+		db #28,0
+		db #ff
+
+		include "includes.asm"
+		include "tsconfig.asm"
+
+; Обмен с ESP: очереди UART ZiFi и двоичный протокол. Оба файла общие для всех
+; проектов и лежат в соседнем ZiFi Micro Python\Firmware\src — сборка находит
+; их по пути из --inc.
+		include "zifi_uart.asm"
+		include "proto.asm"
+; Сетевые операции ZiFi поверх этого протокола.
+		include "net.asm"
+
+
+mouse_button	db 0
+/*
+  D0 - левая кнопка
+  D1 - правая кнопка
+  D2 - средняя кнопка
+*/
+
+mouse_x		dw 0
+mouse_y		dw 0	
+	; l - X, h- Y
+mouse_map	dw 0
+mouse_switch	db 0
+
+
+		ALIGN 2
+spr_db		
+
+		DB 0
+		DB %01000000	; leap
+		DB 0
+		DB %00010000
+		DB 0
+		DB %11100000
+
+		
+		DB 0
+		DB %01000000	; leap
+		DB 0
+		DB %00010000
+		DB 0
+		DB %11100000
+
+
+mouse_spr
+		db 0		;y
+		db SP_SIZE16+SP_ACT
+		db #0		;x
+		db SP_SIZE16
+		db #0
+		db Mouse_pal_num+#00
+
+
+/*
+; show text
+txt_spr
+		db 240-96-16;+16	;y
+		db SP_SIZE16+SP_ACT
+		db #0		;x
+		db SP_SIZE64
+		db #00
+		db #ef
+
+		db 240-96-16;+16	;y
+		db SP_SIZE16+SP_ACT
+		db #0+64	;x
+		db SP_SIZE64
+		db #08
+		db #ef
+*/
+
+		DB 0		;exit
+		DB %01000000	; leap
+		DB 0
+		DB %00010000
+		DB 0
+		DB %11100000
+spr_db_end
+
+
+
+; Длина zifi.ini. Файл уходит на ESP целиком командой WIFI_INI, ключи разбирает
+; прошивка; значение кладёт load_ini из длины, которую вернул FENTRY.
+ini_length		dw 0
+; Путь файла на сервере строкой с нулём: его кладёт parse_url, а забирает
+; NET_HTTP_GET. Текст самого запроса собирает ESP.
+request_path		ds 256
+; Адрес сервера строкой с нулём на конце: его кладёт сюда parse_url, а берёт
+; NET_OPEN. Раньше строка была частью команды AT+CIPSTART.
+cmd_conn2site_adr	ds #40
+
+
+
+current_load_page	db 0
+
+; Состояние приёмника файла. Обращение к ним идёт по смещению +1: в оригинале
+; это были операнды самомодифицирующегося кода внутри цикла приёма, и так на
+; них по-прежнему ссылается store_body_byte. Цикл заменён, смещения нет.
+zipd_adr		ds 1
+			dw 0		; zipd_adr+1 — куда класть следующий байт
+zipd_page		ds 1
+			db 0		; zipd_page+1 — текущая страница приёмника
+readed_len_low		ds 1
+			dw 0		; readed_len_low+1 — принято, младшие 16 бит
+readed_len_high		ds 1
+			db 0		; readed_len_high+1 — старший байт
+
+; Заготовки строк запроса удалены: «GET … HTTP/1.0», Host, User-Agent и
+; Connection собирает ESP в http_get. На Z80 этой склейки больше нет.
+
+zip_url_buffer	db "http://zifi.vtrd.in/unzipremote.php?f="
+zip_url_buffer_data	ds 256
+
+list_search_db
+		db "Search:"
+		dup 5
+		db #0a
+		edup
+list_search_db_end
+
+
+		align 256
+all_pal_bin	incbin "_spg/menu.tga.pal"
+		incbin "_spg/pal_zx.tga.pal"
+search_url	ds 64
+
+		align 256
+mouse_step	ds 256
+
+parsed_link		ds #080
+; Тело команды NET_HTTP_GET: адрес,0,порт,путь,0. Собирает Net_HttpGet.
+httpget_payload		ds 256+128
+current_paging_url	ds 150
+
+sd_init
+		call init_sd_card
+		
+		CALL DOS_SWP; DEPACK Driver
+		CALL DEV_INI
+		JP NZ,ER0
+		CALL HDD
+		JP NZ,ER1
+		CALL SETROOT; SET ROOT DIR
+		jp sd_exit
+
+/*
+[17:37:51] Koshi: ну вначале зайди в папко
+[17:37:55] Koshi: где файло настроек
+[17:38:02] Koshi: чтобы зайти в папко ннадо сделать
+[17:38:08] Koshi: LD HL,DIR1
+        CALL FENTRY
+[17:38:13] Koshi: затем CALL SETDIR
+[17:38:35] Koshi: затем запустить LD HL,FILE_INI:CALL FENTRY
+[17:38:40] Koshi: и тока потом уже можна LOAD512
+[17:38:48] Koshi: если конечно файл нашелся
+[17:39:23] Koshi: FENTRY ищет файлы/каталоги
+[17:39:29] Koshi: и выдает длину оных в ответ
+[17:39:43] Koshi: плюс позиционирует на них
+[17:39:58] Koshi: но LOAD512 сразу после FENTRY, када искали дир
+[17:40:03] Koshi: буит читать САМ дир
+[17:40:10] Koshi: аля содержимое низкоуровневое дира
+[17:40:20] Koshi: чтобы перейти на дир
+[17:40:23] Koshi: надо сетнуть его
+[17:40:26] Koshi: и потом уже в НЕМ
+[17:40:28] Koshi: искать файло
+[17:40:34] Koshi: по то му же FENTRY
+*/
+
+
+on_int_dma	ld a,1
+		jr sw_int_dma
+off_int_dma	xor a
+sw_int_dma	ld (save_mode+1),a
+	;	ld (analizator_sw+1),a
+;		ld (mouse_sw+1),a
+;		jp wait_frame
+		ret
+
+
+save_downloaded_file	; ld de,10884	; file lenght 
+		call init_sd_card
+		ld de,disk_icon
+		call set_icon
+		ld ix,read_threads
+		ld de,(ix+thread.full_len)
+		ld hl,FILE+1
+		ld (hl),e
+		inc hl
+		ld (hl),d
+		inc hl
+		ld a,(ix+thread.full_len_high)
+		ld (hl),a
+;		ld (save_over_64+1),a
+;		ld c,a
+		ex de,hl
+		ld d,0
+		ld e,a
+		call DEL512  ;расчёт длины в секторах: i:[DE,HL]/512 	
+/*
+		ld a,e
+		or a
+		jr z,1f
+		inc d
+1		bit 0,d
+		jr z,1f
+		inc d
+1		srl c
+		rr d		; d= sectors (512bytes)
+*/
+		push hl
+;Create File (flag,size,name,0):
+
+		LD HL,FILE
+		CALL MKFILE
+		pop bc		; bc= num sectors
+		JP Z,1f
+				;File Creation Failed
+/*
+[15:50:27] Way Be: если файло есть, то ;File Creation Failed получаем, так?
+[15:50:55] Koshi: и смотрим в A код ошибке
+[15:51:01] Koshi: если 3 - то имя уже занято
+
+;i: HL - flag(1),ln(4),name(1-255),0
+;   NZ - ERROR (NO ENOUGHT SPACE)
+;        A: 1 - ln not valid
+;           2 - index fatality
+;           3 - ln already exists
+;         255 - unknown error
+;    Z - SUCCESS
+MKFILE  EQU CORE+57
+*/
+		cp 3
+		jr z,2f
+		cp 4
+		jr z,2f
+		LD A,5:OUT (254),a
+		jr 2f
+1
+; check size>64kb
+/*
+save_over_64	ld a,0
+		or a
+		jr z,save_64
+*/
+		ld a,b
+		or a
+		jr z,save_64
+;Save data into new file >128kb:
+		ld a,c
+		push af
+		ld c,(ix+thread.page)
+		ld hl,(ix+thread.adress)
+		ld a,b
+3		push af
+		ld b,#80
+		call SAVE512
+		ld b,#80
+		call SAVE512		
+		pop af
+		dec a
+		jr nz,3b
+		pop af
+		or a
+		jr z,3f
+		ld b,a
+		jr 2f
+
+;Save data into new file <128kb:
+save_64		ld b,c
+		ld c,(ix+thread.page)
+		ld hl,(ix+thread.adress)
+2		call SAVE512
+3
+/*
+[11:50:29] Koshi: просто пишешь до посинения
+[11:50:35] Koshi: пока цепочка не кончиццо
+[11:50:59] Koshi: када цепочки конец - сейв512 и лоад512 выдадут в А=#0F
+*/
+		ld hl,status_copy		; clear statusbar gfx
+		call set_ports
+		jp sd_exit
+
+DEL512  ;i:[DE,HL]/512
+        LD A,L,L,H,H,E,E,D,D,0
+        LD BC,1:OR A:CALL NZ,ADD4B
+        LD A,2
+
+DELITX2 ;i:[DE,HL]/A
+;                A - Power of Two
+;        o:[DE,HL]
+
+        CP 2:RET C
+        LD C,0
+        SRL A
+L33T    SRL D:RR E,H,L,C
+        SRL A:JR NC,L33T
+
+        LD A,C:OR A:RET Z
+        LD BC,1:CALL ADD4B
+        RET
+
+ADD4B   ADD HL,BC:RET NC:INC DE
+        RET
+; читаем настройки:
+load_ini	
+		call init_sd_card
+		LD HL,DIR_zifi
+		CALL FENTRY
+		CALL SETDIR
+		LD HL,FILE_INI
+		CALL FENTRY
+		JP Z,ini_not_found
+		; FENTRY отдаёт длину файла в [DE,HL]. Файл целиком уходит на ESP
+		; командой WIFI_INI, а в один пакет протокола больше PROTO_MAX не
+		; влезает; разборщику хватает 511 байтов — столько же берёт плагин
+		; NTP, и предел у обоих один.
+		ld a,d
+		or e
+		jr nz,1f
+		ld a,h
+		cp 2
+		jr c,2f
+1		ld hl,511
+2		ld (ini_length),hl
+		LD C,download_page	; page ini
+		LD HL,#0000
+		LD B,#32
+		CALL LOAD512
+		CALL SETROOT; возвращаемся в коневой
+		call sd_exit
+
+
+parse_ini	ld a,download_page
+		call set_page3
+		ld hl,#c000
+; Имя сети и пароль тут НЕ разбираются. Файл уходит на ESP целиком командой
+; WIFI_INI, и все пары «ключ: значение» читает прошивка — там уже есть готовый
+; разборщик. Здесь ищется только поле time:, потому что смещение GMT нужно
+; самому ZiFi для записи RTC.
+		ld de,ini_db
+		call cp_ini
+		call find_next_line
+		call find_next_line
+		ld de,ini_db_time
+		call cp_ini
+		cp "n"
+		ret z		; time will not updated
+
+		ld (update_rtc_sw+1),a	; set on update time
+		cp "0"
+		jr c,1f
+		cp "9"
+		jr c,2f
+1		cp "+"		; set +/- gmt time
+		jr nz,gmt_minus
+		inc hl
+2		call get_gmt
+		neg
+		ld (gmt_time+1),a
+		ret
+
+gmt_minus	cp "-"
+		ret nz
+		inc hl
+		call get_gmt
+		ld (gmt_time+1),a
+		ret
+
+get_gmt		ld b,(hl)
+		inc hl
+		ld a,(hl)
+		cp #2f
+		jr c,1f
+		and #0f
+		add a
+		ld c,a
+		add a
+		add a
+		add c
+		ld c,a
+		ld a,b
+		and #0f
+		add c
+		ret
+
+1		ld a,b
+		and #0f
+		ret
+
+find_next_line
+		ld a,(hl)
+		cp #0d+1
+		jr c,1f
+		inc hl
+		jr find_next_line
+
+1		inc hl
+		ld a,(hl)
+		cp #0d+1
+		ret nc
+		inc hl
+		ret
+ini_not_found
+		call set_Textpage
+		ld hl,ini_not_found_msg
+		ld b,1
+		call zifi_echo
+		jr $
+ini_not_found_msg	db ' Error: zifi.ini not found',0,0
+/*
+читаем настройки:
+        LD HL,DIR_INI
+        CALL FENTRY
+        CALL SETDIR
+        LD HL,FILE_INI
+        CALL FENTRY
+        LD C,0
+        LD HL,0
+        LD B,X
+        CALL LOAD512
+        CALL SETROOT; возвращаемся в коневой
+*/
+
+;CALL VYGREB; Выгребаем каталог, чисто по приколу
+
+;LD HL,FILENAM ; ищем файл
+;CALL FENTRY:JP Z,ER2
+;LD HL,#1000,C,#02 ; читаем файл (1 блок, 512 байт)
+;LD B,1:CALL LOAD512
+
+; переходим в папку
+set_download_dir
+		call init_sd_card
+		call SETROOT
+		LD HL,DIR_zifi
+		CALL FENTRY
+		jr nz,zifi_dir
+		LD HL,DIR_zifi+1
+		CALL MKDIR
+		JR Z,set_download_dir
+		JP ER3
+
+zifi_dir	call SETDIR		; we in "zifi" dir
+download_dir
+		LD HL,DIR_download
+		CALL FENTRY
+		jr nz,current_dir	; Set DIR found by FENTRY active
+		LD HL,DIR_download+1
+		CALL MKDIR
+		JR Z,download_dir
+		JP ER3
+
+current_dir	call SETDIR		; we in "zifi/downloads" dir
+		LD HL,DIR_date		; check current date dir
+		CALL FENTRY
+		jr nz,sd_exit_date		; Set DIR found by FENTRY active
+		LD HL,DIR_date+1
+		CALL MKDIR
+		JR Z,current_dir
+		jr sd_exit 
+
+init_sd_card	call off_int_dma
+		ld a,sd_driver_page
+		jp set_page0
+
+sd_exit_date	call SETDIR
+sd_exit		call on_int_dma
+		xor a
+		jp set_page0
+
+
+//		db "Your"
+//		DB "0000-00-00" ; date
+//		DB "0000"	; time
+
+write_rtc
+		ld a,#80
+		ld bc,#eff7
+		out (c),a
+
+	; register b
+		ld a,#0b
+		ld b,#df
+		out (c),a
+		ld a,#82
+		ld b,#bf
+		out (c),a
+
+		ld hl,get_buffer+4	; startup downloaded time 
+	; date of the month
+		ld a,#07
+		ld b,#df
+		out (c),a
+		ld b,#bf
+		call code_time_rtc
+		out (c),a
+		inc hl		; "_"
+	; month
+		ld a,#08
+		ld b,#df
+		out (c),a
+		ld b,#bf
+		call code_time_rtc
+		out (c),a
+		inc hl		; "_"
+	; year
+		inc hl		; 2
+		inc hl		; 0
+		ld a,#09
+		ld b,#df
+		out (c),a
+		ld b,#bf
+		call code_time_rtc
+		out (c),a
+	; hours		
+		ld a,#04
+		ld b,#df
+		out (c),a
+		ld b,#bf
+		
+		ld a,(hl)
+		and #0f
+		add a
+		ld e,a
+		add a
+		add a
+		add e
+		ld e,a
+		inc hl
+		ld a,(hl)
+		and #0f
+		add e
+		inc hl
+		ld e,0		; calculate time with gmt offset, signed (-2 = #fe, +2 = 2 )
+gmt_time	add 0
+		jp m,3f
+		cp 24
+		jr c,1f
+		jr nc,1f
+		add 24
+		jr 2f
+
+3		add 24
+1		cp 24
+		jr c,2f
+		sub 24
+2		
+4		cp 10
+		jr c,1f
+		sub 10
+		inc e
+		jr 4b
+
+1		or a
+		rl e
+		rl e
+		rl e
+		rl e
+		or e
+		out (c),a
+
+	; minutes		
+		ld a,#02
+		ld b,#df
+		out (c),a
+		ld b,#bf
+		call code_time_rtc
+		out (c),a
+
+	; register b
+		ld a,#0b
+		ld b,#df
+		out (c),a
+		ld a,#02
+		ld b,#bf
+		out (c),a
+
+		ld a,#00
+		ld bc,#eff7
+		out (c),a
+		ret
+
+code_time_rtc	ld a,(hl)
+		and #0f
+		rla
+		rla
+		rla
+		rla
+		ld e,a
+		inc hl
+		ld a,(hl)
+		and #0f
+		or e
+		inc hl
+		ret
+
+;---------------------------------------
+/*
+VYGREB  LD DE,#8000
+VYG     CALL NXTETY:RET Z
+        LD A,D:CP #C0:RET NC
+        JR VYG
+*/
+;---------------------------------------
+ER0     ;Device not found
+;       (SD Card NOT ready!)
+		LD A,1:OUT (254),a
+		JP sd_exit
+;-------
+ER1     ;FAT32 NOT FOUND
+
+		LD A,2:OUT (254),a
+		JP sd_exit
+;-------
+ER2     ;File NOT FOUND
+
+		LD A,3:OUT (254),a
+		JP sd_exit
+;-------
+ER3     ;Dir Creation Failed
+
+		LD A,4:OUT (254),a
+		JP sd_exit
+;-------
+ER4     ;File Creation Failed
+/*
+[15:50:27] Way Be: если файло есть, то ;File Creation Failed получаем, так?
+[15:50:55] Koshi: и смотрим в A код ошибке
+[15:51:01] Koshi: если 3 - то имя уже занято
+*/
+		LD A,5:OUT (254),a
+		JP sd_exit
+
+;---------------------------------------
+/*
+FILENAM		DB #00; 0 - file, 1 - DIR
+		DB "WC_History.txt",0
+*/
+
+FILE		DB #00;        flag
+;		DW #1000,#0000;length - 4kb
+		DW #0000,#0000;length
+FILE_NAME	ds 48
+		db 0
+
+/*
+[14:12:36] Koshi: младший, старший вестимо
+[14:12:42] Way Be: ок
+[14:12:46 | Змінено в 14:12:49] Koshi: #0000 1000 = 4кб
+[14:13:03] Koshi: в примере же написано		
+*/
+
+FILE_INI	DB #00; 0 - file, 1 - DIR
+		DB "zifi.ini",0
+
+DIR_download	DB #10
+		DB "downloads",0
+
+DIR_zifi	DB #10
+		DB "zifi",0
+
+DIR_date		DB #10
+		DB "0000-00-00",0
+
+;---------------------------------------
+CORE    EQU #2002
+DEV_INI EQU CORE+3
+HDD     EQU CORE+9
+;-------
+;i: CHL - Addres
+;     B - lenght (512b blocks)
+;o: CHL - New Value
+;     A - EndOfChain (#0F)
+LOAD512 EQU CORE+21
+
+;i: CHL - Addres
+;     B - lenght
+;o: CHL - New Value
+;     A - EndOfChain (#0F)
+SAVE512 EQU CORE+24
+
+DOS_SWP EQU CORE+27
+
+;i: HL - flag(1),ln(4),name(1-255),0
+;   NZ - ERROR (NO ENOUGHT SPACE)
+;        A: 1 - ln not valid
+;           2 - index fatality
+;           3 - ln already exists
+;         255 - unknown error
+;    Z - SUCCESS
+MKFILE  EQU CORE+57
+
+;i: HL - DirName(1-255,0)
+;o: NZ - ERROR
+;        A: 1 - ln not valid
+;           2 - index fatality
+;           3 - ln already exists
+;         255 - unknown error
+;    Z - SUCCESS
+MKDIR   EQU CORE+60
+
+;i: HL - flag(1),name(1-255),0
+;o:  Z - NOT FOUND
+;   NZ - FILE DELETED
+DELFL   EQU CORE+63
+
+;i: HL - flag(1),oldname(1-255),0
+;   DE - newname(1-255),0
+;o:  Z - NOT FOUND
+;   NZ - SUCCESS
+RENAM   EQU CORE+66
+
+;Search for entry in current DIR
+;i: HL - flag(1),name(1-255),0
+;o:  Z - NOT FOUND
+;   NZ - [DE,HL] - file length
+;        SEEK0 is automatically called
+FENTRY  EQU CORE+78
+
+;Seek/Skip N sectors
+;i: B - Number of sectors to process
+LOADNON EQU CORE+84
+
+;GetNextEntryFromActiveDir
+;i: DE - Addres
+;o: DE - New Value
+;    Z - EndOfDir
+;   NZ - OK
+;
+;STRUCTURE:
+;fclus(4),size(4),date(2),time(2),
+;!flag(1),name(1-255),#00
+NXTETY  EQU CORE+87
+
+;Set DIR found by ENTRY active
+SETDIR  EQU CORE+93
+
+;Set ROOT DIR active
+SETROOT EQU CORE+96
+
+SEEK0   EQU CORE+99
+
+
+	struct thread
+num		byte	; num thread -1
+len		word	; current ipd lenght
+adress		word	; current adress
+page		byte	; current page 
+file_ext	word	; file name adress
+full_len 	word	; lenght of file
+full_len_high	byte	; 
+	ends
+
+
+
+read_threads	ds 6*5
+		db #ff
+
+
+
+; Найти модуль, убедиться что прошивка отвечает, и поднять Wi-Fi.
+; Раньше здесь шла цепочка AT-команд (ATE0, GMR, CWMODE, CWAUTOCONN, CIPMUX,
+; CIPRECVMODE, CIPDINFO, CWJAP) с разбором текстовых ответов. Native C++
+; прошивке настройка не нужна: режимы у неё не переключаются, а подключение
+; выполняется одной командой.
+init_zifi
+		call set_Textpage
+		ld hl,banner_msg
+		ld b,1
+		call zifi_echo
+		call ZiFi_Init		; включить API 1 и прочитать версию
+		jp c,nozifi
+		call Net_Ping		; прошивка обязана ответить READY
+		jp c,init_zifi_silent
+		ld hl,wifi_send_ini_msg
+		ld b,1
+		call zifi_echo
+		call Net_WifiConnect
+		jp c,init_zifi_nowifi
+		ld hl,wifi_connected
+		ld b,1
+		call zifi_echo
+		; Ответ WIFI_INI несёт выданный роутером адрес: показываем его. Это не
+		; украшение — по адресу сразу видно, что ini разобран и сеть настоящая.
+		call show_esp_ip
+		; Сведения о плате: свободная память и версия Native C++ прошивки. Нужны не
+		; для красоты — поведение сокетов зависит от версии, и без неё
+		; разбор отказа идёт вслепую.
+		call show_esp_info
+
+; Проба доступности узла (Net_PingHost) из старта временно убрана. Она задумана
+; как диагностика, но именно на ней старт и застревал, а застрявший старт не
+; даёт проверить главное — саму закачку. Код пробы и её сообщения оставлены:
+; вернётся отдельной строкой, когда закачка подтвердится на железе.
+
+; Самопроверка HTTP прямо на старте: один запрос к тому же адресу, который дёргал
+; оригинал. Смысл в том, чтобы диагноз печатался сам, без хождения по меню: на
+; экране сразу видно либо код ответа сервера, либо причину отказа.
+init_zifi_ready
+		ld hl,selftest_msg
+		ld b,1
+		call zifi_echo
+		ld hl,selftest_url
+		call parse_url
+		call Net_HttpGet
+		jr c,init_zifi_http_bad
+		or a
+		jr z,init_zifi_http_bad
+		ld hl,(NetHttpCode)
+		ld de,selftest_code_field
+		call put_decimal4
+		ld hl,selftest_ok_msg
+		ld b,1
+		call zifi_echo
+		jp Net_Close
+
+; Причина дописывается в ТУ ЖЕ строку. Отдельной строкой она терялась: до
+; пользователя доходило только «HTTP test failed», а весь смысл в тексте после.
+init_zifi_http_bad
+		call Net_Close
+		ld a,(ProtoErr)
+		or a
+		jr nz,1f
+		call Net_GetStep	; резервный путь: спросить метку шага
+		ld a,(ProtoErr)
+		or a
+		jr nz,1f
+		ld hl,selftest_silent
+		jr 2f
+1		ld hl,ProtoErrText
+2		push hl
+		ld a,(NetStepByte)	; метка шага: ноль означает потерю состояния,
+		ld l,a			; то есть перезагрузку платы
+		ld h,0
+		ld de,selftest_step_field
+		call put_decimal4
+		ld hl,(NetPayloadLen)	; длина отправленного тела команды
+		ld de,selftest_len_field
+		call put_decimal4
+		pop hl
+		ld de,selftest_reason_field
+		; РОВНО размер поля минус завершающий ноль. Было 40 при поле в 34
+		; байта: причина длиннее 33 символов писала за буфер и затирала
+		; соседние строки, начиная с selftest_silent и selftest_url — на
+		; экране получался мусор, а следующая проверка шла по испорченному
+		; адресу. Прошивка обрезает свой текст до 44 байт, так что переполнить
+		; поле она может легко.
+		ld b,33
+3		ld a,(hl)
+		or a
+		jr z,4f
+		ld (de),a
+		inc hl
+		inc de
+		djnz 3b
+4		xor a
+		ld (de),a
+		ld hl,selftest_bad_msg
+		ld b,1
+		jp zifi_log
+
+selftest_msg		db "HTTP test: zifi.vtrd.in",0,0
+selftest_ok_msg		db "HTTP test OK, server code "
+selftest_code_field	db "    "
+			db 0,0
+selftest_bad_msg	db "HTTP fail step "
+selftest_step_field	db "    "
+			db " len "
+selftest_len_field	db "    "
+			db " "
+selftest_reason_field	ds 34
+selftest_silent		db "ESP silent",0
+selftest_url		db "http://zifi.vtrd.in/zifi_ver.php?w=0733",13,10
+
+; Молчание узла и молчание прошивки для пользователя выглядят одинаково, поэтому
+; под строкой печатается причина: текст исключения с ESP либо метка шага.
+init_zifi_ping_none
+		ld hl,ping_none_msg
+		ld b,1
+		call zifi_log
+		jp net_report_reason
+
+; Показать ответ SYS_INFO как есть: это готовая строка ASCII вида
+; «RAM:… Flash:… FW:Native C++ native-…». Молчание прошивки тут не беда —
+; строка необязательная, поэтому отказ просто пропускается.
+show_esp_info
+		ld hl,0
+		ld bc,0
+		ld a,CMD_SYS_INFO
+		call Net_Request
+		ld de,NET_WAIT_PING
+		call ZiFi_SetTimeout
+		ld a,RESP_SYS_INFO
+		call Net_WaitCmd
+		ret c
+		; print печатает до нуля, а в пакете его нет: ставим сами. Длину
+		; ограничиваем — строка короткая, а писать за буфером нельзя.
+		ld hl,(ProtoRxLen)
+		ld a,h
+		or a
+		ret nz
+		ld a,l
+		cp 120
+		ret nc
+		ld bc,ProtoBuf
+		add hl,bc
+		ld (hl),0
+		ld hl,ProtoBuf
+		ld b,1
+		jp zifi_echo
+
+; Показать адрес, который выдал роутер. Четыре байта лежат в ответе WIFI_INI
+; сразу за признаком успеха.
+show_esp_ip
+		ld de,esp_ip_field
+		ld hl,ProtoBuf+1
+		ld b,4
+1		ld a,(hl)
+		inc hl
+		push hl
+		push bc
+		call put_octet
+		pop bc
+		pop hl
+		dec b
+		jr z,1f
+		ld a,"."
+		ld (de),a
+		inc de
+		jr 1b
+1		xor a
+		ld (de),a
+		ld hl,esp_ip_msg
+		ld b,1
+		jp zifi_echo
+
+; A — байт 0..255, DE — приёмник. Печатает без ведущих нулей и сдвигает DE.
+put_octet
+		ld l,a			; значение приходит в A
+		ld h,0
+		xor a
+		ld (put_octet_seen),a
+		ld bc,-100
+		call put_octet_digit
+		ld bc,-10
+		call put_octet_digit
+		ld a,"0"		; последний разряд печатается всегда
+		add a,l
+		ld (de),a
+		inc de
+		ret
+
+put_octet_digit
+		call Num1
+		cp "0"
+		jr nz,1f
+		ld a,(put_octet_seen)
+		or a
+		ret z			; ведущий ноль не печатаем
+		ld a,"0"
+1		ld (put_octet_seen),a
+		ld (de),a
+		inc de
+		ret
+
+put_octet_seen		db 0
+
+esp_ip_msg		db "ESP IP: "
+esp_ip_field		ds 16
+
+; HL — число до 9999, DE — четыре символа приёмника. Ведущие нули заменяются
+; пробелами: в консоли «24 ms» читается, а «0024 ms» выглядит поломкой.
+put_decimal4
+		xor a
+		ld (put_decimal_seen),a
+		ld bc,-1000
+		call put_decimal_digit
+		ld bc,-100
+		call put_decimal_digit
+		ld bc,-10
+		call put_decimal_digit
+		ld a,"0"		; последний разряд печатается всегда
+		add a,l
+		ld (de),a
+		ret
+
+; Num1 возвращает цифру в A и остаток в HL, вычитая BC нужное число раз.
+put_decimal_digit
+		call Num1
+		cp "0"
+		jr nz,put_decimal_put
+		ld a,(put_decimal_seen)
+		or a
+		ld a,"0"
+		jr nz,put_decimal_put
+		ld a," "		; значащих цифр ещё не было
+		jr put_decimal_store
+put_decimal_put
+		ld (put_decimal_seen),a	; напечатанная цифра снимает подавление
+put_decimal_store
+		ld (de),a
+		inc de
+		ret
+
+put_decimal_seen	db 0
+
+ping_start_msg		db "Probing google.com...",0,0
+ping_host_name		db "google.com",0
+ping_reply_msg		db "google.com answered in "
+ping_ms_field		db "    "
+			db " ms",0,0
+ping_none_msg		db "google.com did not answer",0,0
+
+; Прошивка не отвечает или сеть не поднялась. В отличие от отсутствующего модуля
+; это не повод останавливать программу: меню и локальные файлы работают и без
+; сети, а попытка скачивания честно закончится нулевой длиной.
+init_zifi_silent
+		ld hl,esp_silent_msg
+		ld b,1
+		jp zifi_echo
+
+init_zifi_nowifi
+		ld hl,wifi_failed_msg
+		ld b,1
+		jp zifi_echo
+;		ld b,25
+;		call wait
+;		ld hl,cmd_cipsta	; is Set IP address of station ?
+;		call zifi_send
+;		call zifi_check_receive_command
+;		ret
+/*
+		ld b,25
+		call wait
+		ret
+*/
+
+
+
+
+nozifi		ld hl,conf_not_found_msg
+		ld b,1
+		call zifi_echo
+		jr $
+conf_not_found_msg
+		db "Error: Please update TS Conf.",0,0
+zifi_not_found_msg
+		db "Error: ZiFi ESP8266 module not found.",0,0
+/*
+Address         Mode Name Description
+0x00EF..0xBFEF  R    DR   Data register (ZIFI or RS232).
+                          Get byte from input FIFO.
+                          Input FIFO must not be empty (xx_IFR > 0).
+0x00EF..0xBFEF  W    DR   Data register (ZIFI or RS232).
+                          Put byte into output FIFO.
+                          Output FIFO must not be full (xx_OFR > 0).
+
+Address Mode Name   Description
+0xC0EF  R    ZF_IFR ZIFI Input FIFO Used Register. Switch DR to ZIFI FIFO.
+                    0 - input FIFO is empty, 191 - input FIFO contain 191 or more bytes.
+0xC1EF  R    ZF_OFR ZIFI Output FIFO Free Register. Switch DR to ZIFI FIFO.
+                    0 - output FIFO is full, 191 - output FIFO free 191 or more bytes.
+0xC2EF  R    RS_IFR RS232 Input FIFO Used Register. Switch DR to RS232 FIFO.
+                    0 - input FIFO is empty, 191 - input FIFO contain 191 or more bytes.
+0xC3EF  R    RS_OFR RS232 Output FIFO Free Register. Switch DR to RS232 FIFO.
+                    0 - output FIFO is full, 191 - output FIFO free 191 or more bytes.
+
+Address Mode Name   Description
+0xC7EF  W    CR     Command register. Command set depends on API mode selected.
+
+  All mode commands:
+    Code     Command      Description
+    000000oi Clear ZIFI FIFOs
+             i: 1 - clear input ZIFI FIFO,
+             o: 1 - clear output ZIFI FIFO.
+    000001oi Clear RS232 FIFOs
+             i: 1 - clear input RS232 FIFO,
+             o: 1 - clear output RS232 FIFO.
+    11110mmm Set API mode or disable API:
+              0     API disabled.
+              1     transparent: all data is sent/received to/from external UART directly.
+              2..7  reserved.
+    11111111 Get Version  Returns highest supported API version. ER=0xFF - no API available.
+
+Address Mode Name Description
+0xC7EF  R    ER   Error register - command execution result code. Depends on command issued.
+
+  All mode responses:
+    Code Description
+    0x00 OK - no error.
+    0xFF REJ - command rejected.
+
+--------------------------------------------------------------------------------
+
+Until initialization sequence performed API is disabled and the only command recognized is 'Set API mode'.
+
+Initialization sequence:
+- Send 'Set API mode = 1' command,
+- Send 'Get Version' command,
+- Read highest supported API mode from ER,
+- Select desired API mode.
+
+zifi_init:
+  ; select API mode 1
+  ld bc, 0xC7EF
+  ld a, 0xF1
+  out (c), a
+  ; get highest supported API mode
+  ld a, 0xFF
+  out (c), a
+  in a, (c)
+  ; select desired API mode, if need
+  ld a, mode  ; possible values are 0xF2..0xF7
+  out (c), a
+*/
+
+
+
+
+
+
+
+
+		align 2 
+download_icon	incbin "_spg/download.tga.pix"
+disk_icon	incbin "_spg/disk.tga.pix"
+cancel_icon	incbin "_spg/X.tga.pix"
+
+highlight_colors_buff	ds 80
+link_adreses		ds 101*6
+	
+end
+
+music_player		equ #c000
+music_player_init	equ @music_player+3
+music_player_play	equ @music_player+5
+music_player_mute	equ @music_player+8
+music_setup_vars	equ music_player+#55
+
+; Плеер модулей в сборке не участвует: он лежит готовым двоичным блоком
+; _spg/ptplay.bin и подключается к странице 3 через spgbld.ini. Исходники
+; плеера (_pt) в порт не копировались — им тут нечего делать.
+
+	LABELSLIST "build/zifi.l"
+
+		SAVEBIN "build/zifi.bin",start, end-start
+		

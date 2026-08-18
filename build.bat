@@ -25,4 +25,7 @@ call "%~dp0FTP Server\build.bat"
 if errorlevel 1 exit /b %errorlevel%
 
 call "%~dp0NTP Time Sync\build.bat"
+if errorlevel 1 exit /b %errorlevel%
+
+call "%~dp0ZiFi SPG\build.bat"
 exit /b %errorlevel%
