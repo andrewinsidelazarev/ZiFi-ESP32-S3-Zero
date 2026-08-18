@@ -54,7 +54,7 @@ WebDAV ещё не включён. Сетевой файловый listener за
 | **SMB-сервер (Windows)** | [**`ZIFISMB.WMF`**](SMB%20Server/build/ZIFISMB.WMF) | Плагин Wild Commander: доступ к SD-карте по сети `\\ZX-Evo\SD` |
 | **FTP-сервер** | [**`ZIFIFTP.WMF`**](FTP%20Server/build/ZIFIFTP.WMF) | Плагин Wild Commander: полнофункциональный FTP-сервер |
 | **Синхронизация времени** | [**`NTPTIME.WMF`**](NTP%20Time%20Sync/build/NTPTIME.WMF) | Плагин Wild Commander: синхронизация часов RTC через интернет |
-| **Браузер / Загрузчик** | [**`zifi.spg`**](ZiFi%20SPG/build/zifi.spg) | Программа ZiFi для ZX-Evolution (каталог сайтов, скачивание) |
+| **Браузер / Загрузчик** | [**`zifi.spg`**](ZiFi%20SPG/build/zifi.spg) ([пример `zifi.ini`](ZiFi%20SPG/build/zifi.ini)) | Программа ZiFi для ZX-Evolution (каталог сайтов, скачивание) |
 | **Печатная плата переходника** | [**`Manufacturing.zip`**](Zifi%20ESP32%20Zero%20Adapter/Zifi_ESP32_Zero_Adapter-Manufacturing.zip) | Готовый архив герберов для заказа платы переходника в производство |
 
 ## Архитектура двух ядер
