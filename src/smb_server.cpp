@@ -98,6 +98,10 @@ constexpr uint32_t kAsyncIoProgressTimeoutMs = 90 * 1000;
 // пул не конфликтует с отдельной областью кэша каталога и не удваивает память.
 // 12 слотов покрывают наблюдавшееся окно из десяти запросов с запасом.
 constexpr size_t kAsyncIoQueueDepth = 12;
+// Сколько TCP-соединений сервер держит одновременно. Проводник открывает их
+// несколько на один и тот же ресурс, и вытеснение предыдущего обрывало
+// копирование. Больше четырёх Windows на один ресурс не заводит.
+constexpr size_t kClientCount = 4;
 constexpr size_t kAsyncIoSlotSize = kSmbAdvertisedIoSize;
 // NEGOTIATE выдаёт Windows три кредита. Обычные WRITE подтверждаются после
 // сохранения полного payload в PSRAM, но последние три места в очереди служат
@@ -357,6 +361,9 @@ struct SmbServer::Impl {
 
   struct Handle {
     bool used = false;
+    // Соединение, которому принадлежит дескриптор. При разрыве освобождаются
+    // только его дескрипторы, чужие остаются открытыми.
+    smb2_context* owner = nullptr;
     bool directory = false;
     bool pipe = false;
     bool writable = false;
@@ -395,6 +402,7 @@ struct SmbServer::Impl {
     bool used = false;
     bool ipc = false;
     uint32_t id = 0;
+    smb2_context* owner = nullptr;
   };
 
   // Payload уже скопирован в соответствующий фиксированный PSRAM-слот.
@@ -446,7 +454,7 @@ struct SmbServer::Impl {
         runningFlag(false),
         discoveryRunning(false),
         lastServeResult(0),
-        client(nullptr),
+        clients{},
         trees{},
         nextTreeId(kFirstTreeId),
         handles{},
@@ -552,7 +560,13 @@ struct SmbServer::Impl {
   volatile bool runningFlag;
   bool discoveryRunning;
   volatile int lastServeResult;
-  smb2_context* client;
+  // Проводник открывает к серверу несколько TCP-соединений сразу: отдельно
+  // копирование, отдельно потоки оболочки с эскизами и типами файлов. Раньше
+  // новое соединение вытесняло предыдущее вместе с его открытыми файлами, и
+  // копирование обрывалось на середине. Физический канал к Z80 по-прежнему
+  // один — его делят те же activeSlot/closeActive, что делят открытые файлы
+  // внутри одного соединения.
+  smb2_context* clients[kClientCount];
 
   Tree trees[kTreeCount];
   uint32_t nextTreeId;
@@ -650,10 +664,13 @@ struct SmbServer::Impl {
   bool asyncIoTimedOut() const;
   void failAsyncReads(uint32_t status);
   void failAsyncWrites(uint32_t status);
-  void releaseClientHandles();
+  void releaseClientHandles(smb2_context* owner);
+  bool addClient(smb2_context* smb2);
+  void forgetClient(smb2_context* smb2);
+  bool knownClient(smb2_context* smb2) const;
+  size_t clientCount() const;
   bool allocateDirectoryBatch();
   void releaseDirectoryBatch();
-  bool clientBusyForReplacement(smb2_context* smb2) const;
   void cleanupClient(smb2_context* smb2);
   void sendClientEvent(uint8_t state);
   void sendOperation(const char* operation, const char* path = nullptr);
@@ -719,10 +736,10 @@ struct SmbServer::Impl {
                   char output[32]) const;
   bool makeInfoName(const Handle& handle);
 
-  int allocateHandle();
+  int allocateHandle(smb2_context* owner);
   Handle* findHandle(const uint8_t fileId[SMB2_FD_SIZE], int* slot = nullptr);
   void releaseHandle(int slot);
-  uint32_t allocateTree(bool ipc);
+  uint32_t allocateTree(bool ipc, smb2_context* owner);
   const Tree* findTree(uint32_t id) const;
   void releaseTree(uint32_t id);
   uint32_t visibleSize(const Handle& handle) const;
@@ -984,9 +1001,12 @@ void SmbServer::Impl::taskLoop() {
       vTaskDelay(pdMS_TO_TICKS(kSmbListenerRetryMs));
     }
   } while (server.stop_requested == 0);
-  if (client != nullptr) {
-    cleanupClient(client);
+  for (size_t index = 0; index < kClientCount; ++index) {
+    if (clients[index] != nullptr) {
+      cleanupClient(clients[index]);
+    }
   }
+  releaseClientHandles(nullptr);
   runningFlag = false;
   taskAlive = false;
   task = nullptr;
@@ -1000,29 +1020,19 @@ void SmbServer::Impl::newClient(smb2_context* smb2, void* context) {
     diagnosticLogEvent("SMB client-invalid");
     return;
   }
-  // VFS физически односессионный, но Windows вправе открыть новый TCP-сеанс
-  // к тому же серверу (например, после обращения сначала по IP, затем по
-  // имени). Завершённый старый сеанс передаёт владение новому. Незавершённый
-  // файловый обмен и ещё не отправленный SMB-ответ прерывать нельзя.
-  if (self->client != nullptr && self->client != smb2) {
-    smb2_context* previous = self->client;
-    if (self->clientBusyForReplacement(previous)) {
-      diagnosticLogEvent(
-          "SMB client-reject-busy new=%p active=%p mode=%u slot=%d", smb2,
-          previous, static_cast<unsigned>(self->activeMode), self->activeSlot);
-      smb2_close_context(smb2);
-      return;
-    }
-    diagnosticLogEvent("SMB client-replace previous=%p new=%p mode=%u",
-                       previous, smb2,
-                       static_cast<unsigned>(self->activeMode));
-    self->cleanupClient(previous);
-    smb2_close_context(previous);
+  // Физический канал к Z80 односессионный, но соединений поверх него может
+  // быть несколько: Проводник копирует одним, а эскизы и типы файлов тянет
+  // другими. Вытеснять предыдущее соединение нельзя — вместе с ним умирали
+  // его открытые файлы и шедшее копирование. Единственный канал к SD делят
+  // те же activeSlot/closeActive, что делят открытые файлы одного сеанса.
+  if (!self->addClient(smb2)) {
+    diagnosticLogEvent("SMB client-reject-full new=%p count=%u", smb2,
+                       static_cast<unsigned>(self->clientCount()));
+    smb2_close_context(smb2);
+    return;
   }
-  self->client = smb2;
-  diagnosticLogEvent("SMB client-accepted client=%p", smb2);
-  self->resetAsyncIo();
-  self->resetHandles();
+  diagnosticLogEvent("SMB client-accepted client=%p count=%u", smb2,
+                     static_cast<unsigned>(self->clientCount()));
   // В серверной части libsmb2 6.1.0 расчёт pre-auth hash для SMB 3.1.1
   // пока несовместим с Windows: последний SESSION_SETUP получается с неверной
   // подписью, и Проводник показывает безликую ошибку 0x80004005. SMB 2.1,
@@ -1048,6 +1058,48 @@ void SmbServer::Impl::libraryError(smb2_context*, const char* message) {
   // во flash и не портит двоичный UART-протокол.
   diagnosticLogEvent("SMB library-error %s",
                      message == nullptr ? "(null)" : message);
+}
+
+bool SmbServer::Impl::addClient(smb2_context* smb2) {
+  for (size_t index = 0; index < kClientCount; ++index) {
+    if (clients[index] == smb2) {
+      return true;
+    }
+  }
+  for (size_t index = 0; index < kClientCount; ++index) {
+    if (clients[index] == nullptr) {
+      clients[index] = smb2;
+      return true;
+    }
+  }
+  return false;
+}
+
+void SmbServer::Impl::forgetClient(smb2_context* smb2) {
+  for (size_t index = 0; index < kClientCount; ++index) {
+    if (clients[index] == smb2) {
+      clients[index] = nullptr;
+    }
+  }
+}
+
+bool SmbServer::Impl::knownClient(smb2_context* smb2) const {
+  for (size_t index = 0; index < kClientCount; ++index) {
+    if (smb2 != nullptr && clients[index] == smb2) {
+      return true;
+    }
+  }
+  return false;
+}
+
+size_t SmbServer::Impl::clientCount() const {
+  size_t count = 0;
+  for (size_t index = 0; index < kClientCount; ++index) {
+    if (clients[index] != nullptr) {
+      ++count;
+    }
+  }
+  return count;
 }
 
 void SmbServer::Impl::resetHandles() {
@@ -1316,29 +1368,8 @@ void SmbServer::Impl::releaseDirectoryBatch() {
   dropFileCache();
 }
 
-bool SmbServer::Impl::clientBusyForReplacement(smb2_context* smb2) const {
-  // Закрытие контекста с ответом в outqueue способно оборвать уже выполненную
-  // операцию ровно перед передачей данных клиенту.
-  if (smb2 != nullptr && (smb2_which_events(smb2) & POLLOUT) != 0) {
-    return true;
-  }
-  if (asyncReadCount != 0 || asyncWriteCount != 0) {
-    return true;
-  }
-  if (activeMode == ActiveMode::kWrite) {
-    return true;
-  }
-  if (activeMode != ActiveMode::kRead) {
-    return false;
-  }
-  if (activeSlot < 0 || static_cast<size_t>(activeSlot) >= kHandleCount) {
-    return true;
-  }
-  const Handle& handle = handles[activeSlot];
-  return !handle.used || handle.position < handle.physicalSize;
-}
 
-uint32_t SmbServer::Impl::allocateTree(bool ipc) {
+uint32_t SmbServer::Impl::allocateTree(bool ipc, smb2_context* owner) {
   size_t slot = kTreeCount;
   for (size_t index = 0; index < kTreeCount; ++index) {
     if (!trees[index].used) {
@@ -1361,6 +1392,7 @@ uint32_t SmbServer::Impl::allocateTree(bool ipc) {
   trees[slot].used = true;
   trees[slot].ipc = ipc;
   trees[slot].id = id;
+  trees[slot].owner = owner;
   return id;
 }
 
@@ -1383,12 +1415,12 @@ void SmbServer::Impl::releaseTree(uint32_t id) {
 }
 
 void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
-  if (smb2 != client) {
-    diagnosticLogEvent("SMB cleanup-nonowner client=%p active=%p", smb2,
-                       client);
+  if (!knownClient(smb2)) {
+    diagnosticLogEvent("SMB cleanup-unknown client=%p", smb2);
     return;
   }
-  diagnosticLogEvent("SMB cleanup-owner client=%p", smb2);
+  diagnosticLogEvent("SMB cleanup-owner client=%p count=%u", smb2,
+                     static_cast<unsigned>(clientCount()));
   bool hadAsyncIo = false;
   bool ioInFlight = false;
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
@@ -1418,8 +1450,8 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
   if (hadAsyncIo && ioInFlight) {
     // Core 1 ещё владеет UART и одним из колец. Окончательную очистку выполнит
     // serviceHandler после возврата текущего VFS-окна.
-    client = nullptr;
-    sendClientEvent(0);
+    forgetClient(smb2);
+    sendClientEvent(clientCount() == 0 ? 0 : 2);
     diagnosticLogEvent("SMB cleanup-deferred async-io");
     return;
   }
@@ -1427,30 +1459,73 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
     closeActive(false);
     resetAsyncIo();
   }
-  closeActive(true);
-  releaseClientHandles();
-  client = nullptr;
+  releaseClientHandles(smb2);
+  forgetClient(smb2);
   // Следующий клиент начинает с чистого поля индикации, а дедупликация не
   // должна проглотить его первое событие из-за совпадения с прошлым сеансом.
-  lastOperationText[0] = 0;
-  resetProgress();
-  sendClientEvent(0);
-  diagnosticLogEvent("SMB cleanup-done");
+  if (clientCount() == 0) {
+    lastOperationText[0] = 0;
+    resetProgress();
+  }
+  sendClientEvent(clientCount() == 0 ? 0 : 2);
+  diagnosticLogEvent("SMB cleanup-done count=%u",
+                     static_cast<unsigned>(clientCount()));
 }
 
-void SmbServer::Impl::releaseClientHandles() {
-  for (size_t index = 0; index < kHandleCount; ++index) {
-    if (handles[index].used && handles[index].deletePending &&
-        strcmp(handles[index].path, "/") != 0) {
-      removePath(handles[index].path);
-    } else if (handles[index].used && handles[index].metadataDirty) {
-      invalidateParent(handles[index].path);
+// Освобождает имущество одного соединения. owner == nullptr означает уборку
+// осиротевших дескрипторов: их владелец уже ушёл, а отложенный обмен на core 1
+// закончился только сейчас.
+void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
+  // Физический файл на Z80 закрываем только если он принадлежал уходящему
+  // соединению: чужое чтение посреди окна прерывать нельзя.
+  if (activeSlot >= 0 && static_cast<size_t>(activeSlot) < kHandleCount) {
+    const Handle& active = handles[activeSlot];
+    const bool mine = owner != nullptr ? active.owner == owner
+                                       : !knownClient(active.owner);
+    if (active.used && mine) {
+      closeActive(true);
     }
   }
-  if (activeAsyncRead < 0 && activeAsyncWrite < 0) {
+  for (size_t index = 0; index < kHandleCount; ++index) {
+    Handle& handle = handles[index];
+    if (!handle.used) {
+      continue;
+    }
+    const bool mine = owner != nullptr ? handle.owner == owner
+                                       : !knownClient(handle.owner);
+    if (!mine) {
+      continue;
+    }
+    if (handle.deletePending && strcmp(handle.path, "/") != 0) {
+      removePath(handle.path);
+    } else if (handle.metadataDirty) {
+      invalidateParent(handle.path);
+    }
+    memset(&handle, 0, sizeof(handle));
+    if (lastCreatedSlot == static_cast<int>(index)) {
+      lastCreatedSlot = -1;
+    }
+    if (activeSlot == static_cast<int>(index)) {
+      activeSlot = -1;
+      activeMode = ActiveMode::kNone;
+      activeLogicalOffset = 0;
+      activeVfsOffset = 0;
+    }
+  }
+  for (size_t index = 0; index < kTreeCount; ++index) {
+    Tree& tree = trees[index];
+    if (!tree.used) {
+      continue;
+    }
+    const bool mine = owner != nullptr ? tree.owner == owner
+                                       : !knownClient(tree.owner);
+    if (mine) {
+      memset(&tree, 0, sizeof(tree));
+    }
+  }
+  if (activeAsyncRead < 0 && activeAsyncWrite < 0 && clientCount() == 0) {
     resetAsyncIo();
   }
-  resetHandles();
 }
 
 void SmbServer::Impl::sendClientEvent(uint8_t state) {
@@ -2349,7 +2424,7 @@ bool SmbServer::Impl::makeInfoName(const Handle& handle) {
   return true;
 }
 
-int SmbServer::Impl::allocateHandle() {
+int SmbServer::Impl::allocateHandle(smb2_context* owner) {
   for (size_t index = 0; index < kHandleCount; ++index) {
     if (handles[index].used) {
       continue;
@@ -2357,6 +2432,7 @@ int SmbServer::Impl::allocateHandle() {
     Handle& handle = handles[index];
     memset(&handle, 0, sizeof(handle));
     handle.used = true;
+    handle.owner = owner;
     handle.generation = generationCounter++;
     if (generationCounter == 0) {
       generationCounter = 1;
@@ -2762,7 +2838,7 @@ void SmbServer::Impl::pollAsyncRead() {
             static_cast<unsigned long>(current.windowLength), result.error);
         failAsyncReads(status);
         if (detached) {
-          releaseClientHandles();
+          releaseClientHandles(nullptr);
           diagnosticLogEvent("SMB cleanup-deferred done");
         }
         return;
@@ -2778,7 +2854,7 @@ void SmbServer::Impl::pollAsyncRead() {
       failAsyncReads(current.cancelRequested ? SMB2_STATUS_CANCELLED
                                              : SMB2_STATUS_IO_DEVICE_ERROR);
       if (detached) {
-        releaseClientHandles();
+        releaseClientHandles(nullptr);
         diagnosticLogEvent("SMB cleanup-deferred done");
       }
       return;
@@ -2858,7 +2934,7 @@ void SmbServer::Impl::pollAsyncRead() {
       const bool detached = asyncReads[index].context == nullptr;
       failAsyncReads(SMB2_STATUS_CANCELLED);
       if (detached) {
-        releaseClientHandles();
+        releaseClientHandles(nullptr);
       }
       return;
     }
@@ -2936,7 +3012,7 @@ void SmbServer::Impl::pollAsyncWrite() {
                                     : SMB2_STATUS_IO_DEVICE_ERROR);
       failAsyncWrites(status);
       if (detached) {
-        releaseClientHandles();
+        releaseClientHandles(nullptr);
         diagnosticLogEvent("SMB cleanup-deferred done");
       }
       return;
@@ -2970,6 +3046,7 @@ void SmbServer::Impl::pollAsyncWrite() {
 
     if (finished) {
       const bool detached = completed.context == nullptr;
+      smb2_context* const owner = completed.context;
       sendOperation("WRITE", handle->path);
       completed = {};
       if (asyncWriteCount != 0) {
@@ -2977,14 +3054,14 @@ void SmbServer::Impl::pollAsyncWrite() {
       }
       if (!queueBufferedWriteReplies()) {
         failAsyncWrites(SMB2_STATUS_IO_DEVICE_ERROR);
-        if (client != nullptr) {
-          smb2_close_context(client);
+        if (owner != nullptr && knownClient(owner)) {
+          smb2_close_context(owner);
         }
         return;
       }
       if (detached && asyncWriteCount == 0 && asyncReadCount == 0) {
         closeActive(true);
-        releaseClientHandles();
+        releaseClientHandles(nullptr);
         diagnosticLogEvent("SMB cleanup-deferred done");
       }
     }
@@ -2995,7 +3072,7 @@ void SmbServer::Impl::pollAsyncWrite() {
       const bool detached = asyncWrites[index].context == nullptr;
       failAsyncWrites(SMB2_STATUS_CANCELLED);
       if (detached) {
-        releaseClientHandles();
+        releaseClientHandles(nullptr);
       }
       return;
     }
@@ -3066,8 +3143,8 @@ int SmbServer::Impl::createStatus(smb2_context* smb2,
 int SmbServer::Impl::destructionHandler(smb2_server* serverValue,
                                         smb2_context* smb2) {
   Impl* self = from(serverValue);
-  diagnosticLogEvent("SMB destruction client=%p owner=%u", smb2,
-                     self != nullptr && self->client == smb2 ? 1U : 0U);
+  diagnosticLogEvent("SMB destruction client=%p known=%u", smb2,
+                     self != nullptr && self->knownClient(smb2) ? 1U : 0U);
   if (self != nullptr) {
     self->cleanupClient(smb2);
   }
@@ -3127,24 +3204,13 @@ int SmbServer::Impl::sessionHandler(smb2_server* serverValue,
 int SmbServer::Impl::logoffHandler(smb2_server* serverValue,
                                    smb2_context* smb2) {
   Impl* self = from(serverValue);
-  if (self != nullptr && self->client == smb2) {
+  if (self != nullptr && self->knownClient(smb2)) {
     diagnosticLogEvent("SMB logoff");
-    // LOGOFF завершает сеанс, но не обязан закрывать сам TCP-сокет. Поэтому
-    // указатель client сохраняем: иначе второй компьютер смог бы войти, пока
-    // первый контекст libsmb2 ещё жив. Новый SESSION_SETUP на этом же сокете
-    // снова пройдёт обычную авторизацию.
-    self->closeActive(true);
-    for (size_t index = 0; index < kHandleCount; ++index) {
-      if (self->handles[index].used &&
-          self->handles[index].deletePending &&
-          strcmp(self->handles[index].path, "/") != 0) {
-        self->removePath(self->handles[index].path);
-      } else if (self->handles[index].used &&
-                 self->handles[index].metadataDirty) {
-        self->invalidateParent(self->handles[index].path);
-      }
-    }
-    self->resetHandles();
+    // LOGOFF завершает сеанс, но не обязан закрывать сам TCP-сокет: соединение
+    // остаётся в списке, и новый SESSION_SETUP на нём снова пройдёт обычную
+    // авторизацию. Освобождаем только файлы и деревья этого соединения —
+    // соседние сеансы Проводника продолжают работать.
+    self->releaseClientHandles(smb2);
     self->sendClientEvent(1);
     self->sendOperation("LOGOFF");
   }
@@ -3177,7 +3243,7 @@ int SmbServer::Impl::treeConnectHandler(
   // TREE_CONNECT собственный TreeId и запоминаем тип именно этого дерева.
   // Глобальный флаг здесь недопустим: служебный запрос IPC$ от Windows/Linux
   // иначе превращал последующие обращения к SD в OBJECT_NAME_NOT_FOUND.
-  reply->tree_id = self->allocateTree(ipc);
+  reply->tree_id = self->allocateTree(ipc, smb2);
   if (reply->tree_id == 0) {
     return replyStatus(smb2, SMB2_TREE_CONNECT,
                        SMB2_STATUS_INSUFFICIENT_RESOURCES);
@@ -3232,7 +3298,7 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
     if (!asciiEqualNoCase(pipeName, "srvsvc")) {
       return createStatus(smb2, request, SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
     }
-    const int slot = self->allocateHandle();
+    const int slot = self->allocateHandle(smb2);
     if (slot < 0) {
       return createStatus(smb2, request,
                           SMB2_STATUS_INSUFFICIENT_RESOURCES);
@@ -3335,7 +3401,7 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
     action = kCreateCreated;
   }
 
-  const int slot = self->allocateHandle();
+  const int slot = self->allocateHandle(smb2);
   if (slot < 0) {
     return createStatus(smb2, request,
                         SMB2_STATUS_INSUFFICIENT_RESOURCES);
