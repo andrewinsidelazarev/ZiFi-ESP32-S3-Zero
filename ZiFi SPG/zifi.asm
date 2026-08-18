@@ -236,7 +236,7 @@ update_rtc_sw	ds 1
 
 ; В консоли — то, что произошло на самом деле: какая команда ушла прошивке и
 ; чем она ответила. Ни одной «проверки обновлений»: порт за ними не ходит.
-banner_msg		db "ZiFi 0.733 Native C++ ESP8266",0,0
+banner_msg		db "ZiFi 0.733 Native C++ ESP32-S3",0,0
 wifi_send_ini_msg	db "zifi.ini sent to ESP, it joins Wi-Fi",0,0
 wifi_connected		db "ESP reports Wi-Fi up",0,0
 wifi_failed_msg		db "ESP reports Wi-Fi down",0,0

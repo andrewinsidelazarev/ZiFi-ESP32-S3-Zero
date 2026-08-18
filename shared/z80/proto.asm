@@ -353,8 +353,7 @@ Net_ProxyStatus:
         ld bc,0
         ld a,CMD_NET_PROXY_STATUS
         call Proto_Send
-        ld de,40                        ; до 1 с
-        call ZiFi_SetTimeout
+        ld de,10000                     ; 10 000 итераций опроса (достаточно для ответа ESP)
         ld a,RESP_NET_PROXY_STATUS
         call Proto_WaitCmd
         ret c
