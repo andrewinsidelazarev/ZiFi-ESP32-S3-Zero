@@ -1845,19 +1845,15 @@ bool SmbServer::Impl::statPath(const char* path, VfsResult& result) {
       snprintf(lastVfsError, sizeof(lastVfsError), "none");
       return true;
     }
+    snprintf(lastVfsError, sizeof(lastVfsError), "not-found");
+    return false;
   }
   // Если дескриптор и снимок каталога не дали попадания — проверяем на Z80.
   // Трогать файловый контекст во время активной передачи нельзя: closeActive
-  // закрыл бы открытый файл посреди окна. Ждём освобождения канала.
-  const uint32_t waitStarted = millis();
-  while ((asyncReadCount != 0 || asyncWriteCount != 0 ||
-          activeAsyncRead >= 0 || activeAsyncWrite >= 0) &&
-         static_cast<uint32_t>(millis() - waitStarted) < kBridgeWaitMs) {
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
+  // закрыл бы открытый файл посреди окна. Не блокируем фоновые потоки Проводника.
   if (asyncReadCount != 0 || asyncWriteCount != 0 || activeAsyncRead >= 0 ||
       activeAsyncWrite >= 0) {
-    snprintf(lastVfsError, sizeof(lastVfsError), "bridge-busy");
+    snprintf(lastVfsError, sizeof(lastVfsError), "not-found");
     return false;
   }
   if (!closeActive(true)) {
@@ -2138,32 +2134,42 @@ bool SmbServer::Impl::normalizePath(
     size_t componentLength = 0;
     while (cursor[componentLength] != 0 && cursor[componentLength] != '/' &&
            cursor[componentLength] != '\\') {
-      const unsigned char value =
-          static_cast<unsigned char>(cursor[componentLength]);
+      ++componentLength;
+    }
+    // Отсекаем суффикс главного потока NTFS "::$DATA" / ":$DATA"
+    size_t effectiveLength = componentLength;
+    if (effectiveLength >= 7 &&
+        asciiEqualNoCase(component + effectiveLength - 7, "::$DATA")) {
+      effectiveLength -= 7;
+    } else if (effectiveLength >= 6 &&
+               asciiEqualNoCase(component + effectiveLength - 6, ":$DATA")) {
+      effectiveLength -= 6;
+    }
+    for (size_t i = 0; i < effectiveLength; ++i) {
+      const unsigned char value = static_cast<unsigned char>(component[i]);
       if (value < 32 || value == ':' || value == '|' || value == '<' ||
           value == '>' || value == '"') {
         return false;
       }
-      ++componentLength;
     }
-    if (componentLength == 1 && component[0] == '.') {
+    if (effectiveLength == 1 && component[0] == '.') {
       // Одиночная точка ничего не меняет.
-    } else if (componentLength == 2 && component[0] == '.' &&
+    } else if (effectiveLength == 2 && component[0] == '.' &&
                component[1] == '.') {
       // Не разрешаем выход выше корня общей папки.
       return false;
-    } else if (componentLength != 0) {
+    } else if (effectiveLength != 0) {
       if (used != 1) {
         if (used >= kMaxPath) {
           return false;
         }
         output[used++] = '/';
       }
-      if (componentLength > kMaxPath - used) {
+      if (effectiveLength > kMaxPath - used) {
         return false;
       }
-      memcpy(output + used, component, componentLength);
-      used += componentLength;
+      memcpy(output + used, component, effectiveLength);
+      used += effectiveLength;
       output[used] = 0;
     }
     cursor += componentLength;
