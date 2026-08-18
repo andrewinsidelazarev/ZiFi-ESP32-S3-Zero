@@ -1,4 +1,4 @@
-﻿# Сборка нативного симулятора SMB-сервера тем же компилятором, которым уже
+# Сборка нативного симулятора SMB-сервера тем же компилятором, которым уже
 # собираются тесты проекта. Прошивочный код берётся как есть, из src/ и lib/:
 # симулятор существует именно для того, чтобы проверять его, а не копию.
 
@@ -101,3 +101,29 @@ Write-Output 'Сборка проверялки чтения...'
 cmd /c ('"' + $vcvars + '" >nul && ' + $readcheck)
 if ($LASTEXITCODE -ne 0) { throw "Сборка проверялки не удалась ($LASTEXITCODE)" }
 Write-Output "Готово: $out\smb_readcheck.exe"
+# Повтор хвоста Проводника после чтения: именно на нём вставало железо.
+
+$tailcheck = "cl.exe /nologo /TC /utf-8 /Zi /MDd /W3 /D_CRT_SECURE_NO_WARNINGS " +
+         "/D_WINDOWS /DHAVE_LINGER /FIzifi_msvc_prelude.h " +
+         "/Itests\stubs_host /Ilib\libsmb2\include /Ilib\libsmb2\include\smb2 " +
+         "tools\host_smb\smb_tailcheck.c $libsmb2 " +
+         "/Fo$out\probe3\ /Fd$out\smb_tailcheck.pdb " +
+         "/Fe$out\smb_tailcheck.exe /link ws2_32.lib"
+if (-not (Test-Path "$out\probe3")) { New-Item -ItemType Directory -Force "$out\probe3" | Out-Null }
+Write-Output 'Сборка проверялки хвоста...'
+cmd /c ('"' + $vcvars + '" >nul && ' + $tailcheck)
+if ($LASTEXITCODE -ne 0) { throw "Сборка проверялки хвоста не удалась ($LASTEXITCODE)" }
+Write-Output "Готово: $out\smb_tailcheck.exe"
+
+$reproduce = "cl.exe /nologo /TC /utf-8 /Zi /MDd /W3 /D_CRT_SECURE_NO_WARNINGS " +
+         "/D_WINDOWS /DHAVE_LINGER /FIzifi_msvc_prelude.h " +
+         "/Itests\stubs_host /Ilib\libsmb2\include /Ilib\libsmb2\include\smb2 " +
+         "tools\host_smb\smb_reproduce_test.c $libsmb2 " +
+         "/Fo$out\probe4\ /Fd$out\smb_reproduce_test.pdb " +
+         "/Fe$out\smb_reproduce_test.exe /link ws2_32.lib"
+if (-not (Test-Path "$out\probe4")) { New-Item -ItemType Directory -Force "$out\probe4" | Out-Null }
+Write-Output 'Сборка проверялки воспроизведения багов...'
+cmd /c ('"' + $vcvars + '" >nul && ' + $reproduce)
+if ($LASTEXITCODE -ne 0) { throw "Сборка проверялки воспроизведения не удалась ($LASTEXITCODE)" }
+Write-Output "Готово: $out\smb_reproduce_test.exe"
+

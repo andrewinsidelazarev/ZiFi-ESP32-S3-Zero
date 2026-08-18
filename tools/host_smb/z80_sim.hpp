@@ -56,6 +56,7 @@ class Z80Simulator {
   void handleFsInfo();
   void handleMkdir(const std::vector<uint8_t>& payload);
   void handleDelete(const std::vector<uint8_t>& payload);
+  void handleMoveRename(const std::vector<uint8_t>& payload);
 
   HardwareSerial& serial_;
   std::string root_;

@@ -37,6 +37,7 @@ constexpr uint8_t kVfsOpen = 0x50;
 constexpr uint8_t kVfsClose = 0x53;
 constexpr uint8_t kVfsDelete = 0x54;
 constexpr uint8_t kVfsMkdir = 0x55;
+constexpr uint8_t kVfsMoveRename = 0x5D;
 constexpr uint8_t kVfsWriteWindow = 0x57;
 constexpr uint8_t kVfsReadWindow = 0x58;
 constexpr uint8_t kVfsSeek = 0x5B;
@@ -207,6 +208,9 @@ void Z80Simulator::handle(uint8_t command,
       break;
     case kVfsDelete:
       handleDelete(payload);
+      break;
+    case kVfsMoveRename:
+      handleMoveRename(payload);
       break;
     case kVfsClose:
       handleClose();
@@ -554,6 +558,29 @@ void Z80Simulator::handleDelete(const std::vector<uint8_t>& payload) {
   std::error_code code;
   const bool removed = fs::remove(resolve(path), code);
   replyStatus(kVfsDelete, removed ? kStatusOk : kStatusFail);
+}
+
+void Z80Simulator::handleMoveRename(const std::vector<uint8_t>& payload) {
+  if (payload.size() < 4) {
+    replyStatus(kVfsMoveRename, kStatusFail);
+    return;
+  }
+  const bool replace = payload[0] != 0;
+  const char* src = reinterpret_cast<const char*>(payload.data() + 2);
+  const size_t srcLen = strlen(src);
+  if (2 + srcLen + 1 >= payload.size()) {
+    replyStatus(kVfsMoveRename, kStatusFail);
+    return;
+  }
+  const char* dst = reinterpret_cast<const char*>(payload.data() + 2 + srcLen + 1);
+  std::error_code code;
+  const fs::path srcPath = resolve(src);
+  const fs::path dstPath = resolve(dst);
+  if (replace && fs::exists(dstPath, code)) {
+    fs::remove(dstPath, code);
+  }
+  fs::rename(srcPath, dstPath, code);
+  replyStatus(kVfsMoveRename, code ? kStatusFail : kStatusOk);
 }
 
 }  // namespace host
