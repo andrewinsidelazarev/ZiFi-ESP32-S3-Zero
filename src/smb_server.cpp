@@ -3463,7 +3463,11 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_IO_DEVICE_ERROR);
   }
 
-  uint8_t* data = static_cast<uint8_t*>(malloc(wanted));
+  uint8_t* data = static_cast<uint8_t*>(
+      heap_caps_malloc(wanted, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (data == nullptr) {
+    data = static_cast<uint8_t*>(malloc(wanted));
+  }
   if (data == nullptr) {
     return replyStatus(smb2, SMB2_READ,
                        SMB2_STATUS_INSUFFICIENT_RESOURCES);
