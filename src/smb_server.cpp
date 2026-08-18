@@ -834,7 +834,7 @@ bool SmbServer::Impl::start(const uint8_t* payload, uint16_t length,
   server.signing_enabled = 1;
   server.allow_anonymous = 0;
   server.max_transact_size = kSmbAdvertisedIoSize;
-  server.max_read_size = kSmbAdvertisedIoSize;
+  server.max_read_size = static_cast<uint32_t>(VfsClient::kTransferWindowSize);
   server.max_write_size = kSmbAdvertisedIoSize;
   snprintf(server.hostname, sizeof(server.hostname), "%s", hostname);
   snprintf(server.domain, sizeof(server.domain), "%s", workgroup);
