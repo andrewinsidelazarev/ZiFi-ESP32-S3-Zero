@@ -260,6 +260,7 @@ void Z80Simulator::handleOpen(const std::vector<uint8_t>& payload) {
     return;
   }
   const uint8_t mode = payload[0];
+  reportCounters("open");
   const char* text = reinterpret_cast<const char*>(payload.data()) + 1;
   const std::string path(text, strnlen(text, payload.size() - 1));
   const fs::path target = resolve(path);
@@ -372,6 +373,15 @@ void Z80Simulator::handleReadWindow(const std::vector<uint8_t>& payload) {
     sent += part;
   }
   offset_ += static_cast<uint32_t>(data.size());
+  ++windowsServed_;
+  bytesServed_ += data.size();
+}
+
+void Z80Simulator::reportCounters(const char* reason) const {
+  std::printf("[Z80] %s: окон чтения %llu, байт %llu\n", reason,
+              static_cast<unsigned long long>(windowsServed_),
+              static_cast<unsigned long long>(bytesServed_));
+  std::fflush(stdout);
 }
 
 // WRITE_WINDOW: кадры [flags][seq][offset:2][total:2][crc16:2][данные].

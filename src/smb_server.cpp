@@ -76,6 +76,20 @@ constexpr uint32_t kSmbListenerRetryMs = 250;
 // Windows CopyFile не повторяет остаток короткого успешного ответа. Физические
 // окна остаются только внутренними этапами одного асинхронного SMB-запроса.
 constexpr uint32_t kSmbAdvertisedIoSize = 64 * 1024;
+// READ объявляется отдельно и заведомо меньше. Канал к Z80 даёт около 6 КБ/с,
+// поэтому ответ на 64-КиБ запрос готовится ~11 секунд, и всё это время
+// однопоточный сервер не обслуживает больше ничего: ни запросы соседних
+// потоков оболочки, ни закрытие файлов. Windows такую очередь рвёт. Одно
+// физическое окно на запрос — это ~2,7 секунды, живой индикатор прогресса и
+// отсутствие головной блокировки.
+constexpr uint32_t kSmbAdvertisedReadSize = 16 * 1024;
+// Файл, прочитанный целиком с начала, оседает в PSRAM: Проводник при
+// копировании читает исходный файл дважды подряд, и второй проход обязан
+// обойтись без единого байта по UART. Кэшируется только то, после чего в
+// PSRAM остаётся запас на буферы сети и каталогов.
+// 640 КиБ — это ровно образ TRD, самое частое, что копируют с карты ZX.
+constexpr uint32_t kFileCacheLimit = 640 * 1024;
+constexpr size_t kFileCachePsramFloor = 320 * 1024;
 // READ и WRITE_THROUGH удерживают свой SMB-кредит до физического завершения,
 // поэтому watchdog должен сработать раньше обычного 120-секундного PDU timeout.
 constexpr uint32_t kAsyncIoProgressTimeoutMs = 90 * 1000;
@@ -474,6 +488,11 @@ struct SmbServer::Impl {
         positionInfo{},
         streamInfo{},
         directoryCache(),
+        cachedFilePath{},
+        cachedFileData(nullptr),
+        cachedFileSize(0),
+        cachedFileFilled(0),
+        activeRandomRead(false),
         cachedFsInfo{},
         fsInfoValid(false),
         volumeInfo{},
@@ -581,6 +600,16 @@ struct SmbServer::Impl {
   smb2_file_position_info positionInfo;
   smb2_file_stream_info streamInfo;
   DirectoryCache directoryCache;
+  // Копия целиком прочитанного файла в PSRAM. Заполняется только строго
+  // последовательным чтением с нулевого смещения и живёт до первой правки
+  // тома. Нужна из-за того, что Проводник читает исходный файл дважды.
+  char cachedFilePath[kMaxPath + 1];
+  uint8_t* cachedFileData;
+  uint32_t cachedFileSize;
+  uint32_t cachedFileFilled;
+  // Режим, которым открыт текущий читаемый файл: позиционный тракт FILEX
+  // ограничен окном 16352 байта, последовательный допускает полные 16 КиБ.
+  bool activeRandomRead;
   // Сведения о томе. Кэш локальный и намеренно: любой обмен с мостом внутри
   // приёма данных блокирует SMB-задачу, и Windows теряет сессию.
   VfsFsInfo cachedFsInfo;
@@ -657,6 +686,11 @@ struct SmbServer::Impl {
   // свободное место в течение всего копирования.
   bool loadFsInfo(VfsFsInfo& info, uint8_t& status);
   void invalidateFsInfo();
+  void dropFileCache();
+  void beginFileCache(const char* path, uint32_t size);
+  void appendFileCache(uint32_t offset, const uint8_t* data, uint32_t length);
+  bool serveFromFileCache(const char* path, uint32_t size, uint32_t offset,
+                          uint32_t length, uint8_t* output) const;
   // Чистая арифметика над локальным кэшем: ни UART, ни моста.
   void noteFileGrowth(uint32_t oldSize, uint32_t newSize);
   // Обновляет размер записи в снимке родителя без сброса всего снимка. Именно
@@ -834,7 +868,7 @@ bool SmbServer::Impl::start(const uint8_t* payload, uint16_t length,
   server.signing_enabled = 1;
   server.allow_anonymous = 0;
   server.max_transact_size = kSmbAdvertisedIoSize;
-  server.max_read_size = kSmbAdvertisedIoSize;
+  server.max_read_size = kSmbAdvertisedReadSize;
   server.max_write_size = kSmbAdvertisedIoSize;
   snprintf(server.hostname, sizeof(server.hostname), "%s", hostname);
   snprintf(server.domain, sizeof(server.domain), "%s", workgroup);
@@ -1279,6 +1313,8 @@ bool SmbServer::Impl::allocateDirectoryBatch() {
 void SmbServer::Impl::releaseDirectoryBatch() {
   heap_caps_free(directoryBatch);
   directoryBatch = nullptr;
+  // Копия файла живёт в той же PSRAM и вне работающего сервера смысла не имеет.
+  dropFileCache();
 }
 
 bool SmbServer::Impl::clientBusyForReplacement(smb2_context* smb2) const {
@@ -1793,11 +1829,15 @@ bool SmbServer::Impl::closeActive(bool commit) {
   VfsResult result;
   const VfsOperation operation = commit ? VfsOperation::kCloseCommit
                                         : VfsOperation::kCloseAbort;
-  const bool closed = requestVfs(operation, nullptr, 0, result,
-                                 kMutateVfsTimeoutMs);
+  // Долгий таймаут оправдан только закрытием записи: там Z80 дописывает FAT и
+  // каталог, и это законно занимает минуты. Закрытие чтения ничего не сбрасывает
+  // на карту, а трёхминутное ожидание здесь замораживает весь сервер — Windows
+  // за это время успевает разорвать сессию и бросить копирование.
+  const uint32_t timeout = mode == ActiveMode::kWrite ? kMutateVfsTimeoutMs
+                                                      : kNormalVfsTimeoutMs;
+  const bool closed = requestVfs(operation, nullptr, 0, result, timeout);
   if (!closed && commit) {
-    requestVfs(VfsOperation::kCloseAbort, nullptr, 0, result,
-               kMutateVfsTimeoutMs);
+    requestVfs(VfsOperation::kCloseAbort, nullptr, 0, result, timeout);
   }
   if (mode == ActiveMode::kWrite && slot >= 0 &&
       static_cast<size_t>(slot) < kHandleCount) {
@@ -1868,6 +1908,9 @@ bool SmbServer::Impl::statPath(const char* path, VfsResult& result) {
 }
 
 bool SmbServer::Impl::createEmptyFile(const char* path) {
+  // Правка тома делает копию файла в PSRAM недостоверной: отдать по сети
+  // устаревшие байты хуже, чем прочитать файл заново.
+  dropFileCache();
   if (!closeActive(true) || !resetBuffers()) {
     return false;
   }
@@ -1886,6 +1929,9 @@ bool SmbServer::Impl::createEmptyFile(const char* path) {
 }
 
 bool SmbServer::Impl::removePath(const char* path) {
+  // Правка тома делает копию файла в PSRAM недостоверной: отдать по сети
+  // устаревшие байты хуже, чем прочитать файл заново.
+  dropFileCache();
   if (!closeActive(true)) {
     return false;
   }
@@ -2067,6 +2113,68 @@ void SmbServer::Impl::refreshCachedSize(const char* path, uint32_t size) {
 }
 
 void SmbServer::Impl::invalidateFsInfo() { fsInfoValid = false; }
+
+void SmbServer::Impl::dropFileCache() {
+  if (cachedFileData != nullptr) {
+    heap_caps_free(cachedFileData);
+    cachedFileData = nullptr;
+  }
+  cachedFilePath[0] = 0;
+  cachedFileSize = 0;
+  cachedFileFilled = 0;
+}
+
+// Завести копию файла в PSRAM. Место берём только при живом запасе: буферы
+// сети и снимки каталогов важнее любого ускорения повторного чтения.
+void SmbServer::Impl::beginFileCache(const char* path, uint32_t size) {
+  dropFileCache();
+  if (path == nullptr || size == 0 || size > kFileCacheLimit ||
+      strlen(path) > kMaxPath) {
+    return;
+  }
+  const size_t free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  if (free < static_cast<size_t>(size) + kFileCachePsramFloor) {
+    return;
+  }
+  cachedFileData = static_cast<uint8_t*>(
+      heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (cachedFileData == nullptr) {
+    return;
+  }
+  snprintf(cachedFilePath, sizeof(cachedFilePath), "%s", path);
+  cachedFileSize = size;
+  cachedFileFilled = 0;
+}
+
+// Копия наполняется только сплошным потоком с начала. Любой пропуск означает,
+// что дальше в кэше будет дыра, и такую копию честнее выбросить целиком.
+void SmbServer::Impl::appendFileCache(uint32_t offset, const uint8_t* data,
+                                      uint32_t length) {
+  if (cachedFileData == nullptr || data == nullptr || length == 0) {
+    return;
+  }
+  if (offset != cachedFileFilled || offset + length > cachedFileSize) {
+    dropFileCache();
+    return;
+  }
+  memcpy(cachedFileData + offset, data, length);
+  cachedFileFilled = offset + length;
+}
+
+bool SmbServer::Impl::serveFromFileCache(const char* path, uint32_t size,
+                                         uint32_t offset, uint32_t length,
+                                         uint8_t* output) const {
+  if (cachedFileData == nullptr || path == nullptr || output == nullptr ||
+      size != cachedFileSize || !asciiEqualNoCase(cachedFilePath, path)) {
+    return false;
+  }
+  if (length == 0 || offset > cachedFileFilled ||
+      offset + length > cachedFileFilled) {
+    return false;
+  }
+  memcpy(output, cachedFileData + offset, length);
+  return true;
+}
 
 void SmbServer::Impl::noteFileGrowth(uint32_t oldSize, uint32_t newSize) {
   if (!fsInfoValid || newSize == oldSize) {
@@ -2333,8 +2441,13 @@ bool SmbServer::Impl::fetchReadWindow(Handle& handle) {
     return false;
   }
   const uint32_t remaining = handle.physicalSize - activeVfsOffset;
+  // Предел окна задаёт режим открытия: позиционный тракт FILEX держит первые
+  // 32 байта страницы под блок параметров, последовательному доступен весь
+  // буфер. Просить больше — получить отказ Z80 вместо данных.
+  const size_t limit = activeRandomRead ? VfsClient::kFilexTransferWindowSize
+                                        : VfsClient::kTransferWindowSize;
   const uint32_t wanted = static_cast<uint32_t>(minimum(
-      static_cast<size_t>(remaining), VfsClient::kTransferWindowSize));
+      static_cast<size_t>(remaining), limit));
   VfsResult result;
   if (!requestVfsAt(VfsOperation::kReadAt, activeVfsOffset, wanted, result,
                     kNormalVfsTimeoutMs) ||
@@ -2355,26 +2468,35 @@ bool SmbServer::Impl::activateRead(int slot, uint32_t offset) {
     return false;
   }
   VfsResult result;
-  const bool useSequential = (offset == 0);
+  // С нуля читаем последовательно: этому режиму доступно полное окно 16 КиБ и
+  // не нужен SEEK. На любом другом смещении путь один — позиционный FILEX.
+  bool random = (offset != 0);
   const VfsOperation op =
-      useSequential ? VfsOperation::kOpenRead : VfsOperation::kOpenRandom;
+      random ? VfsOperation::kOpenRandom : VfsOperation::kOpenRead;
   if (!requestVfs(op, handle.path, 0, result, kNormalVfsTimeoutMs)) {
-    if (useSequential &&
-        !requestVfs(VfsOperation::kOpenRandom, handle.path, 0, result,
-                    kNormalVfsTimeoutMs)) {
-      return false;
-    } else if (!useSequential) {
+    if (random) {
       return false;
     }
+    // Плагин мог отказать в последовательном открытии; позиционный тракт
+    // умеет то же самое, поэтому пробуем его, но и окно берём уже его.
+    if (!requestVfs(VfsOperation::kOpenRandom, handle.path, 0, result,
+                    kNormalVfsTimeoutMs)) {
+      return false;
+    }
+    random = true;
   }
   activeSlot = slot;
   activeMode = ActiveMode::kRead;
+  activeRandomRead = random;
   activeLogicalOffset = offset;
   activeVfsOffset = offset;
   return true;
 }
 
 bool SmbServer::Impl::activateWrite(int slot, uint32_t offset) {
+  // Правка тома делает копию файла в PSRAM недостоверной: отдать по сети
+  // устаревшие байты хуже, чем прочитать файл заново.
+  dropFileCache();
   Handle& handle = handles[slot];
   if (activeSlot == slot && activeMode == ActiveMode::kWrite &&
       activeLogicalOffset == offset) {
@@ -2399,6 +2521,9 @@ bool SmbServer::Impl::activateWrite(int slot, uint32_t offset) {
 }
 
 bool SmbServer::Impl::commitReservedSize(int slot) {
+  // Правка тома делает копию файла в PSRAM недостоверной: отдать по сети
+  // устаревшие байты хуже, чем прочитать файл заново.
+  dropFileCache();
   if (slot < 0 || static_cast<size_t>(slot) >= kHandleCount) {
     return false;
   }
@@ -3417,7 +3542,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   }
   if (request->offset > UINT32_MAX ||
       request->minimum_count > request->length ||
-      request->minimum_count > kSmbAdvertisedIoSize) {
+      request->minimum_count > kSmbAdvertisedReadSize) {
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_INVALID_PARAMETER);
   }
   if (self->asyncWriteCount != 0) {
@@ -3447,7 +3572,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
                        SMB2_STATUS_INSUFFICIENT_RESOURCES);
   }
   const uint32_t wanted = static_cast<uint32_t>(minimum64(
-      minimum64(request->length, kSmbAdvertisedIoSize),
+      minimum64(request->length, kSmbAdvertisedReadSize),
       static_cast<uint64_t>(handle->physicalSize - offset)));
   if (wanted < request->minimum_count) {
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_END_OF_FILE);
@@ -3459,10 +3584,6 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     return 0;
   }
 
-  if (!self->activateRead(slot, offset)) {
-    return replyStatus(smb2, SMB2_READ, SMB2_STATUS_IO_DEVICE_ERROR);
-  }
-
   uint8_t* data = static_cast<uint8_t*>(
       heap_caps_malloc(wanted, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (data == nullptr) {
@@ -3471,6 +3592,29 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   if (data == nullptr) {
     return replyStatus(smb2, SMB2_READ,
                        SMB2_STATUS_INSUFFICIENT_RESOURCES);
+  }
+
+  // Повторный проход Проводника по тому же файлу отдаём из PSRAM: на канале
+  // 115200 каждый такой байт стоит столько же, сколько первый.
+  if (self->serveFromFileCache(handle->path, handle->physicalSize, offset,
+                               wanted, data)) {
+    handle->position = offset + wanted;
+    reply->data = data;  // После отправки этот malloc освободит сама libsmb2.
+    reply->data_length = wanted;
+    reply->data_remaining = 0;
+    diagnosticLogEvent("SMB read-cached bytes=%lu off=%lu path=%s",
+                       static_cast<unsigned long>(wanted),
+                       static_cast<unsigned long>(offset), handle->path);
+    self->sendOperation("READ", handle->path);
+    return 0;
+  }
+
+  if (!self->activateRead(slot, offset)) {
+    free(data);
+    return replyStatus(smb2, SMB2_READ, SMB2_STATUS_IO_DEVICE_ERROR);
+  }
+  if (offset == 0) {
+    self->beginFileCache(handle->path, handle->physicalSize);
   }
   uint32_t copied = 0;
   while (copied < wanted) {
@@ -3494,6 +3638,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     self->activeLogicalOffset += static_cast<uint32_t>(got);
   }
   handle->position = offset + copied;
+  self->appendFileCache(offset, data, copied);
   reply->data = data;  // После отправки этот malloc освободит сама libsmb2.
   reply->data_length = copied;
   // Для обычного TCP Channel=NONE, поэтому это не число байтов до EOF.
@@ -4321,6 +4466,8 @@ int SmbServer::Impl::setInfoHandler(smb2_server* serverValue,
       return 0;
 
     case SMB2_FILE_DISPOSITION_INFORMATION:
+        // Копия файла в PSRAM после правки недостоверна.
+        self->dropFileCache();
       if (request->buffer_length < 1 || strcmp(handle->path, "/") == 0) {
         return replyStatus(smb2, SMB2_SET_INFO,
                            SMB2_STATUS_INVALID_PARAMETER);
@@ -4356,6 +4503,8 @@ int SmbServer::Impl::setInfoHandler(smb2_server* serverValue,
     }
 
     case SMB2_FILE_END_OF_FILE_INFORMATION: {
+        // Копия файла в PSRAM после правки недостоверна.
+        self->dropFileCache();
       if (!handle->writable || handle->directory ||
           request->buffer_length < 8 || readLe64Local(data) > UINT32_MAX) {
         return replyStatus(smb2, SMB2_SET_INFO,
@@ -4415,6 +4564,8 @@ int SmbServer::Impl::setInfoHandler(smb2_server* serverValue,
     }
 
     case SMB2_FILE_RENAME_INFORMATION: {
+        // Копия файла в PSRAM после правки недостоверна.
+        self->dropFileCache();
       if (!handle->writable || strcmp(handle->path, "/") == 0 ||
           request->buffer_length < 20) {
         return replyStatus(smb2, SMB2_SET_INFO,

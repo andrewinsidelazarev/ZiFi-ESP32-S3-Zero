@@ -45,6 +45,7 @@ class Z80Simulator {
 
   void handleStat(const std::vector<uint8_t>& payload);
   void handleOpen(const std::vector<uint8_t>& payload);
+  void reportCounters(const char* reason) const;
   void handleSeek(const std::vector<uint8_t>& payload);
   void handleReadWindow(const std::vector<uint8_t>& payload);
   void handleWriteWindow(const std::vector<uint8_t>& payload);
@@ -80,6 +81,11 @@ class Z80Simulator {
   std::vector<uint8_t> windowData_;
   uint16_t windowTotal_ = 0;
   uint8_t windowSeq_ = 0;
+  // Сколько окон чтения эмулятор реально отдал: повторный проход по файлу,
+  // обслуженный кэшем прошивки, не должен увеличивать этот счётчик.
+  unsigned long long windowsServed_ = 0;
+  unsigned long long bytesServed_ = 0;
+
   bool windowActive_ = false;
 };
 
