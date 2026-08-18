@@ -1174,7 +1174,7 @@ Vfs_WriteWindow:
 
         ld a,(VfsWindowFlags)
         and VFS_WINDOW_START
-        jr z,.continuation
+        jp z,.continuation
         ld a,(VfsWindowActive)
         or a
         ld a,VFS_BS_STATE
@@ -1211,6 +1211,19 @@ Vfs_WriteWindow:
         jr c,.start_ok
         jr z,.start_ok
 .overflow:
+        ld a,(VfsMode)
+        cp 3
+        jr z,.fail_overflow
+        call Vfs_WriteFlush
+        jr nz,.fail_overflow
+        ld hl,(ProtoBuf+4)
+        ld (VfsWindowTotal),hl
+        ld de,VFS_APPEND_SIZE
+        or a
+        sbc hl,de
+        jr c,.start_ok
+        jr z,.start_ok
+.fail_overflow:
         ld a,VFS_BS_OVERFLOW
         jp Vfs_WriteWindowFail
 .start_ok:

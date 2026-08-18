@@ -2867,7 +2867,7 @@ void SmbServer::Impl::pollAsyncWrite() {
   AsyncWrite& next = asyncWrites[nextIndex];
   const uint32_t remaining = next.length - next.flushed;
   const uint32_t window = static_cast<uint32_t>(minimum(
-      bridge.ringCapacity(), VfsClient::kFilexTransferWindowSize));
+      bridge.ringCapacity(), VfsClient::kTransferWindowSize));
   const uint32_t part = static_cast<uint32_t>(minimum(
       static_cast<size_t>(remaining), static_cast<size_t>(window)));
   const uint32_t nextOffset = next.offset + next.flushed;
@@ -3588,7 +3588,7 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
   // FILEX WRITE_AT сохраняет реальный 32-битный offset каждого запроса.
   const size_t window = minimum(self->bridge.ringCapacity(),
                                 static_cast<size_t>(
-                                    VfsClient::kFilexTransferWindowSize));
+                                    VfsClient::kTransferWindowSize));
   // Windows CopyFile не повторяет хвост короткого успешного WRITE. Поэтому весь
   // запрос копируется в PSRAM и всегда подтверждается полной длиной. Обычный
   // WRITE получает write-back ответ сразу из PSRAM; WRITE_THROUGH ждёт SD.
