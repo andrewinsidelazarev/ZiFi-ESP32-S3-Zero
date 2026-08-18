@@ -2210,6 +2210,9 @@ bool SmbServer::Impl::parseShare(const smb2_tree_connect_request* request,
   const size_t characters = request->path_length / 2;
   for (size_t index = 0; index < characters; ++index) {
     const uint16_t value = request->path[index];
+    if (value == 0) {
+      continue;
+    }
     if (value == '\\' || value == '/') {
       used = 0;
       continue;
