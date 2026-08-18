@@ -242,9 +242,9 @@ smb2_encode_file_stream_info(struct smb2_context *smb2,
         int name_len = 0;
 
         do {
-                fs->stream_name_length *= 2;
+                const uint32_t stream_name_bytes = fs->stream_name_length * 2;
                 smb2_set_uint64(vec, offset + 8, fs->stream_size);
-                smb2_set_uint32(vec, offset + 4, fs->stream_name_length);
+                smb2_set_uint32(vec, offset + 4, stream_name_bytes);
                 smb2_set_uint64(vec, offset + 16, fs->stream_allocation_size);
 
                 if (fs->stream_name) {
@@ -259,7 +259,7 @@ smb2_encode_file_stream_info(struct smb2_context *smb2,
                         }
                 }
 
-                fslen = 24 + fs->stream_name_length;
+                fslen = 24 + stream_name_bytes;
 
                 if (fs->next_entry_offset) {
                         padded_offset = PAD_TO_64BIT(offset + fslen);

@@ -4716,6 +4716,11 @@ int SmbServer::Impl::setInfoHandler(smb2_server* serverValue,
       }
 
       const bool replace = data[0] != 0;
+      if (replace) {
+        VfsResult delResult = {};
+        self->requestVfs(VfsOperation::kDelete, target, 0, delResult,
+                         kMutateVfsTimeoutMs);
+      }
       VfsResult result = {};
       char oldPath[kMaxPath + 1];
       snprintf(oldPath, sizeof(oldPath), "%s", handle->path);
