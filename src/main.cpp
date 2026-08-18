@@ -418,6 +418,7 @@ bool Application::connectWifi(const char* ssid, const char* password) {
   }
   snprintf(activeSsid_, sizeof(activeSsid_), "%s", ssid);
   snprintf(activePassword_, sizeof(activePassword_), "%s", safePassword);
+  configTime(config_.timezoneHours() * 3600, 0, "pool.ntp.org", "time.google.com");
   updateProxyState();
   return true;
 }
