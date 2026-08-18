@@ -393,10 +393,8 @@ void VfsBridge::processCore1() {
         } else {
           finish(false);
         }
-      } else if (exchange_->request.offset == 0) {
-        processRead();
       } else {
-        finish(false, "seek-not-random");
+        processRead();
       }
       break;
     case VfsOperation::kWriteAt:
@@ -406,10 +404,8 @@ void VfsBridge::processCore1() {
         } else {
           finish(false);
         }
-      } else if (exchange_->request.offset == 0) {
-        processWrite();
       } else {
-        finish(false, "seek-not-random");
+        processWrite();
       }
       break;
     case VfsOperation::kExtend:
