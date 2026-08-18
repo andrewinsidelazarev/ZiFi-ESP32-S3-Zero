@@ -19,7 +19,14 @@ void setError(char* error, size_t size, const char* text) {
 }  // namespace
 
 NetClient::NetClient()
-    : client_(), httpHeader_{}, pending_{}, pendingOffset_(0), pendingLength_(0) {}
+    : client_(),
+      proxyHost_{},
+      proxyPort_(0),
+      proxyEnabled_(false),
+      httpHeader_{},
+      pending_{},
+      pendingOffset_(0),
+      pendingLength_(0) {}
 
 bool NetClient::active() {
   return client_.connected() || client_.available() > 0 ||
@@ -197,22 +204,80 @@ bool NetClient::readHttpHeader(uint16_t& statusCode, uint32_t& contentLength,
   return true;
 }
 
+void NetClient::setProxy(const char* host, uint16_t port) {
+  if (host != nullptr && *host != 0) {
+    snprintf(proxyHost_, sizeof(proxyHost_), "%s", host);
+    proxyPort_ = port != 0 ? port : 49281;
+    proxyEnabled_ = true;
+  } else {
+    clearProxy();
+  }
+}
+
+void NetClient::clearProxy() {
+  proxyHost_[0] = 0;
+  proxyPort_ = 0;
+  proxyEnabled_ = false;
+}
+
 bool NetClient::httpGet(const char* host, uint16_t port, const char* path,
                         uint16_t& statusCode, uint32_t& contentLength,
                         char* error, size_t errorSize) {
-  if (!open(host, port, error, errorSize)) {
+  const bool useProxy = proxyEnabled_ && proxyHost_[0] != 0;
+  const char* connectHost = useProxy ? proxyHost_ : host;
+  const uint16_t connectPort = useProxy ? proxyPort_ : port;
+
+  if (!open(connectHost, connectPort, error, errorSize)) {
     return false;
   }
   if (path == nullptr || *path == 0) {
     path = "/";
   }
-  char request[512];
-  const int length = snprintf(
-      request, sizeof(request),
-      "GET %s HTTP/1.0\r\nHost: %s\r\n"
-      "User-Agent: ZiFi (ZX Evo)\r\nAccept: */*\r\n"
-      "Connection: close\r\n\r\n",
-      path, host);
+  char request[640];
+  int length = -1;
+  if (useProxy) {
+    if (port != 80 && port != 0) {
+      length = snprintf(
+          request, sizeof(request),
+          "GET http://%s:%u%s HTTP/1.0\r\n"
+          "Host: %s:%u\r\n"
+          "Proxy-Authorization: Basic eng6eng=\r\n"
+          "User-Agent: ZiFi (ZX Evo)\r\n"
+          "Accept: */*\r\n"
+          "Connection: close\r\n\r\n",
+          host, port, path, host, port);
+    } else {
+      length = snprintf(
+          request, sizeof(request),
+          "GET http://%s%s HTTP/1.0\r\n"
+          "Host: %s\r\n"
+          "Proxy-Authorization: Basic eng6eng=\r\n"
+          "User-Agent: ZiFi (ZX Evo)\r\n"
+          "Accept: */*\r\n"
+          "Connection: close\r\n\r\n",
+          host, path, host);
+    }
+  } else {
+    if (port != 80 && port != 0) {
+      length = snprintf(
+          request, sizeof(request),
+          "GET %s HTTP/1.0\r\n"
+          "Host: %s:%u\r\n"
+          "User-Agent: ZiFi (ZX Evo)\r\n"
+          "Accept: */*\r\n"
+          "Connection: close\r\n\r\n",
+          path, host, port);
+    } else {
+      length = snprintf(
+          request, sizeof(request),
+          "GET %s HTTP/1.0\r\n"
+          "Host: %s\r\n"
+          "User-Agent: ZiFi (ZX Evo)\r\n"
+          "Accept: */*\r\n"
+          "Connection: close\r\n\r\n",
+          path, host);
+    }
+  }
   if (length < 0 || static_cast<size_t>(length) >= sizeof(request)) {
     close();
     setError(error, errorSize, "request too long");

@@ -10,8 +10,9 @@ ESP-01S через переходник и сохраняет двоичный U
 - UART0: `RX=GPIO44`, `TX=GPIO43`, 115200 8N1;
 - команды `ECHO`, `WIFI_CONNECT`, `WIFI_INI`, `PING`, `SYS_INFO`, `GET_STEP`,
   `FTP_START/STOP`, `FTP_RAM_STATS`, `SMB_START/STOP`, `NET_OPEN/SEND/RECV/CLOSE`,
-  `NET_HTTP_GET`, `NET_PING`, `NET_IP_CONFIG`, `NET_NTP`,
+  `NET_HTTP_GET`, `NET_PING`, `NET_IP_CONFIG`, `NET_NTP`, `NET_PROXY_STATUS`,
   `UPDATE_START/STOP` и `SYS_RESET`;
+- прозрачный HTTP-прокси для обхода блокировок ретро-архивов (`vtrd.in`, `zxart.ee` и др.) с проверкой доступности и фиксированной авторизацией;
 - NTP-плагин Wild Commander с результатом `YYYYMMDDhhmmss`;
 - совместимость с Native-версией `zifi.spg`: ESP сама выполняет DNS,
   HTTP-запрос и разбор заголовка, Z80 забирает тело командами `NET_RECV`;

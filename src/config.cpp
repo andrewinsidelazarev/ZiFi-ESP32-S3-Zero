@@ -200,4 +200,24 @@ int8_t IniConfig::timezoneHours() const {
   return static_cast<int8_t>(sign * hours);
 }
 
+const char* IniConfig::proxyHost() const {
+  const char* host = get("proxy_ip", "");
+  if (host != nullptr && *host != 0) {
+    return host;
+  }
+  return get("proxy_host", "");
+}
+
+uint16_t IniConfig::proxyPort() const {
+  const char* portStr = get("proxy_port", "");
+  if (portStr == nullptr || *portStr == 0) {
+    return 49281;
+  }
+  const unsigned long val = strtoul(portStr, nullptr, 10);
+  if (val == 0 || val > 65535) {
+    return 49281;
+  }
+  return static_cast<uint16_t>(val);
+}
+
 }  // namespace zifi

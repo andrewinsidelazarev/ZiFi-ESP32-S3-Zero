@@ -32,6 +32,7 @@ enum Command : uint8_t {
   kNetPing = 0x20,
   kNetIpConfig = 0x21,
   kNetNtp = 0x22,
+  kNetProxyStatus = 0x23,
 
   kVfsStat = 0x40,
   kVfsOpenDir = 0x41,
@@ -81,6 +82,7 @@ enum Command : uint8_t {
   kRespNetIpConfig = 0xA0,
   kRespNetPing = 0xA1,
   kRespNetNtp = 0xA2,
+  kRespNetProxyStatus = 0xA3,
   kReady = 0xF0,
   kError = 0xEE,
   kAck = 0xFE,

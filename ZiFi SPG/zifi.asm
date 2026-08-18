@@ -4145,6 +4145,7 @@ init_zifi
 		; для красоты — поведение сокетов зависит от версии, и без неё
 		; разбор отказа идёт вслепую.
 		call show_esp_info
+		call show_proxy_status
 
 ; Проба доступности узла (Net_PingHost) из старта временно убрана. Она задумана
 ; как диагностика, но именно на ней старт и застревал, а застрявший старт не
@@ -4322,6 +4323,45 @@ put_octet_digit
 		ret
 
 put_octet_seen		db 0
+
+; Показать статус HTTP-прокси (CMD_NET_PROXY_STATUS).
+show_proxy_status:
+		call Net_ProxyStatus
+		jr c,.disabled
+		cp 1
+		jr z,.enabled
+		cp 2
+		jr z,.unreach
+.disabled:
+		ld hl,proxy_disabled_msg
+		ld b,1
+		jp zifi_echo
+.unreach:
+		ld hl,proxy_unreach_msg
+		ld b,1
+		jp zifi_echo
+.enabled:
+		push de
+		ld de,proxy_enabled_field
+		pop hl
+		ld b,30
+1		ld a,(hl)
+		or a
+		jr z,2f
+		ld (de),a
+		inc hl
+		inc de
+		djnz 1b
+2		xor a
+		ld (de),a
+		ld hl,proxy_enabled_msg
+		ld b,1
+		jp zifi_echo
+
+proxy_enabled_msg	db "Proxy enabled: "
+proxy_enabled_field	ds 32
+proxy_disabled_msg	db "Proxy disabled",0,0
+proxy_unreach_msg	db "Proxy disabled (server unreachable)",0,0
 
 esp_ip_msg		db "ESP IP: "
 esp_ip_field		ds 16

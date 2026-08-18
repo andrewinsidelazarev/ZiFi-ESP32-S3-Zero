@@ -29,6 +29,7 @@ CMD_SYS_RESET   equ #0F
 CMD_SYS_INFO    equ #02
 CMD_NET_IPCONFIG equ #21               ; текущие IP, маска, шлюз, DNS
 CMD_NET_NTP     equ #22                ; точное время; ESP уже учла time: из ini
+CMD_NET_PROXY_STATUS equ #23           ; статус HTTP-прокси (0=выкл, 1=вкл, 2=недоступен)
 ; TCP-клиент: подключиться, отправить, забрать порцию, закрыть. Данные тянет
 ; Z80 — приёмная очередь ZiFi всего 256 байт, и непрошеный поток её переполнит.
 CMD_NET_OPEN    equ #10                ; адрес,0,порт LE16 (без порта — 80)
@@ -56,7 +57,9 @@ RESP_UPDATE_STOP equ #89
 RESP_SMB_START  equ #8B
 RESP_SMB_STOP   equ #8C
 RESP_NET_IPCONFIG equ #A0
+RESP_NET_PING   equ #A1
 RESP_NET_NTP    equ #A2                ; ГГГГММДДЧЧММСС, 14 символов ASCII
+RESP_NET_PROXY_STATUS equ #A3          ; [status(1B)][endpoint(ASCII)]
 RESP_NET_OPEN   equ #90
 RESP_NET_SEND   equ #91
 ; Первый байт: 0 — порция (пустая значит «данных пока нет, спроси снова»),
@@ -65,8 +68,6 @@ RESP_NET_RECV   equ #92
 RESP_NET_CLOSE  equ #93
 ; Признак, код ответа HTTP (LE16) и длина тела (LE32, ноль — сервер не назвал).
 RESP_NET_HTTP_GET equ #94
-; Признак ответа плюс время отклика в миллисекундах, LE16.
-RESP_NET_PING   equ #A1
 RESP_READY      equ #F0
 RESP_ERROR      equ #EE                 ; доклад ESP об исключении
 RESP_ACK        equ #FE
@@ -342,6 +343,32 @@ Proto_SaveErr:
 .term:
         xor a
         ld (de),a
+        ret
+
+; Запросить статус HTTP-прокси.
+; Возвращает: CF=0 если ответ получен (A=статус: 0-выкл, 1-вкл, 2-недоступен;
+; DE=указатель на строку адреса ProtoBuf+1 с нулём); CF=1 при тайм-ауте.
+Net_ProxyStatus:
+        ld hl,0
+        ld bc,0
+        ld a,CMD_NET_PROXY_STATUS
+        call Proto_Send
+        ld de,40                        ; до 1 с
+        call ZiFi_SetTimeout
+        ld a,RESP_NET_PROXY_STATUS
+        call Proto_WaitCmd
+        ret c
+        ld hl,(ProtoRxLen)
+        ld a,h
+        or l
+        scf
+        ret z
+        ld bc,ProtoBuf
+        add hl,bc
+        ld (hl),0                       ; гарантируем завершающий ноль
+        ld a,(ProtoBuf)                 ; статус (0, 1, 2)
+        ld de,ProtoBuf+1                ; адрес "ip:port"
+        or a
         ret
 
 ; --- данные -----------------------------------------------------------------

@@ -23,6 +23,11 @@ class NetClient {
                uint16_t& statusCode, uint32_t& contentLength,
                char* error, size_t errorSize);
   bool probe(const char* host, uint16_t port, uint16_t& elapsedMs);
+  void setProxy(const char* host, uint16_t port);
+  void clearProxy();
+  bool proxyEnabled() const { return proxyEnabled_; }
+  const char* proxyHost() const { return proxyHost_; }
+  uint16_t proxyPort() const { return proxyPort_; }
   void close();
   bool active();
 
@@ -31,6 +36,9 @@ class NetClient {
                       char* error, size_t errorSize);
 
   WiFiClient client_;
+  char proxyHost_[128];
+  uint16_t proxyPort_;
+  bool proxyEnabled_;
   // Буфер заголовка живёт в объекте, а не на 6-КБ стеке сетевой задачи.
   char httpHeader_[2049];
   uint8_t pending_[256];

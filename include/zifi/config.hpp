@@ -22,6 +22,8 @@ class IniConfig {
   const char* get(const char* key, const char* fallback = nullptr) const;
   const char* ssid() const { return get("ssid", ""); }
   const char* password() const { return get("password", ""); }
+  const char* proxyHost() const;
+  uint16_t proxyPort() const;
   int8_t timezoneHours() const;
   size_t count() const { return count_; }
   const IniEntry& entry(size_t index) const { return entries_[index]; }

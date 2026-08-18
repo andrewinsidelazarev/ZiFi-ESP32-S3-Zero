@@ -122,6 +122,8 @@ class Application {
   void processHttpGet();
   void processNetProbe();
   void processIpConfig();
+  void processNetProxyStatus();
+  void updateProxyState();
 
   void handle(const PacketView& packet);
   void handleSysInfo();
@@ -165,6 +167,8 @@ class Application {
   char lastError_[49];
   char activeSsid_[33];
   char activePassword_[64];
+  uint8_t proxyStatus_;
+  char activeProxy_[64];
   uint8_t configCache_[ConfigStore::kMaxIniSize];
   uint8_t response_[kMaxPayload];
 };
@@ -194,6 +198,8 @@ Application::Application()
       lastError_{},
       activeSsid_{},
       activePassword_{},
+      proxyStatus_(0),
+      activeProxy_{},
       configCache_{},
       response_{} {}
 
@@ -412,7 +418,33 @@ bool Application::connectWifi(const char* ssid, const char* password) {
   }
   snprintf(activeSsid_, sizeof(activeSsid_), "%s", ssid);
   snprintf(activePassword_, sizeof(activePassword_), "%s", safePassword);
+  updateProxyState();
   return true;
+}
+
+void Application::updateProxyState() {
+  const char* host = config_.proxyHost();
+  const uint16_t port = config_.proxyPort();
+  if (host == nullptr || *host == 0) {
+    proxyStatus_ = 0;
+    activeProxy_[0] = 0;
+    netClient_.clearProxy();
+    return;
+  }
+  snprintf(activeProxy_, sizeof(activeProxy_), "%s:%u", host, port);
+  if (WiFi.status() == WL_CONNECTED) {
+    uint16_t elapsedMs = 0;
+    if (netClient_.probe(host, port, elapsedMs)) {
+      proxyStatus_ = 1;
+      netClient_.setProxy(host, port);
+    } else {
+      proxyStatus_ = 2;
+      netClient_.clearProxy();
+    }
+  } else {
+    proxyStatus_ = 0;
+    netClient_.clearProxy();
+  }
 }
 
 void Application::prepareWifiResponse(uint8_t responseCommand,
@@ -483,7 +515,23 @@ void Application::processWifiIni() {
   if (!connected) {
     setNetworkError("wifi timeout");
   }
+  updateProxyState();
   prepareWifiResponse(kRespWifiIni, connected);
+}
+
+void Application::processNetProxyStatus() {
+  exchange_->responseCommand = kRespNetProxyStatus;
+  exchange_->response[0] = proxyStatus_;
+  size_t len = 1;
+  if (activeProxy_[0] != 0) {
+    const size_t slen = strlen(activeProxy_);
+    if (slen < sizeof(exchange_->response) - 2) {
+      memcpy(exchange_->response + 1, activeProxy_, slen);
+      len += slen;
+    }
+  }
+  exchange_->response[len] = 0;
+  exchange_->responseLength = static_cast<uint16_t>(len);
 }
 
 void Application::processNtp() {
@@ -841,6 +889,9 @@ void Application::processNetworkRequest() {
     case kNetIpConfig:
       processIpConfig();
       break;
+    case kNetProxyStatus:
+      processNetProxyStatus();
+      break;
     default:
       setNetworkError("network command:%02X", exchange_->requestCommand);
       break;
@@ -873,9 +924,7 @@ void Application::sendWifiFailure(uint8_t responseCommand) {
 }
 
 void Application::sendNtpFailure() {
-  static constexpr uint8_t failed[14] = {
-      '0', '0', '0', '0', '0', '0', '0',
-      '0', '0', '0', '0', '0', '0', '0'};
+  const uint8_t failed[14] = {};
   transport_.send(kRespNetNtp, failed, sizeof(failed));
 }
 
@@ -925,6 +974,9 @@ void Application::sendNetworkFailure(uint8_t command) {
     case kNetIpConfig:
       transport_.send(kRespNetIpConfig, failed, 16);
       break;
+    case kNetProxyStatus:
+      transport_.send(kRespNetProxyStatus, failed, 1);
+      break;
     case kNetNtp:
       sendNtpFailure();
       break;
@@ -961,17 +1013,20 @@ void Application::pollNetworkEvent() {
 
 void Application::handleSysInfo() {
   transport_.sendAck();
+  const char* proxyStr = proxyStatus_ == 1 ? activeProxy_
+                       : (proxyStatus_ == 2 ? "UNREACHABLE" : "OFF");
   const int length = snprintf(
       reinterpret_cast<char*>(response_), sizeof(response_),
       "RAM:%uB PSRAM:%u/%uB Flash:%uB Sketch:%uB RST:%u "
-      "CORE:UART+VFS1/NET+EVT0 CTRL:%s VFSBUF:%s:%u+%u FW:%s",
+      "CORE:UART+VFS1/NET+EVT0 CTRL:%s VFSBUF:%s:%u+%u PROXY:%s FW:%s",
       ESP.getFreeHeap(), ESP.getFreePsram(), ESP.getPsramSize(),
       ESP.getFlashChipSize(), ESP.getSketchSize(),
       static_cast<unsigned>(esp_reset_reason()),
       exchangeInPsram_ ? "PSRAM" : "RAM",
       vfsBridge_.buffersInPsram() ? "PSRAM" : "RAM",
       static_cast<unsigned>(vfsBridge_.ringCapacity()),
-      static_cast<unsigned>(vfsBridge_.ringCapacity()), ZIFI_BUILD_VERSION);
+      static_cast<unsigned>(vfsBridge_.ringCapacity()),
+      proxyStr, ZIFI_BUILD_VERSION);
   if (length <= 0) {
     reportError("sysinfo format");
     transport_.send(kRespSysInfo);
@@ -1050,6 +1105,7 @@ void Application::handle(const PacketView& packet) {
     case kNetHttpGet:
     case kNetPing:
     case kNetIpConfig:
+    case kNetProxyStatus:
       transport_.sendAck();
       if (!submitNetwork(packet.command, packet.data, packet.length)) {
         reportError("network busy");
