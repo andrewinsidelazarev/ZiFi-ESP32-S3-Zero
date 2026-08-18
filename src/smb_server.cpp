@@ -2325,7 +2325,7 @@ bool SmbServer::Impl::fetchReadWindow(Handle& handle) {
   }
   const uint32_t remaining = handle.physicalSize - activeVfsOffset;
   const uint32_t wanted = static_cast<uint32_t>(minimum(
-      static_cast<size_t>(remaining), VfsClient::kFilexTransferWindowSize));
+      static_cast<size_t>(remaining), VfsClient::kTransferWindowSize));
   VfsResult result;
   if (!requestVfsAt(VfsOperation::kReadAt, activeVfsOffset, wanted, result,
                     kNormalVfsTimeoutMs) ||
@@ -2346,9 +2346,17 @@ bool SmbServer::Impl::activateRead(int slot, uint32_t offset) {
     return false;
   }
   VfsResult result;
-  if (!requestVfs(VfsOperation::kOpenRandom, handle.path, 0, result,
-                  kNormalVfsTimeoutMs)) {
-    return false;
+  const bool useSequential = (offset == 0);
+  const VfsOperation op =
+      useSequential ? VfsOperation::kOpenRead : VfsOperation::kOpenRandom;
+  if (!requestVfs(op, handle.path, 0, result, kNormalVfsTimeoutMs)) {
+    if (useSequential &&
+        !requestVfs(VfsOperation::kOpenRandom, handle.path, 0, result,
+                    kNormalVfsTimeoutMs)) {
+      return false;
+    } else if (!useSequential) {
+      return false;
+    }
   }
   activeSlot = slot;
   activeMode = ActiveMode::kRead;
@@ -2699,7 +2707,7 @@ void SmbServer::Impl::pollAsyncRead() {
     const size_t wanted = minimum(
         minimum(static_cast<size_t>(current.length - current.filled),
                 static_cast<size_t>(handle->physicalSize - activeVfsOffset)),
-        minimum(VfsClient::kFilexTransferWindowSize,
+        minimum(VfsClient::kTransferWindowSize,
                 bridge.vfsToNetworkFree()));
     if (wanted == 0 ||
         !bridge.submitAt(VfsOperation::kReadAt, activeVfsOffset,
@@ -3424,7 +3432,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_END_OF_FILE);
   }
   const uint32_t physicalWindow = static_cast<uint32_t>(minimum(
-      self->bridge.ringCapacity(), VfsClient::kFilexTransferWindowSize));
+      self->bridge.ringCapacity(), VfsClient::kTransferWindowSize));
   if (physicalWindow == 0) {
     return replyStatus(smb2, SMB2_READ,
                        SMB2_STATUS_INSUFFICIENT_RESOURCES);

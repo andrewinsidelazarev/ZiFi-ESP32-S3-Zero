@@ -247,8 +247,11 @@ void VfsBridge::finish(bool success, const char* error) {
 
 void VfsBridge::processRead() {
   const size_t room = vfsToNetwork_.freeSpace();
-  const size_t pumpLimit = exchange_->request.operation == VfsOperation::kReadAt
+  const size_t maxWindow = vfs_.openMode() == 3
                                ? VfsClient::kFilexTransferWindowSize
+                               : VfsClient::kTransferWindowSize;
+  const size_t pumpLimit = exchange_->request.operation == VfsOperation::kReadAt
+                               ? maxWindow
                                : kMaxPumpPerRequest;
   const size_t wanted = minimum(
       minimum(static_cast<size_t>(exchange_->request.value),
@@ -270,8 +273,11 @@ void VfsBridge::processRead() {
 }
 
 void VfsBridge::processWrite() {
-  const size_t pumpLimit = exchange_->request.operation == VfsOperation::kWriteAt
+  const size_t maxWindow = vfs_.openMode() == 3
                                ? VfsClient::kFilexTransferWindowSize
+                               : VfsClient::kTransferWindowSize;
+  const size_t pumpLimit = exchange_->request.operation == VfsOperation::kWriteAt
+                               ? maxWindow
                                : kMaxPumpPerRequest;
   const size_t requested = minimum(
       static_cast<size_t>(exchange_->request.value),
