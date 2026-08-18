@@ -1,5 +1,9 @@
 # ZiFi ESP32-S3 Zero
 
+<p align="center">
+  <img src="Zifi%20ESP32%20Zero%20Adapter/Documentation/esp32-s3-zero-to-esp-01-adapter.webp" alt="ZiFi ESP32-S3 Zero to ESP-01S Adapter" width="700">
+</p>
+
 Нативная прошивка для стандартного Waveshare ESP32-S3-Zero на
 `ESP32-S3FH4R2` (4 МБ Flash, 2 МБ QSPI PSRAM). Модуль устанавливается вместо
 ESP-01S через переходник и сохраняет двоичный UART-протокол ZiFi.
