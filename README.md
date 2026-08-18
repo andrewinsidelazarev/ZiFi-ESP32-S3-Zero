@@ -38,6 +38,19 @@ WebDAV ещё не включён. Сетевой файловый listener за
 командой плагина: `FTP_START` для `ZIFIFTP.WMF` либо `SMB_START` для
 `ZIFISMB.WMF`. Одно наличие Wi-Fi не открывает порты `21` и `445`.
 
+## Готовые файлы для скачивания
+
+| Категория | Файл для скачивания | Назначение |
+|---|---|---|
+| **Первая прошивка (USB)** | [**`firmware.factory.bin`**](firmware/firmware.factory.bin) | Полный 4 МБ образ для первой прошивки ESP32-S3 через USB Type-C (смещение `0x0`) |
+| **Обновление по Wi-Fi (OTA)** | [**`firmware.bin`**](firmware/firmware.bin) | Образ приложения для сетевого обновления ([SHA-256](firmware/firmware.sha256)) |
+| **Сетевой апдейтер** | [**`update.sna`**](firmware/update.sna) | Snapshot для ZX-Evolution, запускающий приём OTA-обновления |
+| **SMB-сервер (Windows)** | [**`ZIFISMB.WMF`**](SMB%20Server/build/ZIFISMB.WMF) | Плагин Wild Commander: доступ к SD-карте по сети `\\ZX-Evo\SD` |
+| **FTP-сервер** | [**`ZIFIFTP.WMF`**](FTP%20Server/build/ZIFIFTP.WMF) | Плагин Wild Commander: полнофункциональный FTP-сервер |
+| **Синхронизация времени** | [**`NTPTIME.WMF`**](NTP%20Time%20Sync/build/NTPTIME.WMF) | Плагин Wild Commander: синхронизация часов RTC через интернет |
+| **Браузер / Загрузчик** | [**`zifi.spg`**](ZiFi%20SPG/build/zifi.spg) | Программа ZiFi для ZX-Evolution (каталог сайтов, скачивание) |
+| **Печатная плата переходника** | [**`Manufacturing.zip`**](Zifi%20ESP32%20Zero%20Adapter/Zifi_ESP32_Zero_Adapter-Manufacturing.zip) | Готовый архив герберов для заказа платы переходника в производство |
+
 ## Архитектура двух ядер
 
 ```text
