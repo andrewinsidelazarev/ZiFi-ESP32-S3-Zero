@@ -744,6 +744,8 @@ struct SmbServer::Impl {
   void releaseTree(uint32_t id);
   uint32_t visibleSize(const Handle& handle) const;
   uint64_t directoryFileId(const char* name) const;
+  uint64_t currentFileTime() const;
+  smb2_timeval currentSmb2Time() const;
   void fillDirectoryInfo(smb2_fileidbothdirectoryinformation& info,
                          uint32_t index, bool directory, uint32_t size,
                          const char* name) const;
@@ -2498,10 +2500,36 @@ uint64_t SmbServer::Impl::directoryFileId(const char* name) const {
   return hash;
 }
 
+uint64_t SmbServer::Impl::currentFileTime() const {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    now = 1767225600;  // 2026-01-01 00:00:00 UTC
+  }
+  constexpr uint64_t kUnixEpochSeconds = 11644473600ULL;
+  constexpr uint64_t kTicksPerSecond = 10000000ULL;
+  return (static_cast<uint64_t>(now) + kUnixEpochSeconds) * kTicksPerSecond;
+}
+
+smb2_timeval SmbServer::Impl::currentSmb2Time() const {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    now = 1767225600;  // 2026-01-01 00:00:00 UTC
+  }
+  smb2_timeval tv = {};
+  tv.tv_sec = now;
+  tv.tv_usec = 0;
+  return tv;
+}
+
 void SmbServer::Impl::fillDirectoryInfo(
     smb2_fileidbothdirectoryinformation& info, uint32_t index,
     bool directory, uint32_t size, const char* name) const {
   memset(&info, 0, sizeof(info));
+  const smb2_timeval fileTime = currentSmb2Time();
+  info.creation_time = fileTime;
+  info.last_access_time = fileTime;
+  info.last_write_time = fileTime;
+  info.change_time = fileTime;
   info.file_index = index;
   info.end_of_file = size;
   info.allocation_size = allocationSize(size);
@@ -3423,6 +3451,11 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
   memcpy(reply->file_id, handle.fileId, SMB2_FD_SIZE);
   self->lastCreatedSlot = slot;
 
+  const uint64_t fileTime = self->currentFileTime();
+  reply->creation_time = fileTime;
+  reply->last_access_time = fileTime;
+  reply->last_write_time = fileTime;
+  reply->change_time = fileTime;
   reply->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
   reply->create_action = action;
   reply->allocation_size = allocationSize(size);
@@ -4254,12 +4287,18 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
 
   if (request->info_type == SMB2_0_INFO_FILE) {
     switch (request->file_info_class) {
-      case SMB2_FILE_BASIC_INFORMATION:
+      case SMB2_FILE_BASIC_INFORMATION: {
         memset(&self->basicInfo, 0, sizeof(self->basicInfo));
+        const smb2_timeval fileTime = self->currentSmb2Time();
+        self->basicInfo.creation_time = fileTime;
+        self->basicInfo.last_access_time = fileTime;
+        self->basicInfo.last_write_time = fileTime;
+        self->basicInfo.change_time = fileTime;
         self->basicInfo.file_attributes = attributes;
         output = &self->basicInfo;
         outputLength = sizeof(self->basicInfo);
         break;
+      }
       case SMB2_FILE_STANDARD_INFORMATION:
         memset(&self->standardInfo, 0, sizeof(self->standardInfo));
         self->standardInfo.allocation_size = allocationSize(size);
@@ -4278,11 +4317,16 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
         output = &self->eaInfo;
         outputLength = sizeof(self->eaInfo);
         break;
-      case SMB2_FILE_ALL_INFORMATION:
+      case SMB2_FILE_ALL_INFORMATION: {
         memset(&self->allInfo, 0, sizeof(self->allInfo));
         if (!self->makeInfoName(*handle)) {
           break;
         }
+        const smb2_timeval fileTime = self->currentSmb2Time();
+        self->allInfo.basic.creation_time = fileTime;
+        self->allInfo.basic.last_access_time = fileTime;
+        self->allInfo.basic.last_write_time = fileTime;
+        self->allInfo.basic.change_time = fileTime;
         self->allInfo.basic.file_attributes = attributes;
         self->allInfo.standard.allocation_size = allocationSize(size);
         self->allInfo.standard.end_of_file = size;
@@ -4297,20 +4341,27 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
         output = &self->allInfo;
         outputLength = sizeof(self->allInfo);
         break;
+      }
       case SMB2_FILE_INTERNAL_INFORMATION:
         memset(&self->internalInfo, 0, sizeof(self->internalInfo));
         self->internalInfo.index_number = self->directoryFileId(handle->path);
         output = &self->internalInfo;
         outputLength = sizeof(self->internalInfo);
         break;
-      case SMB2_FILE_NETWORK_OPEN_INFORMATION:
+      case SMB2_FILE_NETWORK_OPEN_INFORMATION: {
         memset(&self->networkInfo, 0, sizeof(self->networkInfo));
+        const smb2_timeval fileTime = self->currentSmb2Time();
+        self->networkInfo.creation_time = fileTime;
+        self->networkInfo.last_access_time = fileTime;
+        self->networkInfo.last_write_time = fileTime;
+        self->networkInfo.change_time = fileTime;
         self->networkInfo.allocation_size = allocationSize(size);
         self->networkInfo.end_of_file = size;
         self->networkInfo.file_attributes = attributes;
         output = &self->networkInfo;
         outputLength = sizeof(self->networkInfo);
         break;
+      }
       case SMB2_FILE_NAME_INFORMATION:
       case SMB2_FILE_NORMALIZED_NAME_INFORMATION:
         memset(&self->nameInfo, 0, sizeof(self->nameInfo));
