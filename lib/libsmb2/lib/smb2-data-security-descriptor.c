@@ -567,5 +567,5 @@ smb2_encode_security_descriptor(struct smb2_context *smb2,
         smb2_set_uint32(vec, 12, 0); /* Sacl: not supported */
         smb2_set_uint32(vec, 16, offset_dacl);
 
-        return 0;
+        return pos;
 }

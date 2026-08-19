@@ -451,6 +451,7 @@ struct SmbServer::Impl {
         eventSink(sink),
         eventContext(sinkContext),
         udp(),
+        udpLlmnr(),
         wsDiscovery(),
         server{},
         handlers{},
@@ -458,6 +459,7 @@ struct SmbServer::Impl {
         taskAlive(false),
         runningFlag(false),
         discoveryRunning(false),
+        llmnrRunning(false),
         lastServeResult(0),
         clients{},
         trees{},
@@ -557,6 +559,7 @@ struct SmbServer::Impl {
   EventSink eventSink;
   void* eventContext;
   WiFiUDP udp;
+  WiFiUDP udpLlmnr;
   WsDiscovery wsDiscovery;
   smb2_server server;
   smb2_server_request_handlers handlers;
@@ -564,6 +567,7 @@ struct SmbServer::Impl {
   volatile bool taskAlive;
   volatile bool runningFlag;
   bool discoveryRunning;
+  bool llmnrRunning;
   volatile int lastServeResult;
   // Проводник открывает к серверу несколько TCP-соединений сразу: отдельно
   // копирование, отдельно потоки оболочки с эскизами и типами файлов. Раньше
@@ -617,6 +621,7 @@ struct SmbServer::Impl {
   smb2_file_name_info nameInfo;
   smb2_file_position_info positionInfo;
   smb2_file_stream_info streamInfo;
+  smb2_security_descriptor secDesc;
   DirectoryCache directoryCache;
   // Копия целиком прочитанного файла в PSRAM. Заполняется только строго
   // последовательным чтением с нулевого смещения и живёт до первой правки
@@ -643,6 +648,11 @@ struct SmbServer::Impl {
   uint8_t scratch[512];
   uint8_t nbnsPacket[576];
 
+  // Адрес, на котором подняты сокеты обнаружения. Выдаётся по DHCP и способен
+  // смениться сам, без нашего участия — это единственный параметр среды,
+  // который не контролирует ни прошивка, ни пользователь.
+  uint32_t announcedAddress = 0;
+
   bool start(const uint8_t* payload, uint16_t length, uint16_t& actualPort,
              bool& netbiosActive, char* error, size_t errorSize);
   bool stop();
@@ -650,6 +660,8 @@ struct SmbServer::Impl {
   void startDiscovery();
   void stopDiscovery();
   void answerNbns(size_t length);
+  void answerLlmnr(const uint8_t* packet, size_t length);
+  bool addressChanged();
 
   static void taskEntry(void* context);
   void taskLoop();
@@ -1636,47 +1648,96 @@ void SmbServer::Impl::resetProgress() {
 
 void SmbServer::Impl::startDiscovery() {
   discoveryRunning = strlen(hostname) <= 15 && udp.begin(137) == 1;
-  // NBNS отвечает за старое разрешение имени, а WS-Discovery — за плитку
-  // компьютера в современном разделе «Сеть» Проводника Windows.
+  llmnrRunning = udpLlmnr.beginMulticast(IPAddress(224, 0, 0, 252), 5355) == 1;
+  // NBNS отвечает за старое разрешение имени, LLMNR — за современное разрешение
+  // имени в Windows 10/11, а WS-Discovery — за плитку компьютера в проводнике.
   const bool wsdStarted = wsDiscovery.begin(hostname, workgroup, server.guid,
                                              ZIFI_BUILD_VERSION);
-  diagnosticLogEvent("DISCOVERY start nbns=%u wsd=%u",
-                     discoveryRunning ? 1U : 0U, wsdStarted ? 1U : 0U);
+  // Запоминаем адрес, на котором подняты сокеты: сравнение с ним и есть
+  // признак того, что DHCP выдал плате новый адрес.
+  announcedAddress = static_cast<uint32_t>(WiFi.localIP());
+  diagnosticLogEvent("DISCOVERY start nbns=%u llmnr=%u wsd=%u ip=%lu",
+                     discoveryRunning ? 1U : 0U,
+                     llmnrRunning ? 1U : 0U,
+                     wsdStarted ? 1U : 0U,
+                     static_cast<unsigned long>(announcedAddress));
+}
+
+// Сокеты обнаружения привязаны к адресу, действовавшему на момент запуска.
+// После смены адреса они перестают слышать широковещательные и многоадресные
+// запросы, и отвечать на разрешение имени становится некому. Короткий TTL в
+// ответах NBNS и LLMNR тут не помогает: Windows спросит заново, а нас на линии
+// уже не будет — и имя останется указывать в пустоту, хотя сервер жив.
+bool SmbServer::Impl::addressChanged() {
+  const uint32_t current = static_cast<uint32_t>(WiFi.localIP());
+  // Нулевой адрес означает, что Wi-Fi сейчас без адреса вовсе. Дёргать контур
+  // обнаружения в этот момент бессмысленно: дождёмся нового адреса.
+  return current != 0 && current != announcedAddress;
 }
 
 void SmbServer::Impl::stopDiscovery() {
-  if (discoveryRunning || wsDiscovery.running()) {
-    diagnosticLogEvent("DISCOVERY stop nbns=%u wsd=%u",
+  if (discoveryRunning || llmnrRunning || wsDiscovery.running()) {
+    diagnosticLogEvent("DISCOVERY stop nbns=%u llmnr=%u wsd=%u",
                        discoveryRunning ? 1U : 0U,
+                       llmnrRunning ? 1U : 0U,
                        wsDiscovery.running() ? 1U : 0U);
   }
   wsDiscovery.stop();
   if (discoveryRunning) {
     udp.stop();
   }
+  if (llmnrRunning) {
+    udpLlmnr.stop();
+  }
   discoveryRunning = false;
+  llmnrRunning = false;
 }
 
 void SmbServer::Impl::pollDiscovery() {
   if (!runningFlag) {
     return;
   }
+  if (addressChanged()) {
+    // Поднимаем контур заново целиком: WS-Discovery успевает попрощаться и
+    // представиться новым экземпляром, чтобы плитка в «Сети» не осталась с
+    // прежним адресом, а сокеты NBNS и LLMNR привязываются к новому.
+    diagnosticLogEvent("DISCOVERY address-changed old=%lu new=%lu",
+                       static_cast<unsigned long>(announcedAddress),
+                       static_cast<unsigned long>(
+                           static_cast<uint32_t>(WiFi.localIP())));
+    stopDiscovery();
+    startDiscovery();
+    return;
+  }
   wsDiscovery.poll();
-  if (!discoveryRunning) {
-    return;
+  if (discoveryRunning) {
+    const int packetLength = udp.parsePacket();
+    if (packetLength > 0) {
+      const size_t wanted = minimum(static_cast<size_t>(packetLength),
+                                    sizeof(nbnsPacket));
+      const int received = udp.read(nbnsPacket, wanted);
+      while (udp.available() > 0) {
+        udp.read();
+      }
+      if (received > 0) {
+        answerNbns(static_cast<size_t>(received));
+      }
+    }
   }
-  const int packetLength = udp.parsePacket();
-  if (packetLength <= 0) {
-    return;
-  }
-  const size_t wanted = minimum(static_cast<size_t>(packetLength),
-                                sizeof(nbnsPacket));
-  const int received = udp.read(nbnsPacket, wanted);
-  while (udp.available() > 0) {
-    udp.read();
-  }
-  if (received > 0) {
-    answerNbns(static_cast<size_t>(received));
+  if (llmnrRunning) {
+    const int packetLength = udpLlmnr.parsePacket();
+    if (packetLength > 0) {
+      uint8_t buffer[512] = {};
+      const size_t wanted = minimum(static_cast<size_t>(packetLength),
+                                    sizeof(buffer));
+      const int received = udpLlmnr.read(buffer, wanted);
+      while (udpLlmnr.available() > 0) {
+        udpLlmnr.read();
+      }
+      if (received > 0) {
+        answerLlmnr(buffer, static_cast<size_t>(received));
+      }
+    }
   }
 }
 
@@ -1735,7 +1796,7 @@ void SmbServer::Impl::answerNbns(size_t length) {
   output += 2;
   writeBe16(response + output, 0x0001);
   output += 2;
-  writeBe32(response + output, 300);           // TTL пять минут
+  writeBe32(response + output, 15);            // Короткий TTL 15 сек для мгновенной адаптации к смене IP
   output += 4;
   writeBe16(response + output, 6);
   output += 2;
@@ -1749,6 +1810,89 @@ void SmbServer::Impl::answerNbns(size_t length) {
   udp.beginPacket(udp.remoteIP(), udp.remotePort());
   udp.write(response, output);
   udp.endPacket();
+}
+
+void SmbServer::Impl::answerLlmnr(const uint8_t* packet, size_t length) {
+  if (packet == nullptr || length < 12) {
+    return;
+  }
+  const uint16_t flags = readBe16(packet + 2);
+  const uint16_t qdcount = readBe16(packet + 4);
+  // QR bit must be 0 (Query) and opcode 0, qdcount >= 1
+  if ((flags & 0x8000) != 0 || qdcount == 0) {
+    return;
+  }
+
+  size_t offset = 12;
+  char queriedName[64] = {};
+  size_t queriedLength = 0;
+  while (offset < length && packet[offset] != 0) {
+    const uint8_t labelLength = packet[offset++];
+    if (labelLength == 0 || (labelLength & 0xC0) != 0 ||
+        offset + labelLength > length) {
+      return;
+    }
+    if (queriedLength != 0 && queriedLength < sizeof(queriedName) - 1) {
+      queriedName[queriedLength++] = '.';
+    }
+    for (size_t i = 0; i < labelLength; ++i) {
+      if (queriedLength < sizeof(queriedName) - 1) {
+        queriedName[queriedLength++] = static_cast<char>(packet[offset + i]);
+      }
+    }
+    offset += labelLength;
+  }
+  queriedName[queriedLength] = 0;
+  if (offset >= length || packet[offset] != 0) {
+    return;
+  }
+  ++offset;  // skip null byte
+
+  if (offset + 4 > length) {
+    return;
+  }
+  const uint16_t qtype = readBe16(packet + offset);
+  const uint16_t qclass = readBe16(packet + offset + 2);
+  const size_t questionSectionLength = (offset + 4) - 12;
+
+  // Answer IPv4 (A record = 1) or ANY (255)
+  if ((qtype != 1 && qtype != 255) || (qclass != 1 && qclass != 0x8001)) {
+    return;
+  }
+
+  // Match single-label hostname (e.g. "ZX-EVO")
+  if (!asciiEqualNoCase(queriedName, hostname)) {
+    return;
+  }
+
+  // Build Response Packet
+  uint8_t response[128] = {};
+  memcpy(response, packet, 2);               // Transaction ID
+  writeBe16(response + 2, 0x8400);            // Response (QR=1), Authoritative (AA=1)
+  writeBe16(response + 4, 1);                 // 1 Question
+  writeBe16(response + 6, 1);                 // 1 Answer
+  writeBe16(response + 8, 0);                 // 0 Authority RRs
+  writeBe16(response + 10, 0);                // 0 Additional RRs
+
+  // Copy Question Section
+  memcpy(response + 12, packet + 12, questionSectionLength);
+  size_t respLen = 12 + questionSectionLength;
+
+  // Answer Section
+  writeBe16(response + respLen, 0xC00C);      // Pointer to question name at offset 12
+  writeBe16(response + respLen + 2, 0x0001);  // Type: A (IPv4)
+  writeBe16(response + respLen + 4, 0x0001);  // Class: IN
+  writeBe32(response + respLen + 6, 15);      // TTL: 15 seconds
+  writeBe16(response + respLen + 10, 4);      // RDLENGTH: 4 bytes
+  const IPAddress localIp = WiFi.localIP();
+  for (size_t i = 0; i < 4; ++i) {
+    response[respLen + 12 + i] = localIp[i];
+  }
+  respLen += 16;
+
+  udpLlmnr.beginPacket(udpLlmnr.remoteIP(), udpLlmnr.remotePort());
+  udpLlmnr.write(response, respLen);
+  udpLlmnr.endPacket();
 }
 
 bool SmbServer::Impl::requestVfs(VfsOperation operation, const char* path,
@@ -2563,29 +2707,23 @@ bool SmbServer::Impl::fetchReadWindow(Handle& handle) {
 bool SmbServer::Impl::activateRead(int slot, uint32_t offset) {
   Handle& handle = handles[slot];
   if (activeSlot == slot && activeMode == ActiveMode::kRead &&
-      activeLogicalOffset == offset) {
+      activeRandomRead && activeLogicalOffset == offset) {
     return true;
   }
   if (!closeActive(true) || !resetBuffers()) {
     return false;
   }
   VfsResult result;
-  // С нуля читаем последовательно: этому режиму доступно полное окно 16 КиБ и
-  // не нужен SEEK. На любом другом смещении путь один — позиционный FILEX.
-  bool random = (offset != 0);
-  const VfsOperation op =
-      random ? VfsOperation::kOpenRandom : VfsOperation::kOpenRead;
-  if (!requestVfs(op, handle.path, 0, result, kNormalVfsTimeoutMs)) {
-    if (random) {
+  bool random = true;
+  if (!requestVfs(VfsOperation::kOpenRandom, handle.path, 0, result,
+                  kNormalVfsTimeoutMs)) {
+    if (offset == 0 &&
+        requestVfs(VfsOperation::kOpenRead, handle.path, 0, result,
+                   kNormalVfsTimeoutMs)) {
+      random = false;
+    } else {
       return false;
     }
-    // Плагин мог отказать в последовательном открытии; позиционный тракт
-    // умеет то же самое, поэтому пробуем его, но и окно берём уже его.
-    if (!requestVfs(VfsOperation::kOpenRandom, handle.path, 0, result,
-                    kNormalVfsTimeoutMs)) {
-      return false;
-    }
-    random = true;
   }
   activeSlot = slot;
   activeMode = ActiveMode::kRead;
@@ -2870,7 +3008,6 @@ void SmbServer::Impl::pollAsyncRead() {
         }
         return;
       }
-      activeVfsOffset += transferred;
       current.windowLength = 0;
       current.lastProgressMs = millis();
     }
@@ -2938,17 +3075,20 @@ void SmbServer::Impl::pollAsyncRead() {
     if (bridge.requestPending()) {
       return;
     }
-    if (activeVfsOffset >= handle->physicalSize) {
-      failAsyncReads(SMB2_STATUS_IO_DEVICE_ERROR);
+    const uint32_t physicalOffset = current.offset + current.filled;
+    if (physicalOffset >= handle->physicalSize) {
+      current.length = current.filled;
       return;
     }
+    const size_t physicalLimit =
+        activeRandomRead ? VfsClient::kFilexTransferWindowSize
+                         : VfsClient::kTransferWindowSize;
     const size_t wanted = minimum(
         minimum(static_cast<size_t>(current.length - current.filled),
-                static_cast<size_t>(handle->physicalSize - activeVfsOffset)),
-        minimum(VfsClient::kTransferWindowSize,
-                bridge.vfsToNetworkFree()));
+                static_cast<size_t>(handle->physicalSize - physicalOffset)),
+        minimum(physicalLimit, bridge.vfsToNetworkFree()));
     if (wanted == 0 ||
-        !bridge.submitAt(VfsOperation::kReadAt, activeVfsOffset,
+        !bridge.submitAt(VfsOperation::kReadAt, physicalOffset,
                          static_cast<uint32_t>(wanted))) {
       failAsyncReads(SMB2_STATUS_IO_DEVICE_ERROR);
       return;
@@ -3277,9 +3417,8 @@ int SmbServer::Impl::treeConnectHandler(
     return replyStatus(smb2, SMB2_TREE_CONNECT,
                        SMB2_STATUS_INSUFFICIENT_RESOURCES);
   }
-  // Кэширование отключено: физический VFS односессионный и не рассылает
-  // уведомления об изменениях другим SMB-клиентам.
-  reply->share_flags = SMB2_SHAREFLAG_NO_CACHING;
+  // Стандартные флаги общего ресурса Windows (MANUAL_CACHING = 0x00).
+  reply->share_flags = SMB2_SHAREFLAG_MANUAL_CACHING;
   reply->capabilities = 0;
   self->sendOperation("TREE", requestedShare);
   return 0;
@@ -3664,20 +3803,11 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     }
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_END_OF_FILE);
   }
-  const uint32_t physicalWindow = static_cast<uint32_t>(minimum(
-      self->bridge.ringCapacity(), VfsClient::kTransferWindowSize));
-  if (physicalWindow == 0) {
-    return replyStatus(smb2, SMB2_READ,
-                       SMB2_STATUS_INSUFFICIENT_RESOURCES);
-  }
-  // Читаем порциями не более одного физического окна (до 16 КБ).
-  // Windows Explorer штатно поддерживает short reads и после каждого
-  // ответа сразу запрашивает следующий смещением.
   const uint32_t remaining = handle->physicalSize - offset;
   const uint32_t wanted = static_cast<uint32_t>(minimum64(
       request->length,
       minimum64(static_cast<uint64_t>(remaining),
-                static_cast<uint64_t>(physicalWindow))));
+                static_cast<uint64_t>(kSmbAdvertisedIoSize))));
   if (wanted == 0) {
     reply->data = nullptr;
     reply->data_length = 0;
@@ -3685,20 +3815,16 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     return 0;
   }
 
-  uint8_t* data = static_cast<uint8_t*>(
+  uint8_t* cacheData = static_cast<uint8_t*>(
       heap_caps_malloc(wanted, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (data == nullptr) {
-    data = static_cast<uint8_t*>(malloc(wanted));
+  if (cacheData == nullptr) {
+    cacheData = static_cast<uint8_t*>(malloc(wanted));
   }
-  if (data == nullptr) {
-    return replyStatus(smb2, SMB2_READ, SMB2_STATUS_INSUFFICIENT_RESOURCES);
-  }
-
-  // Повторный проход Проводника по тому же файлу отдаём из PSRAM
-  if (self->serveFromFileCache(handle->path, handle->physicalSize, offset,
-                               wanted, data)) {
+  if (cacheData != nullptr &&
+      self->serveFromFileCache(handle->path, handle->physicalSize, offset,
+                               wanted, cacheData)) {
     handle->position = offset + wanted;
-    reply->data = data;  // После отправки буфер освободит libsmb2.
+    reply->data = cacheData;  // После отправки буфер освободит libsmb2.
     reply->data_length = wanted;
     reply->data_remaining = 0;
     diagnosticLogEvent("SMB read-cached bytes=%lu off=%lu path=%s",
@@ -3707,50 +3833,32 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     self->sendOperation("READ", handle->path);
     return 0;
   }
-
-  if (!self->activateRead(slot, offset)) {
-    free(data);
-    return replyStatus(smb2, SMB2_READ, SMB2_STATUS_IO_DEVICE_ERROR);
+  if (cacheData != nullptr) {
+    free(cacheData);
   }
 
-  if (offset == 0) {
-    self->beginFileCache(handle->path, handle->physicalSize);
+  const int index = self->allocateAsyncRead();
+  if (index < 0) {
+    return replyStatus(smb2, SMB2_READ,
+                       SMB2_STATUS_INSUFFICIENT_RESOURCES);
   }
 
-  uint32_t copied = 0;
-  while (copied < wanted) {
-    const size_t ready = self->bridge.vfsToNetworkAvailable();
-    if (ready == 0) {
-      if (!self->fetchReadWindow(*handle)) {
-        free(data);
-        self->closeActive(false);
-        return replyStatus(smb2, SMB2_READ, SMB2_STATUS_IO_DEVICE_ERROR);
-      }
-      continue;
-    }
-    const size_t part = minimum(ready, static_cast<size_t>(wanted - copied));
-    const size_t got = self->bridge.readForNetwork(data + copied, part);
-    if (got == 0) {
-      free(data);
-      self->closeActive(false);
-      return replyStatus(smb2, SMB2_READ, SMB2_STATUS_IO_DEVICE_ERROR);
-    }
-    copied += static_cast<uint32_t>(got);
-    self->activeLogicalOffset += static_cast<uint32_t>(got);
-  }
+  AsyncRead& pending = self->asyncReads[index];
+  pending = {};
+  pending.used = true;
+  pending.context = smb2;
+  pending.messageId = smb2_get_last_request_message_id(smb2);
+  pending.slot = slot;
+  pending.generation = handle->generation;
+  pending.offset = offset;
+  pending.length = wanted;
+  pending.filled = 0;
+  pending.windowLength = 0;
+  pending.lastProgressMs = millis();
+  ++self->asyncReadCount;
 
-  handle->position = offset + copied;
-  self->appendFileCache(offset, data, copied);
-  reply->data = data;  // После отправки этот malloc освободит сама libsmb2.
-  reply->data_length = copied;
-  reply->data_remaining = 0;
-  diagnosticLogEvent("SMB read-ok bytes=%lu left=%lu path=%s",
-                     static_cast<unsigned long>(copied),
-                     static_cast<unsigned long>(handle->physicalSize -
-                                                handle->position),
-                     handle->path);
-  self->sendOperation("READ", handle->path);
-  return 0;
+  self->pollAsyncRead();
+  return 1;
 }
 
 int SmbServer::Impl::writeHandler(smb2_server* serverValue,
@@ -4389,10 +4497,6 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
         if (!handle->directory) {
           memset(&self->streamInfo, 0, sizeof(self->streamInfo));
           self->streamInfo.stream_name = "::$DATA";
-          // Длина имени задаётся В СИМВОЛАХ: smb2_encode_file_stream_info сама
-          // домножает её на два, переводя в байты UTF-16LE. Удвоить здесь —
-          // значит получить учетверение, завышенный fslen и битую структуру,
-          // на которой Проводник молча замирает после успешного READ.
           self->streamInfo.stream_name_length = strlen("::$DATA");
           self->streamInfo.stream_size = size;
           self->streamInfo.stream_allocation_size = allocationSize(size);
@@ -4405,10 +4509,11 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
     }
   } else if (request->info_type == SMB2_0_INFO_FILESYSTEM &&
              request->file_info_class == SMB2_FILE_FS_ATTRIBUTE_INFORMATION) {
-    // Имя и возможности FAT32 постоянны и не требуют чтения геометрии, а тем
-    // более повторного потокового чтения активной FAT после создания файла.
+    // Стандартные атрибуты тома FAT32 в Windows:
+    // FILE_CASE_PRESERVED_NAMES (0x2) | FILE_UNICODE_ON_DISK (0x4) = 0x06.
+    // Флаг FILE_NAMED_STREAMS (0x40) отсутствует.
     memset(&self->attributeInfo, 0, sizeof(self->attributeInfo));
-    self->attributeInfo.filesystem_attributes = 0x00000042;
+    self->attributeInfo.filesystem_attributes = 0x00000006;
     self->attributeInfo.maximum_component_name_length = 255;
     self->attributeInfo.filesystem_name =
         reinterpret_cast<const uint8_t*>("FAT32");
@@ -4503,6 +4608,12 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
       default:
         break;
     }
+  } else if (request->info_type == SMB2_0_INFO_SECURITY) {
+    memset(&self->secDesc, 0, sizeof(self->secDesc));
+    self->secDesc.revision = 1;
+    self->secDesc.control = SMB2_SD_CONTROL_SR | SMB2_SD_CONTROL_DP;
+    output = &self->secDesc;
+    outputLength = sizeof(self->secDesc);
   }
 
   if (output == nullptr || outputLength == 0) {

@@ -303,6 +303,9 @@ smb2_encode_query_info_reply(struct smb2_context *smb2,
                         }
                         break;
                 case SMB2_0_INFO_SECURITY:
+                        created_output_buffer_length =
+                                smb2_encode_security_descriptor(smb2,
+                                        (struct smb2_security_descriptor *)rep->output_buffer, iov);
                         break;
                 case SMB2_0_INFO_QUOTA:
                         break;

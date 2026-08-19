@@ -38,9 +38,7 @@ bool logReady = false;
 uint32_t nextSequence = 1;
 
 bool mountLogFs() {
-  // Раздел уже форматирует ConfigStore. Журнал никогда не форматирует его сам,
-  // чтобы диагностическая ошибка не могла уничтожить сохранённый zifi.ini.
-  return LittleFS.begin(false, kMountPath, 3, kPartitionLabel);
+  return LittleFS.begin(true, kMountPath, 3, kPartitionLabel);
 }
 
 bool recordValid(const uint8_t record[kRecordSize]) {

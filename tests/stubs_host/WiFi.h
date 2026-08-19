@@ -15,6 +15,15 @@ class IPAddress {
 
   uint8_t operator[](int index) const { return octets_[index & 3]; }
 
+  // Arduino-ядро отдаёт адрес одним 32-битным числом; прошивка на это
+  // рассчитывает, сравнивая прежний адрес с текущим.
+  operator uint32_t() const {
+    return static_cast<uint32_t>(octets_[0]) |
+           (static_cast<uint32_t>(octets_[1]) << 8) |
+           (static_cast<uint32_t>(octets_[2]) << 16) |
+           (static_cast<uint32_t>(octets_[3]) << 24);
+  }
+
   String toString() const {
     static char text[16];
     snprintf(text, sizeof(text), "%u.%u.%u.%u", octets_[0], octets_[1],

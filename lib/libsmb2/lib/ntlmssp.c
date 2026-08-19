@@ -1213,17 +1213,26 @@ ntlmssp_authenticate_blob(struct smb2_server *server, struct smb2_context *smb2,
 
         /* call server handler to get pw for this user */
         if (server && server->handlers) {
+                /* ZiFi: при анонимном входе поля пользователя в сообщении
+                 * NTLMSSP просто нет, и auth_data->user остаётся нулевым.
+                 * Подставлять такой указатель в %s нельзя: glibc и MSVC
+                 * печатают "(null)" и живут дальше, а newlib на ESP32
+                 * разыменовывает ноль — плата уходит в панику, и служба SMB
+                 * умирает от одной попытки входа без пароля. Именно так её и
+                 * ронял любой клиент, который сперва стучится анонимно. */
+                const char *user_text = auth_data->user ? auth_data->user
+                                                        : "<anonymous>";
                 if(server->handlers->authorize_user(server, smb2,
                                 auth_data->user,
                                 auth_data->domain,
                                 auth_data->workstation)) {
                         smb2_set_error(smb2, "server can not authorize %s",
-                                auth_data->user);
+                                user_text);
                         return -1;
                 }
                 if (!smb2->password && !server->allow_anonymous) {
                         smb2_set_error(smb2, "server has no passwd for %s",
-                                auth_data->user);
+                                user_text);
                         return -1;
                 }
         }
