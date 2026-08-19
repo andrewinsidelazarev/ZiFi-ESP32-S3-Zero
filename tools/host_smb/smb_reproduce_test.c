@@ -109,6 +109,33 @@ int main(int argc, char **argv) {
     printf("RESULT TEST 3: stat failed\n");
   }
 
+  /* TEST 4: 52KB file copy read check (64KB buffer) */
+  printf("\n--- TEST 4: 52KB file reading via 64KB buffer ---\n");
+  struct smb2fh *fh_52_w = smb2_open(smb2, "evogram.bin", O_CREAT | O_WRONLY);
+  if (fh_52_w) {
+    uint8_t *big = (uint8_t*)malloc(53248);
+    for (int i = 0; i < 53248; ++i) big[i] = (uint8_t)(i & 0xFF);
+    smb2_write(smb2, fh_52_w, big, 53248);
+    smb2_close(smb2, fh_52_w);
+    free(big);
+  }
+  struct smb2fh *fh_52_r = smb2_open(smb2, "evogram.bin", O_RDONLY);
+  int total_read_52 = 0;
+  if (fh_52_r) {
+    uint8_t *buf_64k = (uint8_t*)malloc(65536);
+    int iters = 0;
+    while (iters++ < 10) {
+      int r = smb2_read(smb2, fh_52_r, buf_64k, 65536);
+      printf("  Iteration %d: smb2_read(65536) returned %d\n", iters, r);
+      if (r <= 0) break;
+      total_read_52 += r;
+    }
+    smb2_close(smb2, fh_52_r);
+    free(buf_64k);
+  }
+  printf("  Total read: %d / 53248\n", total_read_52);
+  printf("RESULT TEST 4: %s\n", (total_read_52 == 53248) ? "PASS" : "FAIL");
+
   smb2_disconnect_share(smb2);
   smb2_destroy_context(smb2);
   return 0;

@@ -81,7 +81,6 @@ constexpr uint32_t kSmbAdvertisedIoSize = 64 * 1024;
 // меньше 65536. Windows делает это буквально — Проводник показывает «Параметр
 // задан неверно» и ресурс не открывается вовсе. Соблазн объявить окно поменьше
 // ради отзывчивости возникает регулярно; цена ему — неработающий ресурс.
-constexpr uint32_t kSmbAdvertisedReadSize = 16 * 1024;
 // Файл, прочитанный целиком с начала, оседает в PSRAM: Проводник при
 // копировании читает исходный файл дважды подряд, и второй проход обязан
 // обойтись без единого байта по UART. Кэшируется только то, после чего в
@@ -117,10 +116,16 @@ constexpr size_t kDirectoryBatchCapacity =
     kSmbAdvertisedIoSize / kMinimumDirectoryEntrySize;
 constexpr uint32_t kFileIdMagic = 0x424D535AUL;  // "ZSMB" в little-endian.
 
-constexpr uint32_t kCreateSuperseded = 1;
-constexpr uint32_t kCreateOpened = 2;
-constexpr uint32_t kCreateCreated = 3;
-constexpr uint32_t kCreateOverwritten = 4;
+// Коды CreateAction из MS-SMB2 2.2.14. Нумерация начинается с нуля, и раньше
+// весь набор был сдвинут на единицу: на обычное открытие существующего файла
+// сервер отвечал «FILE_CREATED». Копировщик Проводника считал, что источник
+// только что создан, и замирал на нуле процентов, хотя данные по сети уже
+// приходили. В дампе это видно прямо в ответе CREATE: запрос с
+// CreateDisposition = FILE_OPEN, ответ с CreateAction = 2.
+constexpr uint32_t kCreateSuperseded = 0;
+constexpr uint32_t kCreateOpened = 1;
+constexpr uint32_t kCreateCreated = 2;
+constexpr uint32_t kCreateOverwritten = 3;
 
 size_t minimum(size_t left, size_t right) {
   return left < right ? left : right;
@@ -2501,20 +2506,14 @@ uint64_t SmbServer::Impl::directoryFileId(const char* name) const {
 }
 
 uint64_t SmbServer::Impl::currentFileTime() const {
-  time_t now = time(nullptr);
-  if (now < 1700000000) {
-    now = 1767225600;  // 2026-01-01 00:00:00 UTC
-  }
+  time_t now = 1767225600;  // 2026-01-01 00:00:00 UTC (Static to prevent Notepad++ reload loops)
   constexpr uint64_t kUnixEpochSeconds = 11644473600ULL;
   constexpr uint64_t kTicksPerSecond = 10000000ULL;
   return (static_cast<uint64_t>(now) + kUnixEpochSeconds) * kTicksPerSecond;
 }
 
 smb2_timeval SmbServer::Impl::currentSmb2Time() const {
-  time_t now = time(nullptr);
-  if (now < 1700000000) {
-    now = 1767225600;  // 2026-01-01 00:00:00 UTC
-  }
+  time_t now = 1767225600;  // 2026-01-01 00:00:00 UTC
   smb2_timeval tv = {};
   tv.tv_sec = now;
   tv.tv_usec = 0;
@@ -2910,6 +2909,8 @@ void SmbServer::Impl::pollAsyncRead() {
       const int completedIndex = activeAsyncRead;
       handle->position = current.offset + current.filled;
       activeAsyncRead = -1;
+      appendFileCache(current.offset, asyncIoBuffers[completedIndex],
+                      completedLength);
       if (!queueAsyncReadReply(completedContext, completedMessageId,
                                asyncIoBuffers[completedIndex],
                                completedLength)) {
@@ -3640,7 +3641,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   }
   if (request->offset > UINT32_MAX ||
       request->minimum_count > request->length ||
-      request->minimum_count > kSmbAdvertisedReadSize) {
+      request->minimum_count > kSmbAdvertisedIoSize) {
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_INVALID_PARAMETER);
   }
   if (self->asyncWriteCount != 0) {
@@ -3669,12 +3670,14 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     return replyStatus(smb2, SMB2_READ,
                        SMB2_STATUS_INSUFFICIENT_RESOURCES);
   }
+  // Читаем порциями не более одного физического окна (до 16 КБ).
+  // Windows Explorer штатно поддерживает short reads и после каждого
+  // ответа сразу запрашивает следующий смещением.
+  const uint32_t remaining = handle->physicalSize - offset;
   const uint32_t wanted = static_cast<uint32_t>(minimum64(
-      minimum64(request->length, kSmbAdvertisedReadSize),
-      static_cast<uint64_t>(handle->physicalSize - offset)));
-  if (wanted < request->minimum_count) {
-    return replyStatus(smb2, SMB2_READ, SMB2_STATUS_END_OF_FILE);
-  }
+      request->length,
+      minimum64(static_cast<uint64_t>(remaining),
+                static_cast<uint64_t>(physicalWindow))));
   if (wanted == 0) {
     reply->data = nullptr;
     reply->data_length = 0;
@@ -3688,16 +3691,14 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     data = static_cast<uint8_t*>(malloc(wanted));
   }
   if (data == nullptr) {
-    return replyStatus(smb2, SMB2_READ,
-                       SMB2_STATUS_INSUFFICIENT_RESOURCES);
+    return replyStatus(smb2, SMB2_READ, SMB2_STATUS_INSUFFICIENT_RESOURCES);
   }
 
-  // Повторный проход Проводника по тому же файлу отдаём из PSRAM: на канале
-  // 115200 каждый такой байт стоит столько же, сколько первый.
+  // Повторный проход Проводника по тому же файлу отдаём из PSRAM
   if (self->serveFromFileCache(handle->path, handle->physicalSize, offset,
                                wanted, data)) {
     handle->position = offset + wanted;
-    reply->data = data;  // После отправки этот malloc освободит сама libsmb2.
+    reply->data = data;  // После отправки буфер освободит libsmb2.
     reply->data_length = wanted;
     reply->data_remaining = 0;
     diagnosticLogEvent("SMB read-cached bytes=%lu off=%lu path=%s",
@@ -3711,9 +3712,11 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     free(data);
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_IO_DEVICE_ERROR);
   }
+
   if (offset == 0) {
     self->beginFileCache(handle->path, handle->physicalSize);
   }
+
   uint32_t copied = 0;
   while (copied < wanted) {
     const size_t ready = self->bridge.vfsToNetworkAvailable();
@@ -3735,11 +3738,11 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     copied += static_cast<uint32_t>(got);
     self->activeLogicalOffset += static_cast<uint32_t>(got);
   }
+
   handle->position = offset + copied;
   self->appendFileCache(offset, data, copied);
   reply->data = data;  // После отправки этот malloc освободит сама libsmb2.
   reply->data_length = copied;
-  // Для обычного TCP Channel=NONE, поэтому это не число байтов до EOF.
   reply->data_remaining = 0;
   diagnosticLogEvent("SMB read-ok bytes=%lu left=%lu path=%s",
                      static_cast<unsigned long>(copied),
@@ -4717,15 +4720,29 @@ int SmbServer::Impl::setInfoHandler(smb2_server* serverValue,
 
       const bool replace = data[0] != 0;
       if (replace) {
-        VfsResult delResult = {};
-        self->requestVfs(VfsOperation::kDelete, target, 0, delResult,
-                         kMutateVfsTimeoutMs);
+        self->removePath(target);
       }
       VfsResult result = {};
       char oldPath[kMaxPath + 1];
       snprintf(oldPath, sizeof(oldPath), "%s", handle->path);
-      if (!self->requestMoveRename(handle->path, target, handle->directory,
-                                   replace, result)) {
+
+      char oldParent[kMaxPath + 1] = {};
+      char oldName[kMaxPath + 1] = {};
+      char targetParent[kMaxPath + 1] = {};
+      char targetName[kMaxPath + 1] = {};
+      const bool sameDir = self->splitParent(oldPath, oldParent, oldName) &&
+                           self->splitParent(target, targetParent, targetName) &&
+                           asciiEqualNoCase(oldParent, targetParent);
+
+      bool ok = false;
+      if (sameDir) {
+        ok = self->requestRename(oldPath, targetName, handle->directory, result);
+      }
+      if (!ok) {
+        ok = self->requestMoveRename(oldPath, target, handle->directory,
+                                     replace, result);
+      }
+      if (!ok) {
         return replyStatus(
             smb2, SMB2_SET_INFO,
             result.status != 0 ? smbStatusFromFilex(result.status)

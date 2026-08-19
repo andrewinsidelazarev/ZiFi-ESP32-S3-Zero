@@ -245,7 +245,12 @@ smb2_encode_create_reply(struct smb2_context *smb2,
         smb2_set_uint64(iov, 48, rep->end_of_file);
         smb2_set_uint32(iov, 56, rep->file_attributes);
         memcpy(&iov->buf[64], rep->file_id, SMB2_FD_SIZE);
-        rep->create_context_offset = PAD_TO_64BIT((SMB2_CREATE_REPLY_SIZE & 0xfffe) + SMB2_HEADER_SIZE);
+        /* ZiFi: по MS-SMB2 2.2.14 при отсутствии контекстов CreateContextsOffset
+         * обязан быть нулём. Библиотека проставляла смещение всегда, и в ответе
+         * уходило смещение на конец сообщения при нулевой длине. */
+        rep->create_context_offset = rep->create_context_length
+                ? PAD_TO_64BIT((SMB2_CREATE_REPLY_SIZE & 0xfffe) + SMB2_HEADER_SIZE)
+                : 0;
         smb2_set_uint32(iov, 80, rep->create_context_offset);
         smb2_set_uint32(iov, 84, rep->create_context_length);
 
