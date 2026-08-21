@@ -83,6 +83,11 @@ int main(int argc, char** argv) {
   // Эмулятор Z80 садится на «UART» до старта сервера: первый же STAT должен
   // получить ответ, иначе сервер решит, что плагин молчит.
   zifi::host::Z80Simulator simulator(Serial, root);
+  // Третий аргумент — скорость линии в байтах в секунду. Настоящий канал даёт
+  // около 6000; без этого эмулятор отвечает мгновенно и гонки не возникают.
+  if (argc >= 4) {
+    simulator.setThrottle(static_cast<unsigned>(std::atoi(argv[3])));
+  }
 
   zifi::UartTransport transport(Serial);
   transport.begin();

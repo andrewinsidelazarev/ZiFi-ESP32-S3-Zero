@@ -16,6 +16,8 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -151,6 +153,14 @@ void Z80Simulator::consume(const uint8_t* data, size_t length) {
 }
 
 void Z80Simulator::reply(uint8_t command, const uint8_t* data, size_t length) {
+  // Задержка по объёму кадра: так эмулятор перестаёт быть быстрее железа и
+  // начинает воспроизводить наложение обменов.
+  if (throttle_ != 0) {
+    const unsigned ms = static_cast<unsigned>((length + 6) * 1000ULL / throttle_);
+    if (ms != 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+  }
   std::vector<uint8_t> frame;
   frame.reserve(length + 6);
   frame.push_back(kSync);
@@ -576,8 +586,21 @@ void Z80Simulator::handleMoveRename(const std::vector<uint8_t>& payload) {
   std::error_code code;
   const fs::path srcPath = resolve(src);
   const fs::path dstPath = resolve(dst);
-  if (replace && fs::exists(dstPath, code)) {
+  const bool destinationExists = fs::exists(dstPath, code);
+  if (code) {
+    replyStatus(kVfsMoveRename, kStatusFail);
+    return;
+  }
+  if (destinationExists && !replace) {
+    replyStatus(kVfsMoveRename, kStatusFail);
+    return;
+  }
+  if (destinationExists) {
     fs::remove(dstPath, code);
+    if (code) {
+      replyStatus(kVfsMoveRename, kStatusFail);
+      return;
+    }
   }
   fs::rename(srcPath, dstPath, code);
   replyStatus(kVfsMoveRename, code ? kStatusFail : kStatusOk);

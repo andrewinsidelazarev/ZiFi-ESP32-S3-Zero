@@ -32,10 +32,19 @@ constexpr size_t kCrcOffset = 188;
 constexpr uint16_t kRecordVersion = 1;
 constexpr uint8_t kMagic[4] = {'Z', 'L', 'O', 'G'};
 constexpr size_t kSnapshotCapacity = 72 * 1024;
+// Полный размер постоянного кольца одновременно держим в PSRAM. Иначе один
+// длинный Windows-read с 4-КиБ запросами вытеснял именно события, которые
+// предшествовали сбою, ещё до остановки SMB и безопасного flush во flash.
+constexpr size_t kPsramPendingCount = kRecordCount;
+constexpr size_t kInternalPendingCount = 16;
 
 SemaphoreHandle_t logMutex = nullptr;
 bool logReady = false;
 uint32_t nextSequence = 1;
+uint8_t* pendingRecords = nullptr;
+size_t pendingCapacity = 0;
+size_t pendingHead = 0;
+size_t pendingCount = 0;
 
 bool mountLogFs() {
   return LittleFS.begin(true, kMountPath, 3, kPartitionLabel);
@@ -105,6 +114,88 @@ void giveLogMutex() {
   }
 }
 
+uint8_t* pendingRecord(size_t logicalIndex) {
+  if (pendingRecords == nullptr || pendingCapacity == 0 ||
+      logicalIndex >= pendingCount) {
+    return nullptr;
+  }
+  const size_t physicalIndex = (pendingHead + logicalIndex) % pendingCapacity;
+  return pendingRecords + physicalIndex * kRecordSize;
+}
+
+bool allocatePendingRecords() {
+  if (pendingRecords != nullptr && pendingCapacity != 0) {
+    return true;
+  }
+  pendingCapacity = kPsramPendingCount;
+  pendingRecords = static_cast<uint8_t*>(heap_caps_malloc(
+      pendingCapacity * kRecordSize,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (pendingRecords == nullptr) {
+    pendingCapacity = kInternalPendingCount;
+    pendingRecords = static_cast<uint8_t*>(heap_caps_malloc(
+        pendingCapacity * kRecordSize,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  if (pendingRecords == nullptr) {
+    pendingCapacity = 0;
+    return false;
+  }
+  pendingHead = 0;
+  pendingCount = 0;
+  return true;
+}
+
+void enqueueRecord(const uint8_t record[kRecordSize]) {
+  if (pendingRecords == nullptr || pendingCapacity == 0) {
+    return;
+  }
+  if (pendingCount == pendingCapacity) {
+    pendingHead = (pendingHead + 1) % pendingCapacity;
+    --pendingCount;
+  }
+  const size_t tail = (pendingHead + pendingCount) % pendingCapacity;
+  memcpy(pendingRecords + tail * kRecordSize, record, kRecordSize);
+  ++pendingCount;
+}
+
+// logMutex должен быть захвачен вызывающим. До полного успешного прохода RAM
+// не очищаем: короткая запись или ошибка mount безопасно повторятся позже.
+bool flushPendingLocked() {
+  if (pendingCount == 0) {
+    return true;
+  }
+  if (!mountLogFs()) {
+    return false;
+  }
+
+  bool ok = false;
+  File file = LittleFS.open(kLogPath, "r+");
+  if (file) {
+    ok = true;
+    for (size_t index = 0; index < pendingCount; ++index) {
+      const uint8_t* record = pendingRecord(index);
+      const uint32_t sequence = readLe32(record + 8);
+      const size_t slot = (sequence - 1) % kRecordCount;
+      if (!file.seek(slot * kRecordSize) ||
+          file.write(record, kRecordSize) != kRecordSize) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      file.flush();
+    }
+    file.close();
+  }
+  LittleFS.end();
+  if (ok) {
+    pendingHead = 0;
+    pendingCount = 0;
+  }
+  return ok;
+}
+
 }  // namespace
 
 bool diagnosticLogBegin() {
@@ -115,8 +206,9 @@ bool diagnosticLogBegin() {
     return false;
   }
 
-  const bool mounted = mountLogFs();
-  bool ok = mounted;
+  bool ok = allocatePendingRecords();
+  const bool mounted = ok && mountLogFs();
+  ok = ok && mounted;
   if (ok) {
     ok = ensureRingFile();
   }
@@ -139,8 +231,7 @@ bool diagnosticLogBegin() {
 }
 
 void diagnosticLogEvent(const char* format, ...) {
-  if (!logReady || format == nullptr ||
-      !takeLogMutex(pdMS_TO_TICKS(250))) {
+  if (!logReady || format == nullptr) {
     return;
   }
 
@@ -152,6 +243,12 @@ void diagnosticLogEvent(const char* format, ...) {
   const size_t textLength = formatted <= 0
                                 ? 0
                                 : strnlen(text, kTextCapacity);
+
+  // Форматирование не держит mutex и не задерживает другой поток, который
+  // может как раз пакетно выгружать накопившиеся записи.
+  if (!takeLogMutex(0)) {
+    return;
+  }
 
   uint8_t record[kRecordSize] = {};
   memcpy(record, kMagic, sizeof(kMagic));
@@ -170,29 +267,32 @@ void diagnosticLogEvent(const char* format, ...) {
   memcpy(record + kTextOffset, text, textLength);
   writeLe32(record + kCrcOffset, crc32IsoHdlc(record, kCrcOffset));
 
-  if (mountLogFs()) {
-    File file = LittleFS.open(kLogPath, "r+");
-    if (file) {
-      const size_t slot = (nextSequence - 1) % kRecordCount;
-      if (file.seek(slot * kRecordSize) &&
-          file.write(record, sizeof(record)) == sizeof(record)) {
-        file.flush();
-        ++nextSequence;
-        if (nextSequence == 0) {
-          nextSequence = 1;
-        }
-      }
-      file.close();
-    }
-    LittleFS.end();
+  enqueueRecord(record);
+  ++nextSequence;
+  if (nextSequence == 0) {
+    nextSequence = 1;
   }
   giveLogMutex();
+}
+
+bool diagnosticLogFlush() {
+  if (!logReady || !takeLogMutex(0)) {
+    return false;
+  }
+  const bool ok = flushPendingLocked();
+  giveLogMutex();
+  return ok;
 }
 
 bool diagnosticLogSnapshot(DiagnosticLogSnapshot& snapshot) {
   snapshot.data = nullptr;
   snapshot.length = 0;
   if (!logReady || !takeLogMutex(pdMS_TO_TICKS(1000))) {
+    return false;
+  }
+
+  if (!flushPendingLocked()) {
+    giveLogMutex();
     return false;
   }
 

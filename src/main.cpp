@@ -379,6 +379,7 @@ void Application::networkTaskLoop() {
   networkReady_ = true;
 
   uint8_t token = 0;
+  uint32_t lastDiagnosticFlushMs = 0;
   for (;;) {
     if (xQueueReceive(requestQueue_, &token, pdMS_TO_TICKS(2)) == pdTRUE) {
       processNetworkRequest();
@@ -392,6 +393,19 @@ void Application::networkTaskLoop() {
     } else if (!smb_.running()) {
       ftp_.poll();
     }
+#if ZIFI_DIAGNOSTIC_LOG
+    // LittleFS блокирует flash cache. Сохранять журнал можно только когда ни
+    // один сетевой файловый сервер и UART/VFS не способны принять работу.
+    const uint32_t now = millis();
+    if (!smb_.running() && !ftp_.running() && !ota_.running() &&
+        !vfsBridge_.requestPending() &&
+        vfsBridge_.networkToVfsAvailable() == 0 &&
+        vfsBridge_.vfsToNetworkAvailable() == 0 &&
+        static_cast<uint32_t>(now - lastDiagnosticFlushMs) >= 1000) {
+      diagnosticLogFlush();
+      lastDiagnosticFlushMs = now;
+    }
+#endif
   }
 }
 
@@ -651,6 +665,11 @@ void Application::processUpdateStart() {
     setNetworkError("ota:smb stopping");
     return;
   }
+#if ZIFI_DIAGNOSTIC_LOG
+  // Здесь SMB/FTP уже остановлены, поэтому можно сохранить весь журнал
+  // завершившегося прогона до того, как OTA начнёт писать другой flash-раздел.
+  diagnosticLogFlush();
+#endif
   char error[64] = {};
   const bool started = ota_.running() ||
       ota_.start(OtaServer::kDefaultPort, error, sizeof(error));

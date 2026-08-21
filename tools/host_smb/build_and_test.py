@@ -31,6 +31,9 @@ def main():
 
     bat_content = f'''@echo off
 call "{vcvars}" >nul
+rem Keep debug records in OBJ files; concurrent compilers must not share a PDB.
+set "CL_MPCount=1"
+set "_CL_=/Z7 /MP1 /FS %_CL_%"
 echo Compiling host_smb.exe...
 {cmd_host}
 if errorlevel 1 exit /b 1
@@ -56,15 +59,35 @@ echo Compilation SUCCESS!
 
     port = 14445
     print(f"Starting host_smb.exe on port {port} pointing to {test_share}...")
-    server_proc = subprocess.Popen(['.test-build/host_smb/host_smb.exe', str(test_share), str(port)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    time.sleep(1.5)
+    # Не оставляем stdout сервера в непрочитанном PIPE: подробный SMB-журнал
+    # заполняет системный буфер и блокирует сервер посреди длинной регрессии.
+    server_log_path = out / 'host_smb.log'
+    test_proc = None
+    with server_log_path.open('w', encoding='utf-8') as server_log:
+        server_proc = subprocess.Popen(
+            ['.test-build/host_smb/host_smb.exe', str(test_share), str(port)],
+            stdout=server_log, stderr=subprocess.STDOUT, text=True)
+        try:
+            time.sleep(1.5)
+            print("Running smb_reproduce_test.exe...")
+            test_proc = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{port}', 'SD'],
+                capture_output=True, text=True)
+            print("TEST OUTPUT:\n" + test_proc.stdout)
+        finally:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+                server_proc.wait(timeout=2)
 
-    print("Running smb_reproduce_test.exe...")
-    test_proc = subprocess.run(['.test-build/host_smb/smb_reproduce_test.exe', f'127.0.0.1:{port}', 'SD'], capture_output=True, text=True)
-    print("TEST OUTPUT:\n" + test_proc.stdout)
-
-    server_proc.terminate()
-    server_proc.wait(timeout=2)
+    if test_proc is None or test_proc.returncode != 0:
+        server_tail = server_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("SERVER LOG TAIL:\n" + server_tail)
+        raise RuntimeError("SMB regression failed")
     print("Test finished!")
 
 if __name__ == '__main__':

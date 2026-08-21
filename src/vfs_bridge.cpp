@@ -112,6 +112,8 @@ bool VfsBridge::submit(VfsOperation operation, const char* path,
   if (xQueueSend(requestQueue_, &token, 0) != pdTRUE) {
     return false;
   }
+  pendingOperation_ = exchange_->request.operation;
+  pendingSinceMs_ = millis();
   requestPending_ = true;
   return true;
 }
@@ -137,6 +139,8 @@ bool VfsBridge::submitAt(VfsOperation operation, uint32_t offset,
   if (xQueueSend(requestQueue_, &token, 0) != pdTRUE) {
     return false;
   }
+  pendingOperation_ = exchange_->request.operation;
+  pendingSinceMs_ = millis();
   requestPending_ = true;
   return true;
 }
@@ -163,6 +167,8 @@ bool VfsBridge::submitRename(const char* oldPath, const char* newName,
   if (xQueueSend(requestQueue_, &token, 0) != pdTRUE) {
     return false;
   }
+  pendingOperation_ = exchange_->request.operation;
+  pendingSinceMs_ = millis();
   requestPending_ = true;
   return true;
 }
@@ -190,6 +196,8 @@ bool VfsBridge::submitMoveRename(const char* oldPath, const char* newPath,
   if (xQueueSend(requestQueue_, &token, 0) != pdTRUE) {
     return false;
   }
+  pendingOperation_ = exchange_->request.operation;
+  pendingSinceMs_ = millis();
   requestPending_ = true;
   return true;
 }
@@ -209,8 +217,27 @@ bool VfsBridge::submitMetadata(const VfsMetadata& metadata) {
   if (xQueueSend(requestQueue_, &token, 0) != pdTRUE) {
     return false;
   }
+  pendingOperation_ = exchange_->request.operation;
+  pendingSinceMs_ = millis();
   requestPending_ = true;
   return true;
+}
+
+bool VfsBridge::reclaim(uint32_t timeoutMs) {
+  if (!ready_ || !requestPending_) {
+    return true;
+  }
+  VfsResult discarded;
+  const uint32_t started = millis();
+  for (;;) {
+    if (takeResult(discarded)) {
+      return true;
+    }
+    if (static_cast<uint32_t>(millis() - started) >= timeoutMs) {
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
 }
 
 bool VfsBridge::takeResult(VfsResult& result) {

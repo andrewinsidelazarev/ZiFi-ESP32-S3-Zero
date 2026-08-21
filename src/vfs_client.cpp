@@ -248,9 +248,12 @@ bool VfsClient::seekFile(uint32_t offset) {
     lastStatus_ = 0x15;
     return false;
   }
-  if (randomOffsetValid_ && randomOffset_ == offset) {
-    return true;
-  }
+  // Пропуск SEEK был возможен, только пока обе стороны одинаково понимали, кто
+  // двигает позицию файла: ESP прибавляла прочитанное к своему счётчику, а
+  // плагин — к своему, вызовом Vfs_AddRandomCount. Стоит одной половине
+  // перестать это делать, и позиции расходятся молча: ESP считает, что SEEK не
+  // нужен, а Z80 читает с прежнего места. Экономия составляла десяток байт на
+  // окно, цена ошибки — тихо неверные данные, поэтому позицию задаём всегда.
   uint8_t payload[4];
   writeLe32(payload, offset);
   PacketView response;

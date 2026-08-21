@@ -18,6 +18,12 @@ class Z80Simulator {
  public:
   Z80Simulator(HardwareSerial& serial, const std::string& root);
 
+  // Скорость линии, байт в секунду. Ноль — отвечать мгновенно, как раньше.
+  // Настоящий канал Z80 <-> ESP держит около 6000 байт/с, и гонки, которые
+  // на нём воспроизводятся, без задержки не возникают вовсе.
+  void setThrottle(unsigned bytesPerSecond) { throttle_ = bytesPerSecond; }
+
+
  private:
   struct Entry {
     std::string name;
@@ -84,6 +90,7 @@ class Z80Simulator {
   uint8_t windowSeq_ = 0;
   // Сколько окон чтения эмулятор реально отдал: повторный проход по файлу,
   // обслуженный кэшем прошивки, не должен увеличивать этот счётчик.
+  unsigned throttle_ = 0;
   unsigned long long windowsServed_ = 0;
   unsigned long long bytesServed_ = 0;
 

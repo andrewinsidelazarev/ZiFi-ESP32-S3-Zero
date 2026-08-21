@@ -840,20 +840,12 @@ Vfs_ReadWindow:
         ld hl,(VfsReadWanted)
         call Vfs_LengthFilex
         jp c,Vfs_ReadWindowFail
-        call Vfs_FilexReadPage
-        cp FILEX_STATUS_OK
-        jr z,.random_status_ok
-        cp FILEX_STATUS_EOF
-        jr z,.random_status_ok
-        ; Быстрый вызов временно отдаёт #8000 второй странице плагина. Если
-        ; конкретная конфигурация WC не сохраняет такой вызов, повторяем
-        ; безопасное чтение через постоянный 512-байтный буфер code-page.
-        ; READ_AT идемпотентен: резервный путь не меняет файл.
         call Vfs_FilexReadPageFallback
         cp FILEX_STATUS_OK
         jr z,.random_status_ok
         cp FILEX_STATUS_EOF
-        jr nz,.random_failed
+        jr z,.random_status_ok
+        jr .random_failed
 .random_status_ok:
         ld hl,(VfsFilexCount+2)
         ld a,h
@@ -874,7 +866,6 @@ Vfs_ReadWindow:
         or l
         jr z,.random_eof
         ld (VfsReadCount),hl
-        call Vfs_AddRandomCount
         ld hl,VFS_FILEX_DATA_C
         jp Vfs_ReadWindowBufferReady
 .random_eof:
@@ -1040,8 +1031,10 @@ Vfs_ReadWindowBufferReady:
         jr z,.advance_fat
         ld hl,VfsReadSeq
         jr .advance_sequence
+
 .advance_fat:
         ld hl,VfsFatSeq
+
 .advance_sequence:
         inc (hl)
         scf

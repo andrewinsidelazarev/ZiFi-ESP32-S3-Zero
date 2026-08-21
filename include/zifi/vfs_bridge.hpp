@@ -78,6 +78,11 @@ class VfsBridge {
                         bool directory, bool replace);
   bool submitMetadata(const VfsMetadata& metadata);
   bool takeResult(VfsResult& result);
+  // Дождаться результата брошенного обмена и забрать его жетон. Пока core 1
+  // не вернул результат, общий Exchange трогать нельзя: принудительный сброс
+  // флага позволил бы следующему запросу перезаписать ещё используемую память.
+  // Возвращает false, оставляя мост занятым и пригодным для следующей попытки.
+  bool reclaim(uint32_t timeoutMs);
   bool requestPending() const { return requestPending_; }
 
   // Сеть -> VFS (STOR/PUT) и VFS -> сеть (RETR/GET).
@@ -93,6 +98,14 @@ class VfsBridge {
 
   bool buffersInPsram() const { return buffersInPsram_; }
   size_t ringCapacity() const { return networkToVfs_.capacity(); }
+
+  // Кто именно держит мост и сколько уже держит. Нужно для одной-единственной
+  // строки журнала: когда очередной запрос получает отказ «bridge-busy»,
+  // виновник должен назваться сам, а не вычисляться перебором версий.
+  uint8_t pendingOperation() const {
+    return static_cast<uint8_t>(pendingOperation_);
+  }
+  uint32_t pendingSinceMs() const { return pendingSinceMs_; }
   size_t networkToVfsHighWater() const {
     return networkToVfs_.highWaterMark();
   }
@@ -136,6 +149,9 @@ class VfsBridge {
   uint8_t* vfsToNetworkStorage_;
   bool ready_;
   bool requestPending_;
+  // Операция незавершённого обмена и время его постановки.
+  VfsOperation pendingOperation_ = VfsOperation::kStat;
+  uint32_t pendingSinceMs_ = 0;
   bool buffersInPsram_;
   bool writeSession_;
 };

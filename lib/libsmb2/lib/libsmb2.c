@@ -2390,9 +2390,9 @@ new_name_cb_1(struct smb2_context *smb2, int status,
 
 static int
 smb2_new_name_async(struct smb2_context *smb2, const char *oldpath,
-                    const char *newpath, uint8_t file_info_class,
-                    uint32_t desired_access,
-                    smb2_command_cb cb, void *cb_data)
+                     const char *newpath, uint8_t file_info_class,
+                     uint32_t desired_access, int replace_if_exist,
+                     smb2_command_cb cb, void *cb_data)
 {
         struct new_name_cb_data *new_name_data;
         struct smb2_create_request cr_req;
@@ -2452,11 +2452,11 @@ smb2_new_name_async(struct smb2_context *smb2, const char *oldpath,
         si_req.additional_information = 0;
         memcpy(si_req.file_id, compound_file_id, SMB2_FD_SIZE);
         if (file_info_class == SMB2_FILE_LINK_INFORMATION) {
-                ln_info.replace_if_exist = 0;
+                ln_info.replace_if_exist = replace_if_exist != 0;
                 ln_info.file_name = new_name_data->newpath;
                 si_req.input_data = &ln_info;
         } else {
-                rn_info.replace_if_exist = 0;
+                rn_info.replace_if_exist = replace_if_exist != 0;
                 rn_info.file_name = new_name_data->newpath;
                 si_req.input_data = &rn_info;
         }
@@ -2500,6 +2500,21 @@ smb2_rename_async(struct smb2_context *smb2, const char *oldpath,
                                    SMB2_GENERIC_READ |
                                    SMB2_FILE_READ_ATTRIBUTES |
                                    SMB2_DELETE,
+                                   0,
+                                   cb, cb_data);
+}
+
+int
+smb2_rename_replace_async(struct smb2_context *smb2, const char *oldpath,
+                          const char *newpath, int replace_if_exist,
+                          smb2_command_cb cb, void *cb_data)
+{
+        return smb2_new_name_async(smb2, oldpath, newpath,
+                                   SMB2_FILE_RENAME_INFORMATION,
+                                   SMB2_GENERIC_READ |
+                                   SMB2_FILE_READ_ATTRIBUTES |
+                                   SMB2_DELETE,
+                                   replace_if_exist,
                                    cb, cb_data);
 }
 
@@ -2512,6 +2527,7 @@ smb2_link_async(struct smb2_context *smb2, const char *oldpath,
         return smb2_new_name_async(smb2, oldpath, newpath,
                                    SMB2_FILE_LINK_INFORMATION,
                                    SMB2_FILE_READ_ATTRIBUTES,
+                                   0,
                                    cb, cb_data);
 }
 
@@ -4574,7 +4590,12 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                 return err;
         }
         server->listener_ready = 1;
-        server->session_counter = 0x1234;
+        /* Preserve an application-provided per-instance namespace.  The
+         * deterministic legacy fallback is retained for other embedders that
+         * do not initialize this field. */
+        if (!server->session_counter) {
+                server->session_counter = 0x1234;
+        }
 
         do {
                 /* ZiFi: dead clients must release the single VFS owner even

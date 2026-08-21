@@ -1179,10 +1179,25 @@ int smb2_rename_async(struct smb2_context *smb2, const char *oldpath,
                       const char *newpath, smb2_command_cb cb, void *cb_data);
 
 /*
+ * Async rename with an explicit ReplaceIfExists value.
+ *
+ * This is the SMB-native variant needed by applications such as editors that
+ * atomically replace a temporary file.  smb2_rename_async() retains the POSIX
+ * library's historical no-replace behavior.
+ */
+int smb2_rename_replace_async(struct smb2_context *smb2, const char *oldpath,
+                              const char *newpath, int replace_if_exist,
+                              smb2_command_cb cb, void *cb_data);
+
+/*
  * Sync rename()
  */
 int smb2_rename(struct smb2_context *smb2, const char *oldpath,
                 const char *newpath);
+
+/* Sync rename with an explicit ReplaceIfExists value. */
+int smb2_rename_replace(struct smb2_context *smb2, const char *oldpath,
+                        const char *newpath, int replace_if_exist);
 
 /*
  * Async link()
@@ -1502,6 +1517,7 @@ struct smb2_server {
         volatile int stop_requested;
         volatile int listener_ready;
         uint16_t port;
+        /* Optional nonzero seed supplied by the server application. */
         uint64_t session_counter;
         struct smb2_server_request_handlers *handlers;
         uint32_t max_transact_size;
