@@ -120,6 +120,34 @@ constexpr size_t kMinimumDirectoryEntrySize = 72;
 constexpr size_t kDirectoryBatchCapacity =
     kSmbAdvertisedIoSize / kMinimumDirectoryEntrySize;
 constexpr uint32_t kFileIdMagic = 0x424D535AUL;  // "ZSMB" в little-endian.
+constexpr uint64_t kDirectoryFileIdOffset = 1469598103934665603ULL;
+constexpr uint64_t kDirectoryFileIdPrime = 1099511628211ULL;
+constexpr size_t kCreateContextHeaderSize = 16;
+constexpr size_t kCreateContextNameOffset = 16;
+constexpr size_t kCreateContextDataOffset = 24;
+constexpr size_t kMaxCreateContextReplySize = 32 + 56;
+
+struct RequestedCreateContexts {
+  bool maximalAccess = false;
+  bool maximalAccessHasTimestamp = false;
+  bool queryOnDiskId = false;
+  bool durableReconnect = false;
+  uint64_t maximalAccessTimestamp = 0;
+};
+
+uint64_t appendDirectoryFileId(uint64_t hash, const char* text) {
+  while (text != nullptr && *text != 0) {
+    uint8_t value = static_cast<uint8_t>(*text++);
+    // FAT и сам SMB-сервер сравнивают имена без учёта регистра ASCII. FileId
+    // тоже должен описывать объект, а не конкретное написание пути в запросе.
+    if (value >= 'A' && value <= 'Z') {
+      value = static_cast<uint8_t>(value + ('a' - 'A'));
+    }
+    hash ^= value;
+    hash *= kDirectoryFileIdPrime;
+  }
+  return hash;
+}
 
 // Windows хранит SMB3 ServerList по строке, переданной приложением как имя
 // сервера. При повторном NEGOTIATE того же имени несовпавший ServerGuid обязан
@@ -317,6 +345,107 @@ void writeBe32(uint8_t* data, uint32_t value) {
 uint64_t readLe64Local(const uint8_t* data) {
   return static_cast<uint64_t>(readLe32(data)) |
          (static_cast<uint64_t>(readLe32(data + 4)) << 32);
+}
+
+void writeLe64Local(uint8_t* data, uint64_t value) {
+  writeLe32(data, static_cast<uint32_t>(value));
+  writeLe32(data + 4, static_cast<uint32_t>(value >> 32));
+}
+
+bool createContextNameEquals(const uint8_t* context, size_t contextLength,
+                             uint16_t nameOffset, uint16_t nameLength,
+                             const char expected[5]) {
+  return nameLength == 4 && nameOffset <= contextLength &&
+         static_cast<size_t>(nameLength) <= contextLength - nameOffset &&
+         memcmp(context + nameOffset, expected, 4) == 0;
+}
+
+bool parseRequestedCreateContexts(const smb2_create_request& request,
+                                  RequestedCreateContexts& parsed) {
+  parsed = {};
+  if (request.create_context_length == 0) {
+    return true;
+  }
+  if (request.create_context == nullptr) {
+    return false;
+  }
+
+  size_t offset = 0;
+  const size_t totalLength = request.create_context_length;
+  while (offset < totalLength) {
+    const size_t remaining = totalLength - offset;
+    if (remaining < kCreateContextHeaderSize) {
+      return false;
+    }
+    const uint8_t* context = request.create_context + offset;
+    const uint32_t next = readLe32(context);
+    const uint16_t nameOffset = readLe16(context + 4);
+    const uint16_t nameLength = readLe16(context + 6);
+    const uint16_t dataOffset = readLe16(context + 10);
+    const uint32_t dataLength = readLe32(context + 12);
+    const size_t contextLength = next == 0 ? remaining : next;
+
+    if (contextLength < kCreateContextHeaderSize || contextLength > remaining ||
+        nameOffset < kCreateContextHeaderSize || (nameOffset & 7U) != 0 ||
+        nameOffset > contextLength ||
+        static_cast<size_t>(nameLength) > contextLength - nameOffset ||
+        (dataLength != 0 &&
+         (dataOffset < kCreateContextHeaderSize || (dataOffset & 7U) != 0 ||
+          dataOffset > contextLength ||
+          static_cast<size_t>(dataLength) > contextLength - dataOffset)) ||
+        (next != 0 && (next & 7U) != 0)) {
+      return false;
+    }
+
+    if (createContextNameEquals(context, contextLength, nameOffset, nameLength,
+                                "MxAc")) {
+      if (dataLength != 0 && dataLength != sizeof(uint64_t)) {
+        return false;
+      }
+      parsed.maximalAccess = true;
+      parsed.maximalAccessHasTimestamp = dataLength == sizeof(uint64_t);
+      if (parsed.maximalAccessHasTimestamp) {
+        parsed.maximalAccessTimestamp = readLe64Local(context + dataOffset);
+      }
+    } else if (createContextNameEquals(context, contextLength, nameOffset,
+                                       nameLength, "QFid")) {
+      if (dataLength != 0) {
+        return false;
+      }
+      parsed.queryOnDiskId = true;
+    } else if (createContextNameEquals(context, contextLength, nameOffset,
+                                       nameLength, "DHnC") ||
+               createContextNameEquals(context, contextLength, nameOffset,
+                                       nameLength, "DH2C")) {
+      parsed.durableReconnect = true;
+    }
+
+    if (next == 0) {
+      break;
+    }
+    offset += next;
+  }
+  return true;
+}
+
+size_t appendCreateResponseContext(uint8_t* output, size_t capacity,
+                                   size_t offset, const char name[5],
+                                   const uint8_t* data, size_t dataLength) {
+  const size_t contextLength = padTo8(kCreateContextDataOffset + dataLength);
+  if (offset > capacity || contextLength > capacity - offset) {
+    return 0;
+  }
+  uint8_t* context = output + offset;
+  memset(context, 0, contextLength);
+  writeLe16(context + 4, kCreateContextNameOffset);
+  writeLe16(context + 6, 4);
+  writeLe16(context + 10, kCreateContextDataOffset);
+  writeLe32(context + 12, static_cast<uint32_t>(dataLength));
+  memcpy(context + kCreateContextNameOffset, name, 4);
+  if (dataLength != 0) {
+    memcpy(context + kCreateContextDataOffset, data, dataLength);
+  }
+  return contextLength;
 }
 
 bool isCompoundFileId(const uint8_t id[SMB2_FD_SIZE]) {
@@ -581,6 +710,7 @@ struct SmbServer::Impl {
         deviceInfo{},
         controlInfo{},
         sectorInfo{},
+        createContextReply{},
         scratch{},
         nbnsPacket{} {
     snprintf(share, sizeof(share), "SD");
@@ -709,6 +839,7 @@ struct SmbServer::Impl {
   smb2_file_fs_device_info deviceInfo;
   smb2_file_fs_control_info controlInfo;
   smb2_file_fs_sector_size_info sectorInfo;
+  uint8_t createContextReply[kMaxCreateContextReplySize];
 
   uint8_t scratch[512];
   uint8_t nbnsPacket[576];
@@ -833,12 +964,18 @@ struct SmbServer::Impl {
   const Tree* findTree(uint32_t id) const;
   void releaseTree(uint32_t id);
   uint32_t visibleSize(const Handle& handle) const;
-  uint64_t directoryFileId(const char* name) const;
+  uint64_t directoryFileId(const char* path) const;
+  uint64_t directoryChildFileId(const char* parentPath,
+                                const char* name) const;
+  void fillCreateContextReply(const RequestedCreateContexts& requested,
+                              uint64_t diskFileId, uint64_t volumeId,
+                              uint64_t changeTime, uint32_t maximalAccess,
+                              smb2_create_reply& reply);
   uint64_t currentFileTime() const;
   smb2_timeval currentSmb2Time() const;
   void fillDirectoryInfo(smb2_fileidbothdirectoryinformation& info,
                          uint32_t index, bool directory, uint32_t size,
-                         const char* name) const;
+                         const char* parentPath, const char* name) const;
   int queryCachedDirectory(smb2_context* smb2, Handle& handle,
                            smb2_query_directory_request* request,
                            smb2_query_directory_reply* reply);
@@ -2906,13 +3043,74 @@ uint32_t SmbServer::Impl::visibleSize(const Handle& handle) const {
              : handle.physicalSize;
 }
 
-uint64_t SmbServer::Impl::directoryFileId(const char* name) const {
-  uint64_t hash = 1469598103934665603ULL;
-  while (name != nullptr && *name != 0) {
-    hash ^= static_cast<uint8_t>(*name++);
-    hash *= 1099511628211ULL;
+uint64_t SmbServer::Impl::directoryFileId(const char* path) const {
+  return appendDirectoryFileId(kDirectoryFileIdOffset, path);
+}
+
+uint64_t SmbServer::Impl::directoryChildFileId(const char* parentPath,
+                                               const char* name) const {
+  const char* parent = parentPath == nullptr || parentPath[0] == 0
+                           ? "/"
+                           : parentPath;
+  uint64_t hash = appendDirectoryFileId(kDirectoryFileIdOffset, parent);
+  const size_t parentLength = strlen(parent);
+  if (parentLength == 0 || parent[parentLength - 1] != '/') {
+    hash = appendDirectoryFileId(hash, "/");
   }
-  return hash;
+  return appendDirectoryFileId(hash, name);
+}
+
+void SmbServer::Impl::fillCreateContextReply(
+    const RequestedCreateContexts& requested, uint64_t diskFileId,
+    uint64_t volumeId, uint64_t changeTime, uint32_t maximalAccess,
+    smb2_create_reply& reply) {
+  memset(createContextReply, 0, sizeof(createContextReply));
+  size_t used = 0;
+  size_t previous = 0;
+  bool havePrevious = false;
+
+  if (requested.maximalAccess) {
+    uint8_t data[8] = {};
+    if (requested.maximalAccessHasTimestamp &&
+        requested.maximalAccessTimestamp == changeTime) {
+      writeLe32(data, SMB2_STATUS_NONE_MAPPED);
+    } else {
+      writeLe32(data, SMB2_STATUS_SUCCESS);
+      writeLe32(data + 4, maximalAccess);
+    }
+    const size_t length = appendCreateResponseContext(
+        createContextReply, sizeof(createContextReply), used, "MxAc", data,
+        sizeof(data));
+    if (length != 0) {
+      previous = used;
+      havePrevious = true;
+      used += length;
+    }
+  }
+
+  // По MS-SMB2 3.3.5.9.9 QFid не возвращается для durable reconnect. Сам
+  // сервер durable handles не выдаёт, но входной список всё равно разбирается
+  // буквально, чтобы не создать противоречивый ответ на reconnect-запрос.
+  if (requested.queryOnDiskId && !requested.durableReconnect) {
+    uint8_t data[32] = {};
+    writeLe64Local(data, diskFileId);
+    writeLe64Local(data + 8, volumeId);
+    const size_t length = appendCreateResponseContext(
+        createContextReply, sizeof(createContextReply), used, "QFid", data,
+        sizeof(data));
+    if (length != 0) {
+      if (havePrevious) {
+        writeLe32(createContextReply + previous,
+                  static_cast<uint32_t>(used - previous));
+      }
+      previous = used;
+      havePrevious = true;
+      used += length;
+    }
+  }
+
+  reply.create_context = used == 0 ? nullptr : createContextReply;
+  reply.create_context_length = static_cast<uint32_t>(used);
 }
 
 uint64_t SmbServer::Impl::currentFileTime() const {
@@ -2932,7 +3130,8 @@ smb2_timeval SmbServer::Impl::currentSmb2Time() const {
 
 void SmbServer::Impl::fillDirectoryInfo(
     smb2_fileidbothdirectoryinformation& info, uint32_t index,
-    bool directory, uint32_t size, const char* name) const {
+    bool directory, uint32_t size, const char* parentPath,
+    const char* name) const {
   memset(&info, 0, sizeof(info));
   const smb2_timeval fileTime = currentSmb2Time();
   info.creation_time = fileTime;
@@ -2944,7 +3143,10 @@ void SmbServer::Impl::fillDirectoryInfo(
   info.allocation_size = allocationSize(size);
   info.file_attributes = directory ? SMB2_FILE_ATTRIBUTE_DIRECTORY
                                    : SMB2_FILE_ATTRIBUTE_ARCHIVE;
-  info.file_id = directoryFileId(name);
+  // FILE_ID_*_DIRECTORY_INFORMATION, QFid и FileInternalInformation обязаны
+  // возвращать один идентификатор для одного объекта. Хеш basename здесь при
+  // хеше полного handle->path после CREATE делал один файл двумя объектами.
+  info.file_id = directoryChildFileId(parentPath, name);
   info.name = name;
 }
 
@@ -3728,6 +3930,10 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
   // any work so a failed CREATE followed by CLOSE cannot close an older
   // handle left by a previous compound request.
   self->lastCreatedSlot = -1;
+  RequestedCreateContexts requestedContexts;
+  if (!parseRequestedCreateContexts(*request, requestedContexts)) {
+    return createStatus(smb2, request, SMB2_STATUS_INVALID_PARAMETER);
+  }
   diagnosticLogEvent(
       "SMB create-enter tree=%08lx disp=%lu opts=%08lx name=%s",
       static_cast<unsigned long>(smb2_get_current_tree_id(smb2)),
@@ -3760,6 +3966,9 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
     reply->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
     reply->create_action = kCreateOpened;
     reply->file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
+    self->fillCreateContextReply(
+        requestedContexts, self->directoryFileId(handle.path),
+        0x005A584556495043ULL, reply->change_time, 0x001F00A9, *reply);
     self->sendOperation("PIPE", "srvsvc");
     return 0;
   }
@@ -3769,6 +3978,21 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
                            path) ||
       request->create_disposition > SMB2_FILE_OVERWRITE_IF) {
     return createStatus(smb2, request, SMB2_STATUS_OBJECT_NAME_INVALID);
+  }
+
+  uint64_t volumeId = 0;
+  if (requestedContexts.queryOnDiskId &&
+      !requestedContexts.durableReconnect) {
+    VfsFsInfo fsInfo = {};
+    uint8_t fsStatus = 0;
+    if (!self->loadFsInfo(fsInfo, fsStatus)) {
+      return createStatus(smb2, request,
+                          fsStatus != 0 ? smbStatusFromFilex(fsStatus)
+                                        : SMB2_STATUS_IO_DEVICE_ERROR);
+    }
+    // QFid требует 64-битный идентификатор тома. Для FAT естественный и
+    // стабильный источник — записанный в boot sector Volume Serial Number.
+    volumeId = fsInfo.serial;
   }
 
   VfsResult statResult;
@@ -3920,6 +4144,10 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
   reply->end_of_file = size;
   reply->file_attributes = directory ? SMB2_FILE_ATTRIBUTE_DIRECTORY
                                      : SMB2_FILE_ATTRIBUTE_ARCHIVE;
+  self->fillCreateContextReply(
+      requestedContexts, self->directoryFileId(handle.path), volumeId,
+      reply->change_time,
+      directory ? 0x001F01FFUL : 0x001F019FUL, *reply);
   diagnosticLogEvent("SMB create-ok slot=%d dir=%u size=%lu path=%s", slot,
                      directory ? 1U : 0U,
                      static_cast<unsigned long>(size), path);
@@ -4571,7 +4799,7 @@ int SmbServer::Impl::queryCachedDirectory(
     auto* info = reinterpret_cast<smb2_fileidbothdirectoryinformation*>(
         entries + count * stride);
     fillDirectoryInfo(*info, handle.directoryIndex, cached.isDirectory,
-                      cached.size, cached.name);
+                      cached.size, handle.path, cached.name);
     encoded += entrySize;
     ++count;
     if ((request->flags & SMB2_RETURN_SINGLE_ENTRY) != 0) {
@@ -4691,7 +4919,7 @@ int SmbServer::Impl::queryDirectoryHandler(
   snprintf(self->directoryName, sizeof(self->directoryName), "%s",
            result.name);
   self->fillDirectoryInfo(self->directoryInfo, handle->directoryIndex,
-                          result.isDirectory, result.size,
+                          result.isDirectory, result.size, handle->path,
                           self->directoryName);
   reply->output_buffer =
       reinterpret_cast<uint8_t*>(&self->directoryInfo);

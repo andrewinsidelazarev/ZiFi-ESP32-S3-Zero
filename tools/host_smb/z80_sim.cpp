@@ -539,16 +539,28 @@ void Z80Simulator::handleFsInfo() {
   const uint32_t free = static_cast<uint32_t>(
       std::min<uint64_t>(space.available / clusterBytes, total));
 
-  uint8_t answer[24] = {};
+  // VFS_FS_INFO v1: status + 48-byte payload. Старый 24-байтный ответ был
+  // достаточен, пока host-тесты не запрашивали сведения о томе, но реальный
+  // VfsClient закономерно отвергает его как fs-info-short.
+  uint8_t answer[49] = {};
   answer[0] = kStatusOk;
-  answer[1] = 0x04 | 0x08;  // свободные кластеры достоверны, метка тома есть
-  answer[2] = kSectorsPerCluster;
-  answer[3] = static_cast<uint8_t>(kBytesPerSector);
-  answer[4] = static_cast<uint8_t>(kBytesPerSector >> 8);
-  writeLe32(answer + 5, total);
-  writeLe32(answer + 9, free);
-  writeLe32(answer + 13, 0x9016'4EF8u);
-  std::memcpy(answer + 17, "HOSTSIM", 7);
+  answer[1] = 48;
+  answer[2] = 1;
+  answer[3] = 0x04 | 0x08;  // свободные кластеры достоверны, метка тома есть
+  answer[4] = kSectorsPerCluster;
+  answer[5] = static_cast<uint8_t>(kBytesPerSector);
+  answer[6] = static_cast<uint8_t>(kBytesPerSector >> 8);
+  writeLe32(answer + 9, total);
+  writeLe32(answer + 13, free);
+  writeLe32(answer + 17, 0x9016'4EF8u);
+  std::memcpy(answer + 21, "HOSTSIM", 7);
+  writeLe32(answer + 33, total * kSectorsPerCluster);
+  writeLe32(answer + 37, 0xFFFFFFFFu);
+  answer[41] = 2;  // две FAT, как на обычной FAT32 SD-карте
+  answer[42] = 0;
+  answer[43] = 0;
+  answer[44] = 0;
+  writeLe32(answer + 45, total / 128u + 1u);
   reply(kVfsFsInfo, answer, sizeof(answer));
 }
 
