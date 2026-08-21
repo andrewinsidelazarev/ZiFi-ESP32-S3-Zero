@@ -1,5 +1,7 @@
 #include "zifi/diagnostic_log.hpp"
 
+#if ZIFI_DIAGNOSTIC_LOG
+
 #include <Arduino.h>
 #include <LittleFS.h>
 
@@ -374,3 +376,11 @@ extern "C" void zifi_diagnostic_log_rpc_stage(const char* stage,
                            static_cast<long>(valueA),
                            static_cast<long>(valueB));
 }
+
+#else
+
+// libsmb2 содержит несколько C-вызовов диагностических этапов DCE/RPC.
+// Оставляем символ для независимой линковки, но в обычной прошивке он пуст.
+extern "C" void zifi_diagnostic_log_rpc_stage(const char*, int32_t, int32_t) {}
+
+#endif

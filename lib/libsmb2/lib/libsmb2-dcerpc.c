@@ -34,9 +34,14 @@
 
 /* Реализация находится в диагностическом C++-модуле прошивки. Простое
  * C-связывание не заставляет изолированную библиотеку искать заголовки
- * верхнего проекта и сохраняет libsmb2 независимой от Arduino-классов. */
+ * верхнего проекта и сохраняет libsmb2 независимой от Arduino-классов.
+ * При ZIFI_DIAGNOSTIC_LOG=0 макрос удаляет и вызовы, и их строки из образа. */
+#if ZIFI_DIAGNOSTIC_LOG
 extern void zifi_diagnostic_log_rpc_stage(const char *stage,
                                           int32_t value_a, int32_t value_b);
+#else
+#define zifi_diagnostic_log_rpc_stage(...) ((void)0)
+#endif
 
 /* UUID записаны так, как они идут по проводу DCE/RPC: первые три поля
  * имеют little-endian порядок. */

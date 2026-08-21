@@ -358,6 +358,10 @@ void OtaServer::processBegin() {
 }
 
 bool OtaServer::sendDiagnosticLog() {
+#if !ZIFI_DIAGNOSTIC_LOG
+  sendText("ERR log disabled\n");
+  return false;
+#else
   // В режим updater SMB уже остановлен, поэтому снимок не конкурирует с
   // записью событий. Сначала включаем в журнал сам запрос чтения, затем
   // отдаём неизменяемую копию из PSRAM.
@@ -398,6 +402,7 @@ bool OtaServer::sendDiagnosticLog() {
                     sendText("OK\n");
   diagnosticLogFreeSnapshot(snapshot);
   return sent;
+#endif
 }
 
 void OtaServer::receiveBeginLine() {
