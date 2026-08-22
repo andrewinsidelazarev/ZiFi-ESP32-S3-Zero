@@ -4459,6 +4459,20 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   pending.lastProgressMs = millis();
   ++self->asyncReadCount;
 
+  // Физическое FILEX-чтение одного 64-КиБ SMB-запроса занимает несколько
+  // окон UART, а следующие READ ждут общий мост. Как Samba, переводим каждый
+  // такой запрос в SMB2 async до начала работы: Windows продлевает его таймер,
+  // получает credit в STATUS_PENDING, а libsmb2 сохраняет тот же AsyncId для
+  // финального READ-ответа. Без interim-ответа хвост CopyFile истекал примерно
+  // через минуту, хотя сервер продолжал последовательно читать данные.
+  if (replyStatus(smb2, SMB2_READ, SMB2_STATUS_PENDING) < 0) {
+    pending = {};
+    if (self->asyncReadCount != 0) {
+      --self->asyncReadCount;
+    }
+    return -1;
+  }
+
   self->pollAsyncRead();
   return 1;
 }

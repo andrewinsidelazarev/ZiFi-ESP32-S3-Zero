@@ -21,6 +21,30 @@ struct async_read_state {
   char error[256];
 };
 
+struct raw_async_read_state {
+  uint8_t *buffer;
+  uint32_t expected_length;
+  uint64_t offset;
+  int *completed_total;
+  int completed;
+  int pending_count;
+  int final_count;
+  int final_status;
+  int corrupted;
+  uint16_t pending_command;
+  uint16_t final_command;
+  uint16_t pending_credit;
+  uint16_t final_credit;
+  uint32_t pending_flags;
+  uint32_t final_flags;
+  uint32_t pending_next_command;
+  uint32_t final_next_command;
+  uint64_t pending_message_id;
+  uint64_t final_message_id;
+  uint64_t pending_async_id;
+  uint64_t final_async_id;
+};
+
 /* Публичный API libsmb2 не выдаёт FileId открытого handle. Начало внутренней
  * структуры стабильно и уже используется отдельным smb_tailcheck. */
 struct probe_fh_mirror {
@@ -60,11 +84,6 @@ struct windows_compound_state {
   int directory_payload_valid;
   int directory_padding_zero;
   uint32_t directory_output_length;
-};
-
-struct windows_compound_slot {
-  struct windows_compound_state *state;
-  int index;
 };
 
 struct internal_id_state {
@@ -133,6 +152,52 @@ static void async_read_cb(struct smb2_context *smb2, int status,
   snprintf(state->error, sizeof(state->error), "%s",
            smb2 == NULL ? "no context" : smb2_get_error(smb2));
   state->done = 1;
+}
+
+static void raw_async_read_cb(struct smb2_context *smb2, int status,
+                              void *command_data, void *private_data) {
+  struct raw_async_read_state *state =
+      (struct raw_async_read_state*)private_data;
+  if ((uint32_t)status == SMB2_STATUS_PENDING) {
+    ++state->pending_count;
+    state->pending_command = smb2->hdr.command;
+    state->pending_credit = smb2->hdr.credit_request_response;
+    state->pending_flags = smb2->hdr.flags;
+    state->pending_next_command = smb2->hdr.next_command;
+    state->pending_message_id = smb2->hdr.message_id;
+    state->pending_async_id = smb2->hdr.async.async_id;
+    return;
+  }
+
+  ++state->final_count;
+  state->final_status = status;
+  state->final_command = smb2->hdr.command;
+  state->final_credit = smb2->hdr.credit_request_response;
+  state->final_flags = smb2->hdr.flags;
+  state->final_next_command = smb2->hdr.next_command;
+  state->final_message_id = smb2->hdr.message_id;
+  state->final_async_id = smb2->hdr.async.async_id;
+  state->corrupted = 0;
+  if ((uint32_t)status == SMB2_STATUS_SUCCESS && command_data != NULL) {
+    const struct smb2_read_reply *reply =
+        (const struct smb2_read_reply*)command_data;
+    if (reply->data == NULL || reply->data_length != state->expected_length) {
+      state->corrupted = -1;
+    } else {
+      uint32_t index;
+      for (index = 0; index < reply->data_length; ++index) {
+        if (reply->data[index] != test_byte(state->offset + index)) {
+          ++state->corrupted;
+        }
+      }
+    }
+  } else {
+    state->corrupted = -1;
+  }
+  if (!state->completed) {
+    state->completed = 1;
+    ++*state->completed_total;
+  }
 }
 
 static int wait_async_reads(struct smb2_context *smb2,
@@ -268,16 +333,15 @@ static void windows_compound_create_cb(struct smb2_context *smb2, int status,
   ++state->completed;
 }
 
-static void windows_compound_directory_cb(struct smb2_context *smb2,
-                                          int status, void *command_data,
-                                          void *private_data) {
-  struct windows_compound_slot *slot =
-      (struct windows_compound_slot*)private_data;
-  struct windows_compound_state *state = slot->state;
+static void windows_compound_directory_cb_index(
+    struct smb2_context *smb2, int status, void *command_data,
+    void *private_data, int index) {
+  struct windows_compound_state *state =
+      (struct windows_compound_state*)private_data;
   struct smb2_query_directory_reply *reply =
       (struct smb2_query_directory_reply*)command_data;
-  capture_compound_header(smb2, state, slot->index, status);
-  if (slot->index == 1 && (uint32_t)status == SMB2_STATUS_SUCCESS &&
+  capture_compound_header(smb2, state, index, status);
+  if (index == 1 && (uint32_t)status == SMB2_STATUS_SUCCESS &&
       reply != NULL && reply->output_buffer != NULL) {
     state->directory_output_length = reply->output_buffer_length;
     state->directory_payload_valid = 1;
@@ -285,6 +349,20 @@ static void windows_compound_directory_cb(struct smb2_context *smb2,
         reply->output_buffer, reply->output_buffer_length);
   }
   ++state->completed;
+}
+
+static void windows_compound_first_directory_cb(
+    struct smb2_context *smb2, int status, void *command_data,
+    void *private_data) {
+  windows_compound_directory_cb_index(
+      smb2, status, command_data, private_data, 1);
+}
+
+static void windows_compound_second_directory_cb(
+    struct smb2_context *smb2, int status, void *command_data,
+    void *private_data) {
+  windows_compound_directory_cb_index(
+      smb2, status, command_data, private_data, 2);
 }
 
 static int inspect_windows_create_contexts(
@@ -406,7 +484,6 @@ static int run_windows_directory_compound(
   struct smb2_query_directory_request second_query;
   struct smb2_pdu *head;
   struct smb2_pdu *next;
-  struct windows_compound_slot slots[2];
   uint8_t contexts[48];
   int old_passthrough = 0;
 
@@ -451,10 +528,6 @@ static int run_windows_directory_compound(
   second_query.output_buffer_length = 1024;
   second_query.name = "*";
 
-  slots[0].state = state;
-  slots[0].index = 1;
-  slots[1].state = state;
-  slots[1].index = 2;
   smb2_get_passthrough(smb2, &old_passthrough);
   smb2_set_passthrough(smb2, 1);
 
@@ -465,7 +538,7 @@ static int run_windows_directory_compound(
     return -1;
   }
   next = smb2_cmd_query_directory_async(
-      smb2, &first_query, windows_compound_directory_cb, &slots[0]);
+      smb2, &first_query, windows_compound_first_directory_cb, state);
   if (next == NULL) {
     smb2_free_pdu(smb2, head);
     smb2_set_passthrough(smb2, old_passthrough);
@@ -473,7 +546,7 @@ static int run_windows_directory_compound(
   }
   smb2_add_compound_pdu(smb2, head, next);
   next = smb2_cmd_query_directory_async(
-      smb2, &second_query, windows_compound_directory_cb, &slots[1]);
+      smb2, &second_query, windows_compound_second_directory_cb, state);
   if (next == NULL) {
     smb2_free_pdu(smb2, head);
     smb2_set_passthrough(smb2, old_passthrough);
@@ -492,6 +565,10 @@ static int run_windows_directory_compound(
   smb2_queue_pdu(smb2, head);
   {
     const int result = wait_for_count(smb2, &state->completed, 3, 10000);
+    if (result != 0) {
+      printf("  Compound service failed after %d callbacks: %s\n",
+             state->completed, smb2_get_error(smb2));
+    }
     smb2_set_passthrough(smb2, old_passthrough);
     return result;
   }
@@ -716,7 +793,7 @@ int main(int argc, char **argv) {
   }
 
   if (argc < 3) {
-    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8|test9|test10|test11|test12|test13|test14|test15|test16|test17|test18|test19] [test-directory]\n");
+    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8|test9|test10|test11|test12|test13|test14|test15|test16|test17|test18|test19|test20] [test-directory]\n");
     return 1;
   }
   const char *server = argv[1];
@@ -740,7 +817,6 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("SUCCESS: Connected to %s/%s\n", server, share);
-
   /* Windows-клиент SMB2 требует не меньше четырёх кредитов. При трёх
    * CopyFile выполняет три предварительных READ и больше не отправляет
    * запросы, ожидая четвёртый кредит. */
@@ -806,6 +882,7 @@ int main(int argc, char **argv) {
     if (strcmp(only_test, "test17") == 0) goto test_17;
     if (strcmp(only_test, "test18") == 0) goto test_18;
     if (strcmp(only_test, "test19") == 0) goto test_19;
+    if (strcmp(only_test, "test20") == 0) goto test_20;
   }
 
   /* TEST 1: Sequential & Multiple Reads check */
@@ -1988,6 +2065,150 @@ test_19:
            (unsigned long long)internal.index_number,
            (unsigned long long)volume_id);
     printf("RESULT TEST 19: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_20:
+  /* TEST 20: точный CopyFile READ burst для файла 600001 байт. Каждый
+   * отложенный READ обязан сначала получить самостоятельный STATUS_PENDING,
+   * затем финальный async-ответ с тем же AsyncId. Именно отсутствие pending
+   * оставляло поздние блоки без ответа дольше таймаута Windows. */
+  printf("\n--- TEST 20: CopyFile async READ interim/final wire contract ---\n");
+  {
+    const uint32_t chunk_size = 65536;
+    const uint32_t file_size = 600001;
+    const int read_count = 10;
+    struct raw_async_read_state states[10];
+    uint8_t *write_buffer = (uint8_t*)malloc(chunk_size);
+    struct smb2fh *write_handle = NULL;
+    struct smb2fh *read_handle = NULL;
+    struct probe_fh_mirror *mirror = NULL;
+    int completed = 0;
+    int queued = 0;
+    int old_passthrough = 0;
+    int test_ok = write_buffer != NULL;
+    int index;
+
+    memset(states, 0, sizeof(states));
+    if (test_ok) {
+      write_handle = smb2_open(smb2, test_path("async_pending_600001.bin"),
+                               O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = write_handle != NULL;
+    }
+    for (uint32_t offset = 0; test_ok && offset < file_size;
+         offset += chunk_size) {
+      uint32_t length = file_size - offset;
+      if (length > chunk_size) length = chunk_size;
+      for (uint32_t byte = 0; byte < length; ++byte) {
+        write_buffer[byte] = test_byte((uint64_t)offset + byte);
+      }
+      if (smb2_write(smb2, write_handle, write_buffer, length) !=
+          (int)length) {
+        test_ok = 0;
+      }
+    }
+    if (write_handle != NULL) {
+      test_ok = smb2_close(smb2, write_handle) == 0 && test_ok;
+      write_handle = NULL;
+    }
+    free(write_buffer);
+
+    if (test_ok) {
+      read_handle = smb2_open(smb2, test_path("async_pending_600001.bin"),
+                              O_RDONLY);
+      test_ok = read_handle != NULL;
+    }
+    if (test_ok) {
+      mirror = (struct probe_fh_mirror*)read_handle;
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+    }
+    for (index = 0; test_ok && index < read_count; ++index) {
+      struct smb2_read_request request;
+      struct smb2_pdu *pdu;
+      const uint64_t offset = (uint64_t)index * chunk_size;
+      uint32_t expected = file_size - (uint32_t)offset;
+      if (expected > chunk_size) expected = chunk_size;
+      states[index].buffer = (uint8_t*)malloc(chunk_size);
+      states[index].expected_length = expected;
+      states[index].offset = offset;
+      states[index].completed_total = &completed;
+      states[index].final_status = -1;
+      if (states[index].buffer == NULL) {
+        test_ok = 0;
+        break;
+      }
+      memset(&request, 0, sizeof(request));
+      request.length = chunk_size;
+      request.offset = offset;
+      request.buf = states[index].buffer;
+      memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
+      pdu = smb2_cmd_read_async(smb2, &request, raw_async_read_cb,
+                                &states[index]);
+      if (pdu == NULL) {
+        test_ok = 0;
+        break;
+      }
+      smb2_queue_pdu(smb2, pdu);
+      ++queued;
+    }
+    if (queued != 0 &&
+        wait_for_count(smb2, &completed, queued, 180000) != 0) {
+      printf("  Timeout/service failure: %s\n", smb2_get_error(smb2));
+      test_ok = 0;
+    }
+    test_ok = test_ok && queued == read_count;
+    if (mirror != NULL) {
+      smb2_set_passthrough(smb2, old_passthrough);
+    }
+
+    for (index = 0; index < read_count; ++index) {
+      const struct raw_async_read_state *state = &states[index];
+      int unique_async_id = 1;
+      int peer;
+      for (peer = 0; peer < index; ++peer) {
+        if (state->pending_async_id != 0 &&
+            state->pending_async_id == states[peer].pending_async_id) {
+          unique_async_id = 0;
+        }
+      }
+      if (!state->completed || state->pending_count != 1 ||
+          state->final_count != 1 ||
+          (uint32_t)state->final_status != SMB2_STATUS_SUCCESS ||
+          state->corrupted != 0 ||
+          state->pending_command != SMB2_READ ||
+          state->final_command != SMB2_READ ||
+          (state->pending_flags & (SMB2_FLAGS_SERVER_TO_REDIR |
+                                   SMB2_FLAGS_ASYNC_COMMAND)) !=
+              (SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND) ||
+          (state->pending_flags & SMB2_FLAGS_SIGNED) != 0 ||
+          (state->final_flags & (SMB2_FLAGS_SERVER_TO_REDIR |
+                                 SMB2_FLAGS_ASYNC_COMMAND)) !=
+              (SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND) ||
+          state->pending_next_command != 0 || state->final_next_command != 0 ||
+          state->pending_credit == 0 || state->final_credit != 0 ||
+          state->pending_message_id != state->final_message_id ||
+          state->pending_async_id == 0 ||
+          state->pending_async_id != state->final_async_id ||
+          !unique_async_id) {
+        test_ok = 0;
+      }
+      printf("  READ %d off=%llu pending=%d async=0x%016llx credit=%u "
+             "final=%08x/0x%016llx credit=%u bytes=%lu bad=%d\n",
+             index, (unsigned long long)state->offset, state->pending_count,
+             (unsigned long long)state->pending_async_id,
+             (unsigned)state->pending_credit, (unsigned)state->final_status,
+             (unsigned long long)state->final_async_id,
+             (unsigned)state->final_credit,
+             (unsigned long)state->expected_length, state->corrupted);
+      free(states[index].buffer);
+    }
+    if (read_handle != NULL) {
+      test_ok = smb2_close(smb2, read_handle) == 0 && test_ok;
+    }
+    printf("RESULT TEST 20: %s\n", test_ok ? "PASS" : "FAIL");
     failures += !test_ok;
   }
 
