@@ -36,17 +36,38 @@ struct query_info_state {
   int status;
 };
 
-struct create_context_state {
+struct allocation_query_state {
   int done;
   int status;
-  int context_copy_ok;
-  uint8_t oplock_level;
-  smb2_file_id file_id;
-  uint32_t create_context_length;
-  uint8_t create_context[128];
+  uint8_t information_class;
+  uint64_t allocation_size;
+  uint64_t end_of_file;
 };
 
-struct internal_info_state {
+struct windows_compound_state {
+  int completed;
+  uint32_t request_next_command[3];
+  uint32_t request_flags[3];
+  int status[3];
+  uint32_t next_command[3];
+  uint32_t flags[3];
+  uint64_t message_id[3];
+  uint8_t oplock_level;
+  smb2_file_id file_id;
+  int context_copy_ok;
+  uint32_t create_context_length;
+  uint8_t create_context[128];
+  int directory_payload_valid;
+  int directory_padding_zero;
+  uint32_t directory_output_length;
+};
+
+struct windows_compound_slot {
+  struct windows_compound_state *state;
+  int index;
+};
+
+struct internal_id_state {
   int done;
   int status;
   int decoded;
@@ -160,10 +181,10 @@ static int service_for(struct smb2_context *smb2, DWORD duration_ms) {
   return 0;
 }
 
-static int wait_for_done(struct smb2_context *smb2, const int *done,
-                         DWORD timeout_ms) {
+static int wait_for_count(struct smb2_context *smb2, const int *completed,
+                          int expected, DWORD timeout_ms) {
   const DWORD started = GetTickCount();
-  while (!*done) {
+  while (*completed < expected) {
     WSAPOLLFD pfd;
     pfd.fd = (SOCKET)smb2_get_fd(smb2);
     pfd.events = (SHORT)smb2_which_events(smb2);
@@ -180,15 +201,57 @@ static int wait_for_done(struct smb2_context *smb2, const int *done,
   return 0;
 }
 
-static void create_context_cb(struct smb2_context *smb2, int status,
-                              void *command_data, void *private_data) {
-  struct create_context_state *state =
-      (struct create_context_state*)private_data;
+static void capture_compound_header(struct smb2_context *smb2,
+                                    struct windows_compound_state *state,
+                                    int index, int status) {
+  state->status[index] = status;
+  state->next_command[index] = smb2->hdr.next_command;
+  state->flags[index] = smb2->hdr.flags;
+  state->message_id[index] = smb2->hdr.message_id;
+}
+
+static int directory_padding_is_zero(const uint8_t *data, uint32_t length) {
+  uint32_t offset = 0;
+  int entries = 0;
+  while (offset < length) {
+    uint32_t next;
+    uint32_t name_length;
+    uint32_t record_length;
+    uint32_t used;
+    uint32_t index;
+    if (length - offset < SMB2_FILEID_BOTH_DIRECTORY_INFORMATION_SIZE) {
+      return 0;
+    }
+    next = test_read_le32(data + offset);
+    name_length = test_read_le32(data + offset + 60);
+    record_length = next == 0 ? length - offset : next;
+    used = SMB2_FILEID_BOTH_DIRECTORY_INFORMATION_SIZE + name_length;
+    if (record_length > length - offset || record_length < used ||
+        (next != 0 && (next & 7u) != 0)) {
+      return 0;
+    }
+    for (index = used; index < record_length; ++index) {
+      if (data[offset + index] != 0) {
+        return 0;
+      }
+    }
+    ++entries;
+    if (next == 0) {
+      break;
+    }
+    offset += next;
+  }
+  return entries > 0;
+}
+
+static void windows_compound_create_cb(struct smb2_context *smb2, int status,
+                                       void *command_data,
+                                       void *private_data) {
+  struct windows_compound_state *state =
+      (struct windows_compound_state*)private_data;
   struct smb2_create_reply *reply = (struct smb2_create_reply*)command_data;
-  (void)smb2;
-  state->status = status;
-  state->context_copy_ok = 0;
-  if (status == SMB2_STATUS_SUCCESS && reply != NULL) {
+  capture_compound_header(smb2, state, 0, status);
+  if ((uint32_t)status == SMB2_STATUS_SUCCESS && reply != NULL) {
     state->oplock_level = reply->oplock_level;
     memcpy(state->file_id, reply->file_id, sizeof(state->file_id));
     state->create_context_length = reply->create_context_length;
@@ -202,127 +265,35 @@ static void create_context_cb(struct smb2_context *smb2, int status,
       state->context_copy_ok = 1;
     }
   }
-  state->done = 1;
+  ++state->completed;
 }
 
-static void internal_info_cb(struct smb2_context *smb2, int status,
-                             void *command_data, void *private_data) {
-  struct internal_info_state *state =
-      (struct internal_info_state*)private_data;
-  struct smb2_query_info_reply *reply =
-      (struct smb2_query_info_reply*)command_data;
-  (void)smb2;
-  state->status = status;
-  if (status == SMB2_STATUS_SUCCESS && reply != NULL &&
-      reply->output_buffer != NULL && reply->output_buffer_length == 8) {
-    state->index_number =
-        test_read_le64((const uint8_t*)reply->output_buffer);
-    state->decoded = 1;
+static void windows_compound_directory_cb(struct smb2_context *smb2,
+                                          int status, void *command_data,
+                                          void *private_data) {
+  struct windows_compound_slot *slot =
+      (struct windows_compound_slot*)private_data;
+  struct windows_compound_state *state = slot->state;
+  struct smb2_query_directory_reply *reply =
+      (struct smb2_query_directory_reply*)command_data;
+  capture_compound_header(smb2, state, slot->index, status);
+  if (slot->index == 1 && (uint32_t)status == SMB2_STATUS_SUCCESS &&
+      reply != NULL && reply->output_buffer != NULL) {
+    state->directory_output_length = reply->output_buffer_length;
+    state->directory_payload_valid = 1;
+    state->directory_padding_zero = directory_padding_is_zero(
+        reply->output_buffer, reply->output_buffer_length);
   }
-  state->done = 1;
+  ++state->completed;
 }
 
-static int raw_create_with_windows_contexts(
-    struct smb2_context *smb2, const char *path,
-    struct create_context_state *state) {
-  struct smb2_create_request request;
-  struct smb2_pdu *pdu;
-  uint8_t contexts[56];
-
-  memset(contexts, 0, sizeof(contexts));
-  /* Windows-подобная цепочка: MxAc с нулевым Timestamp, затем пустой QFid. */
-  test_write_le32(contexts, 32);
-  test_write_le16(contexts + 4, 16);
-  test_write_le16(contexts + 6, 4);
-  test_write_le16(contexts + 10, 24);
-  test_write_le32(contexts + 12, 8);
-  memcpy(contexts + 16, "MxAc", 4);
-
-  test_write_le16(contexts + 32 + 4, 16);
-  test_write_le16(contexts + 32 + 6, 4);
-  memcpy(contexts + 32 + 16, "QFid", 4);
-
-  memset(&request, 0, sizeof(request));
-  request.requested_oplock_level = SMB2_OPLOCK_LEVEL_BATCH;
-  request.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
-  request.desired_access = SMB2_FILE_READ_DATA | SMB2_FILE_READ_EA |
-                           SMB2_FILE_READ_ATTRIBUTES | SMB2_READ_CONTROL |
-                           SMB2_SYNCHRONIZE;
-  request.file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
-  request.share_access = SMB2_FILE_SHARE_READ | SMB2_FILE_SHARE_WRITE |
-                         SMB2_FILE_SHARE_DELETE;
-  request.create_disposition = SMB2_FILE_OPEN;
-  request.create_options = SMB2_FILE_NON_DIRECTORY_FILE;
-  request.name = path;
-  request.create_context_length = sizeof(contexts);
-  request.create_context = contexts;
-  memset(state, 0, sizeof(*state));
-
-  pdu = smb2_cmd_create_async(smb2, &request, create_context_cb, state);
-  if (pdu == NULL) {
-    return -1;
-  }
-  smb2_queue_pdu(smb2, pdu);
-  return wait_for_done(smb2, &state->done, 10000);
-}
-
-static int query_internal_file_id(struct smb2_context *smb2,
-                                  const smb2_file_id file_id,
-                                  struct internal_info_state *state) {
-  struct smb2_query_info_request request;
-  struct smb2_pdu *pdu;
-  int old_passthrough = 0;
-
-  memset(&request, 0, sizeof(request));
-  request.info_type = SMB2_0_INFO_FILE;
-  request.file_info_class = SMB2_FILE_INTERNAL_INFORMATION;
-  request.output_buffer_length = 8;
-  memcpy(request.file_id, file_id, sizeof(request.file_id));
-  memset(state, 0, sizeof(*state));
-
-  /* Эта версия libsmb2 кодирует FileInternalInformation на сервере, но не
-   * декодирует его на клиенте. Passthrough даёт тесту ровно 8 wire-байт. */
-  smb2_get_passthrough(smb2, &old_passthrough);
-  smb2_set_passthrough(smb2, 1);
-  pdu = smb2_cmd_query_info_async(smb2, &request, internal_info_cb, state);
-  if (pdu == NULL) {
-    smb2_set_passthrough(smb2, old_passthrough);
-    return -1;
-  }
-  smb2_queue_pdu(smb2, pdu);
-  {
-    const int result = wait_for_done(smb2, &state->done, 10000);
-    smb2_set_passthrough(smb2, old_passthrough);
-    return result;
-  }
-}
-
-static int find_directory_file_id(struct smb2_context *smb2,
-                                  const char *directory, const char *name,
-                                  uint64_t *file_id) {
-  struct smb2dir *dir = smb2_opendir(smb2, directory);
-  struct smb2dirent *entry;
-  if (dir == NULL) {
-    return -1;
-  }
-  while ((entry = smb2_readdir(smb2, dir)) != NULL) {
-    if (strcmp(entry->name, name) == 0) {
-      *file_id = entry->st.smb2_ino;
-      smb2_closedir(smb2, dir);
-      return 0;
-    }
-  }
-  smb2_closedir(smb2, dir);
-  return -1;
-}
-
-static int inspect_create_context_reply(
-    const struct create_context_state *state, uint32_t *query_status,
+static int inspect_windows_create_contexts(
+    const struct windows_compound_state *state, uint32_t *query_status,
     uint32_t *maximal_access, uint64_t *disk_file_id, uint64_t *volume_id) {
   size_t offset = 0;
   int seen_mxac = 0;
   int seen_qfid = 0;
-  int context_count = 0;
+  int count = 0;
   if (!state->context_copy_ok) {
     return -1;
   }
@@ -350,7 +321,7 @@ static int inspect_create_context_reply(
         (next != 0 && (next & 7u) != 0)) {
       return -1;
     }
-    ++context_count;
+    ++count;
     if (name_length == 4 && memcmp(context + name_offset, "MxAc", 4) == 0) {
       if (seen_mxac || data_length != 8) {
         return -1;
@@ -360,7 +331,6 @@ static int inspect_create_context_reply(
       seen_mxac = 1;
     } else if (name_length == 4 &&
                memcmp(context + name_offset, "QFid", 4) == 0) {
-      int reserved_zero = 1;
       size_t index;
       if (seen_qfid || data_length != 32) {
         return -1;
@@ -369,11 +339,8 @@ static int inspect_create_context_reply(
       *volume_id = test_read_le64(context + data_offset + 8);
       for (index = 16; index < 32; ++index) {
         if (context[data_offset + index] != 0) {
-          reserved_zero = 0;
+          return -1;
         }
-      }
-      if (!reserved_zero) {
-        return -1;
       }
       seen_qfid = 1;
     } else {
@@ -384,7 +351,150 @@ static int inspect_create_context_reply(
     }
     offset += next;
   }
-  return seen_mxac && seen_qfid && context_count == 2 ? 0 : -1;
+  return seen_mxac && seen_qfid && count == 2 ? 0 : -1;
+}
+
+static void internal_id_cb(struct smb2_context *smb2, int status,
+                           void *command_data, void *private_data) {
+  struct internal_id_state *state =
+      (struct internal_id_state*)private_data;
+  struct smb2_query_info_reply *reply =
+      (struct smb2_query_info_reply*)command_data;
+  (void)smb2;
+  state->status = status;
+  if ((uint32_t)status == SMB2_STATUS_SUCCESS && reply != NULL &&
+      reply->output_buffer != NULL && reply->output_buffer_length == 8) {
+    state->index_number =
+        test_read_le64((const uint8_t*)reply->output_buffer);
+    state->decoded = 1;
+  }
+  state->done = 1;
+}
+
+static int query_internal_id(struct smb2_context *smb2,
+                             const smb2_file_id file_id,
+                             struct internal_id_state *state) {
+  struct smb2_query_info_request request;
+  struct smb2_pdu *pdu;
+  int old_passthrough = 0;
+  memset(&request, 0, sizeof(request));
+  request.info_type = SMB2_0_INFO_FILE;
+  request.file_info_class = SMB2_FILE_INTERNAL_INFORMATION;
+  request.output_buffer_length = 8;
+  memcpy(request.file_id, file_id, sizeof(request.file_id));
+  memset(state, 0, sizeof(*state));
+  smb2_get_passthrough(smb2, &old_passthrough);
+  smb2_set_passthrough(smb2, 1);
+  pdu = smb2_cmd_query_info_async(smb2, &request, internal_id_cb, state);
+  if (pdu == NULL) {
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  smb2_queue_pdu(smb2, pdu);
+  {
+    const int result = wait_for_count(smb2, &state->done, 1, 10000);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return result;
+  }
+}
+
+static int run_windows_directory_compound(
+    struct smb2_context *smb2, const char *directory,
+    struct windows_compound_state *state) {
+  struct smb2_create_request create_request;
+  struct smb2_query_directory_request first_query;
+  struct smb2_query_directory_request second_query;
+  struct smb2_pdu *head;
+  struct smb2_pdu *next;
+  struct windows_compound_slot slots[2];
+  uint8_t contexts[48];
+  int old_passthrough = 0;
+
+  memset(contexts, 0, sizeof(contexts));
+  test_write_le32(contexts, 24);
+  test_write_le16(contexts + 4, 16);
+  test_write_le16(contexts + 6, 4);
+  test_write_le16(contexts + 10, 24);
+  memcpy(contexts + 16, "MxAc", 4);
+  test_write_le16(contexts + 24 + 4, 16);
+  test_write_le16(contexts + 24 + 6, 4);
+  test_write_le16(contexts + 24 + 10, 24);
+  memcpy(contexts + 24 + 16, "QFid", 4);
+
+  memset(state, 0, sizeof(*state));
+  memset(&create_request, 0, sizeof(create_request));
+  create_request.requested_oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+  create_request.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
+  create_request.desired_access = SMB2_FILE_READ_DATA |
+                                  SMB2_FILE_READ_ATTRIBUTES |
+                                  SMB2_SYNCHRONIZE;
+  create_request.share_access = SMB2_FILE_SHARE_READ | SMB2_FILE_SHARE_WRITE |
+                                SMB2_FILE_SHARE_DELETE;
+  create_request.create_disposition = SMB2_FILE_OPEN;
+  create_request.create_options = SMB2_FILE_DIRECTORY_FILE |
+                                  SMB2_FILE_SYNCHRONOUS_IO_NONALERT;
+  create_request.name = directory;
+  create_request.create_context_length = sizeof(contexts);
+  create_request.create_context = contexts;
+
+  memset(&first_query, 0, sizeof(first_query));
+  first_query.file_information_class =
+      SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION;
+  memcpy(first_query.file_id, compound_file_id, SMB2_FD_SIZE);
+  first_query.output_buffer_length = 65536;
+  first_query.name = "*";
+
+  memset(&second_query, 0, sizeof(second_query));
+  second_query.file_information_class =
+      SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION;
+  memcpy(second_query.file_id, compound_file_id, SMB2_FD_SIZE);
+  second_query.output_buffer_length = 1024;
+  second_query.name = "*";
+
+  slots[0].state = state;
+  slots[0].index = 1;
+  slots[1].state = state;
+  slots[1].index = 2;
+  smb2_get_passthrough(smb2, &old_passthrough);
+  smb2_set_passthrough(smb2, 1);
+
+  head = smb2_cmd_create_async(smb2, &create_request,
+                               windows_compound_create_cb, state);
+  if (head == NULL) {
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  next = smb2_cmd_query_directory_async(
+      smb2, &first_query, windows_compound_directory_cb, &slots[0]);
+  if (next == NULL) {
+    smb2_free_pdu(smb2, head);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  smb2_add_compound_pdu(smb2, head, next);
+  next = smb2_cmd_query_directory_async(
+      smb2, &second_query, windows_compound_directory_cb, &slots[1]);
+  if (next == NULL) {
+    smb2_free_pdu(smb2, head);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  smb2_add_compound_pdu(smb2, head, next);
+  state->request_next_command[0] = head->header.next_command;
+  state->request_next_command[1] =
+      head->next_compound->header.next_command;
+  state->request_next_command[2] =
+      head->next_compound->next_compound->header.next_command;
+  state->request_flags[0] = head->header.flags;
+  state->request_flags[1] = head->next_compound->header.flags;
+  state->request_flags[2] =
+      head->next_compound->next_compound->header.flags;
+  smb2_queue_pdu(smb2, head);
+  {
+    const int result = wait_for_count(smb2, &state->completed, 3, 10000);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return result;
+  }
 }
 
 static void query_info_cb(struct smb2_context *smb2, int status,
@@ -394,6 +504,97 @@ static void query_info_cb(struct smb2_context *smb2, int status,
   (void)command_data;
   state->status = status;
   state->done = 1;
+}
+
+static void allocation_query_cb(struct smb2_context *smb2, int status,
+                                void *command_data, void *private_data) {
+  struct allocation_query_state *state =
+      (struct allocation_query_state*)private_data;
+  state->status = status;
+  if (status == SMB2_STATUS_SUCCESS && command_data != NULL) {
+    struct smb2_query_info_reply *reply =
+        (struct smb2_query_info_reply*)command_data;
+    if (reply->output_buffer != NULL) {
+      switch (state->information_class) {
+        case SMB2_FILE_STANDARD_INFORMATION: {
+          const struct smb2_file_standard_info *info =
+              (const struct smb2_file_standard_info*)reply->output_buffer;
+          state->allocation_size = info->allocation_size;
+          state->end_of_file = info->end_of_file;
+          break;
+        }
+        case SMB2_FILE_ALL_INFORMATION: {
+          const struct smb2_file_all_info *info =
+              (const struct smb2_file_all_info*)reply->output_buffer;
+          state->allocation_size = info->standard.allocation_size;
+          state->end_of_file = info->standard.end_of_file;
+          break;
+        }
+        case SMB2_FILE_NETWORK_OPEN_INFORMATION: {
+          const struct smb2_file_network_open_info *info =
+              (const struct smb2_file_network_open_info*)reply->output_buffer;
+          state->allocation_size = info->allocation_size;
+          state->end_of_file = info->end_of_file;
+          break;
+        }
+        case SMB2_FILE_STREAM_INFORMATION: {
+          const struct smb2_file_stream_info *info =
+              (const struct smb2_file_stream_info*)reply->output_buffer;
+          state->allocation_size = info->stream_allocation_size;
+          state->end_of_file = info->stream_size;
+          break;
+        }
+      }
+      smb2_free_data(smb2, reply->output_buffer);
+    }
+  }
+  state->done = 1;
+}
+
+static int query_file_allocation(struct smb2_context *smb2,
+                                 struct smb2fh *handle,
+                                 uint8_t information_class,
+                                 uint64_t *allocation_size,
+                                 uint64_t *end_of_file) {
+  struct probe_fh_mirror *mirror = (struct probe_fh_mirror*)handle;
+  struct smb2_query_info_request request;
+  struct allocation_query_state state;
+  struct smb2_pdu *pdu;
+  const DWORD started = GetTickCount();
+
+  memset(&request, 0, sizeof(request));
+  request.info_type = SMB2_0_INFO_FILE;
+  request.file_info_class = information_class;
+  request.output_buffer_length = 65536;
+  memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
+  memset(&state, 0, sizeof(state));
+  state.status = -1;
+  state.information_class = information_class;
+
+  pdu = smb2_cmd_query_info_async(smb2, &request, allocation_query_cb,
+                                  &state);
+  if (pdu == NULL) {
+    return -1;
+  }
+  smb2_queue_pdu(smb2, pdu);
+  while (!state.done) {
+    WSAPOLLFD pfd;
+    pfd.fd = (SOCKET)smb2_get_fd(smb2);
+    pfd.events = (SHORT)smb2_which_events(smb2);
+    pfd.revents = 0;
+    const int polled = WSAPoll(&pfd, 1, 500);
+    if (polled == SOCKET_ERROR ||
+        smb2_service(smb2, polled > 0 ? pfd.revents : 0) < 0 ||
+        (DWORD)(GetTickCount() - started) >= 10000) {
+      return -1;
+    }
+  }
+  if (state.status != SMB2_STATUS_SUCCESS) {
+    return -1;
+  }
+  *allocation_size = state.allocation_size;
+  *end_of_file = state.end_of_file;
+  return 0;
 }
 
 static int query_security_status(struct smb2_context *smb2,
@@ -515,7 +716,7 @@ int main(int argc, char **argv) {
   }
 
   if (argc < 3) {
-    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8|test9|test10|test11|test12|test13|test14|test15|test16|test17] [test-directory]\n");
+    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8|test9|test10|test11|test12|test13|test14|test15|test16|test17|test18|test19] [test-directory]\n");
     return 1;
   }
   const char *server = argv[1];
@@ -603,6 +804,8 @@ int main(int argc, char **argv) {
     if (strcmp(only_test, "test15") == 0) goto test_15;
     if (strcmp(only_test, "test16") == 0) goto test_16;
     if (strcmp(only_test, "test17") == 0) goto test_17;
+    if (strcmp(only_test, "test18") == 0) goto test_18;
+    if (strcmp(only_test, "test19") == 0) goto test_19;
   }
 
   /* TEST 1: Sequential & Multiple Reads check */
@@ -1549,81 +1752,242 @@ test_16:
   if (only_test != NULL) goto done;
 
 test_17:
-  /* TEST 17: точный Windows CREATE с MxAc/QFid. Проверяется не наличие кода,
-   * а wire-ответ и единый идентификатор в каталоге, QFid и InternalInfo. */
-  printf("\n--- TEST 17: Windows MxAc/QFid CREATE contexts and FileId identity ---\n");
+  /* TEST 17: Explorer выбирает объект из QUERY_DIRECTORY, а затем открывает
+   * его и запрашивает FILE_INTERNAL_INFORMATION. Оба пути обязаны вернуть
+   * один FileId; иначе Shell не начинает чтение выбранного файла. */
+  printf("\n--- TEST 17: Directory and open FileId identity ---\n");
   {
-    const char *file_name = "create_context_identity.bin";
-    const char *path = test_path(file_name);
-    const char *directory = test_directory[0] == '\0' ? "" : test_directory;
-    const uint8_t byte = 0x5a;
-    struct smb2fh *writer = smb2_open(
-        smb2, path, O_CREAT | O_TRUNC | O_WRONLY);
-    struct create_context_state create_state;
-    struct internal_info_state internal_state;
-    struct smb2fh *raw_handle = NULL;
-    uint64_t directory_file_id = 0;
-    uint64_t disk_file_id = 0;
-    uint64_t volume_id = 0;
-    uint32_t query_status = 0xffffffffu;
-    uint32_t maximal_access = 0;
-    int test_ok = writer != NULL;
+    const char *file_name = "file_identity.bin";
+    char file_path[512];
+    struct smb2fh *writer = NULL;
+    struct smb2dir *directory = NULL;
+    struct smb2dirent *entry = NULL;
+    struct smb2_stat_64 opened_stat;
+    uint64_t directory_id = 0;
+    int found = 0;
+    int test_ok = 1;
+    const uint8_t byte = 0xa5;
 
-    memset(&create_state, 0, sizeof(create_state));
-    memset(&internal_state, 0, sizeof(internal_state));
-    create_state.status = -1;
-    internal_state.status = -1;
-
+    snprintf(file_path, sizeof(file_path), "%s", test_path(file_name));
+    writer = smb2_open(smb2, file_path, O_CREAT | O_TRUNC | O_WRONLY);
+    test_ok = writer != NULL;
     if (test_ok) {
       test_ok = smb2_write(smb2, writer, (void*)&byte, 1) == 1;
-    }
-    if (writer != NULL) {
       test_ok = smb2_close(smb2, writer) == 0 && test_ok;
       writer = NULL;
     }
     if (test_ok) {
-      test_ok = find_directory_file_id(smb2, directory, file_name,
-                                       &directory_file_id) == 0;
+      directory = smb2_opendir(smb2, test_directory);
+      test_ok = directory != NULL;
+    }
+    while (directory != NULL &&
+           (entry = smb2_readdir(smb2, directory)) != NULL) {
+      if (strcmp(entry->name, file_name) == 0) {
+        directory_id = entry->st.smb2_ino;
+        found = 1;
+        break;
+      }
+    }
+    if (directory != NULL) {
+      smb2_closedir(smb2, directory);
+    }
+    memset(&opened_stat, 0, sizeof(opened_stat));
+    if (test_ok) {
+      test_ok = found && smb2_stat(smb2, file_path, &opened_stat) == 0;
+    }
+    printf("  Directory FileId=0x%016llx open FileId=0x%016llx found=%d\n",
+           (unsigned long long)directory_id,
+           (unsigned long long)opened_stat.smb2_ino, found);
+    test_ok = test_ok && directory_id != 0 &&
+              directory_id == opened_stat.smb2_ino;
+    if (writer != NULL) {
+      smb2_close(smb2, writer);
+    }
+    printf("RESULT TEST 17: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_18:
+  /* TEST 18: MS-FSCC требует, чтобы AllocationSize был кратен размеру
+   * кластера тома. Эталонный случай повторяет реальный зависший CopyFile:
+   * EOF=262147, FAT32 cluster=32768, значит AllocationSize=294912, а не
+   * прежние 262656 (округление до сектора 512). */
+  printf("\n--- TEST 18: AllocationSize follows FAT32 cluster geometry ---\n");
+  {
+    static const uint8_t classes[] = {
+        SMB2_FILE_STANDARD_INFORMATION,
+        SMB2_FILE_ALL_INFORMATION,
+        SMB2_FILE_NETWORK_OPEN_INFORMATION,
+        SMB2_FILE_STREAM_INFORMATION};
+    const uint32_t file_size = 262147;
+    const uint64_t expected_allocation = 294912;
+    uint8_t *buffer = (uint8_t*)calloc(1, 65536);
+    struct smb2fh *handle = NULL;
+    struct smb2_statvfs statvfs;
+    uint32_t written_total = 0;
+    int test_ok = buffer != NULL;
+
+    memset(&statvfs, 0, sizeof(statvfs));
+    if (test_ok) {
+      test_ok = smb2_statvfs(smb2, test_directory, &statvfs) == 0 &&
+                statvfs.f_frsize == 32768;
+      printf("  Filesystem allocation unit=%lu expected=32768\n",
+             (unsigned long)statvfs.f_frsize);
     }
     if (test_ok) {
-      test_ok = raw_create_with_windows_contexts(
-                    smb2, path, &create_state) == 0 &&
-                (uint32_t)create_state.status == SMB2_STATUS_SUCCESS &&
-                create_state.oplock_level == SMB2_OPLOCK_LEVEL_NONE;
+      handle = smb2_open(smb2, test_path("allocation_262147.bin"),
+                         O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = handle != NULL;
+    }
+    while (test_ok && written_total < file_size) {
+      uint32_t part = file_size - written_total;
+      if (part > 65536) part = 65536;
+      const int written = smb2_write(smb2, handle, buffer, part);
+      if (written != (int)part) {
+        test_ok = 0;
+      } else {
+        written_total += part;
+      }
+    }
+    if (handle != NULL) {
+      test_ok = smb2_close(smb2, handle) == 0 && test_ok;
+      handle = NULL;
     }
     if (test_ok) {
-      test_ok = inspect_create_context_reply(
-                    &create_state, &query_status, &maximal_access,
+      handle = smb2_open(smb2, test_path("allocation_262147.bin"), O_RDONLY);
+      test_ok = handle != NULL;
+    }
+    for (size_t index = 0;
+         test_ok && index < sizeof(classes) / sizeof(classes[0]); ++index) {
+      uint64_t allocation = 0;
+      uint64_t eof = 0;
+      test_ok = query_file_allocation(smb2, handle, classes[index],
+                                      &allocation, &eof) == 0 &&
+                allocation == expected_allocation && eof == file_size;
+      printf("  Class %u: EOF=%llu AllocationSize=%llu (%s)\n",
+             (unsigned)classes[index], (unsigned long long)eof,
+             (unsigned long long)allocation, test_ok ? "PASS" : "FAIL");
+    }
+    if (handle != NULL) {
+      test_ok = smb2_close(smb2, handle) == 0 && test_ok;
+    }
+    free(buffer);
+    printf("RESULT TEST 18: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_19:
+  /* TEST 19: точная форма запроса Проводника при открытии каталога. Сервер
+   * обязан вернуть CREATE + оба QUERY_DIRECTORY в одном compound-ответе,
+   * разрешить all-ones related FileId в рамках этого соединения и обнулить
+   * все байты выравнивания между directory records. */
+  printf("\n--- TEST 19: Windows related directory compound wire contract ---\n");
+  {
+    const char *directory = test_directory[0] == '\0' ? "" : test_directory;
+    struct windows_compound_state state;
+    struct internal_id_state internal;
+    struct smb2fh *marker = NULL;
+    struct smb2fh *directory_handle = NULL;
+    uint32_t query_status = 0xffffffffu;
+    uint32_t maximal_access = 0;
+    uint64_t disk_file_id = 0;
+    uint64_t volume_id = 0;
+    const uint8_t marker_byte = 0x5a;
+    int header_ok;
+    int test_ok;
+
+    memset(&state, 0, sizeof(state));
+    memset(&internal, 0, sizeof(internal));
+    marker = smb2_open(smb2, test_path("compound_padding_odd.bin"),
+                       O_CREAT | O_TRUNC | O_WRONLY);
+    test_ok = marker != NULL;
+    if (test_ok) {
+      test_ok = smb2_write(smb2, marker, (void*)&marker_byte, 1) == 1;
+    }
+    if (marker != NULL) {
+      test_ok = smb2_close(smb2, marker) == 0 && test_ok;
+      marker = NULL;
+    }
+    if (test_ok) {
+      test_ok = run_windows_directory_compound(smb2, directory, &state) == 0;
+    }
+
+    header_ok = state.completed == 3 &&
+        state.request_next_command[0] == 176 &&
+        state.request_next_command[1] == 104 &&
+        state.request_next_command[2] == 0 &&
+        (state.request_flags[0] & SMB2_FLAGS_RELATED_OPERATIONS) == 0 &&
+        (state.request_flags[1] & SMB2_FLAGS_RELATED_OPERATIONS) != 0 &&
+        (state.request_flags[2] & SMB2_FLAGS_RELATED_OPERATIONS) != 0 &&
+        state.next_command[0] != 0 &&
+        (state.next_command[0] & 7u) == 0 &&
+        state.next_command[1] != 0 &&
+        (state.next_command[1] & 7u) == 0 &&
+        state.next_command[2] == 0 &&
+        (state.flags[0] & SMB2_FLAGS_SERVER_TO_REDIR) != 0 &&
+        (state.flags[0] & SMB2_FLAGS_RELATED_OPERATIONS) == 0 &&
+        (state.flags[1] & (SMB2_FLAGS_SERVER_TO_REDIR |
+                           SMB2_FLAGS_RELATED_OPERATIONS)) ==
+            (SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_RELATED_OPERATIONS) &&
+        (state.flags[2] & (SMB2_FLAGS_SERVER_TO_REDIR |
+                           SMB2_FLAGS_RELATED_OPERATIONS)) ==
+            (SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_RELATED_OPERATIONS) &&
+        state.message_id[1] == state.message_id[0] + 1 &&
+        state.message_id[2] == state.message_id[1] + 1;
+    test_ok = test_ok && header_ok &&
+        (uint32_t)state.status[0] == SMB2_STATUS_SUCCESS &&
+        (uint32_t)state.status[1] == SMB2_STATUS_SUCCESS &&
+        (uint32_t)state.status[2] == SMB2_STATUS_NO_MORE_FILES &&
+        state.oplock_level == SMB2_OPLOCK_LEVEL_NONE &&
+        state.directory_payload_valid && state.directory_padding_zero;
+
+    if (test_ok) {
+      test_ok = inspect_windows_create_contexts(
+                    &state, &query_status, &maximal_access,
                     &disk_file_id, &volume_id) == 0;
     }
     if (test_ok) {
-      test_ok = query_internal_file_id(
-                    smb2, create_state.file_id, &internal_state) == 0 &&
-                (uint32_t)internal_state.status == SMB2_STATUS_SUCCESS &&
-                internal_state.decoded;
+      test_ok = query_internal_id(smb2, state.file_id, &internal) == 0 &&
+                (uint32_t)internal.status == SMB2_STATUS_SUCCESS &&
+                internal.decoded && internal.index_number == disk_file_id;
     }
-    if ((uint32_t)create_state.status == SMB2_STATUS_SUCCESS) {
-      raw_handle = smb2_fh_from_file_id(smb2, &create_state.file_id);
-      if (raw_handle == NULL || smb2_close(smb2, raw_handle) != 0) {
+    if ((uint32_t)state.status[0] == SMB2_STATUS_SUCCESS) {
+      directory_handle = smb2_fh_from_file_id(smb2, &state.file_id);
+      if (directory_handle == NULL ||
+          smb2_close(smb2, directory_handle) != 0) {
         test_ok = 0;
       }
     }
     test_ok = test_ok && query_status == SMB2_STATUS_SUCCESS &&
-              maximal_access == 0x001F019Fu && volume_id != 0 &&
-              directory_file_id != 0 &&
-              directory_file_id == disk_file_id &&
-              disk_file_id == internal_state.index_number;
-    printf("  CREATE status=0x%08x contexts=%lu oplock=0x%02x MxAc=0x%08x/0x%08x\n",
-           (unsigned)create_state.status,
-           (unsigned long)create_state.create_context_length,
-           (unsigned)create_state.oplock_level, (unsigned)query_status,
-           (unsigned)maximal_access);
-    printf("  FileId directory=0x%016llx QFid=0x%016llx internal=0x%016llx volume=0x%016llx\n",
-           (unsigned long long)directory_file_id,
+              maximal_access == 0x001F01FFu && disk_file_id != 0 &&
+              volume_id != 0;
+
+    printf("  Status CREATE/QD/QD=%08x/%08x/%08x callbacks=%d\n",
+           (unsigned)state.status[0], (unsigned)state.status[1],
+           (unsigned)state.status[2], state.completed);
+    printf("  Request NextCommand=%lu/%lu/%lu (capture=176/104/0)\n",
+           (unsigned long)state.request_next_command[0],
+           (unsigned long)state.request_next_command[1],
+           (unsigned long)state.request_next_command[2]);
+    printf("  NextCommand=%lu/%lu/%lu flags=%08x/%08x/%08x (%s)\n",
+           (unsigned long)state.next_command[0],
+           (unsigned long)state.next_command[1],
+           (unsigned long)state.next_command[2],
+           (unsigned)state.flags[0], (unsigned)state.flags[1],
+           (unsigned)state.flags[2], header_ok ? "COMPOUND" : "SPLIT");
+    printf("  Directory bytes=%lu zero-padding=%s MxAc=%08x/%08x\n",
+           (unsigned long)state.directory_output_length,
+           state.directory_padding_zero ? "PASS" : "FAIL",
+           (unsigned)query_status, (unsigned)maximal_access);
+    printf("  QFid=0x%016llx Internal=0x%016llx Volume=0x%016llx\n",
            (unsigned long long)disk_file_id,
-           (unsigned long long)internal_state.index_number,
+           (unsigned long long)internal.index_number,
            (unsigned long long)volume_id);
-    printf("RESULT TEST 17: %s\n", test_ok ? "PASS" : "FAIL");
+    printf("RESULT TEST 19: %s\n", test_ok ? "PASS" : "FAIL");
     failures += !test_ok;
   }
 

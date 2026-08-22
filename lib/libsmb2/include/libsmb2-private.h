@@ -235,6 +235,16 @@ struct smb2_context {
         struct smb2_pdu *outqueue;
         struct smb2_pdu *waitqueue;
 
+        /* Synchronous replies produced while a related compound request is
+         * being decoded.  A server must not send the first reply before it
+         * has seen the rest of the related chain: doing so loses the compound
+         * relationship that Windows uses for CREATE + QUERY_DIRECTORY. */
+        struct smb2_pdu *server_compound_reply;
+        struct smb2_pdu *server_compound_reply_tail;
+        uint16_t server_compound_request_count;
+        uint16_t server_compound_reply_count;
+        uint8_t server_compound_active;
+
         /*
          * For receiving PDUs
          */
@@ -275,6 +285,7 @@ struct smb2_context {
 
         /* last file_id in a create-reply, for "related requests" */
         smb2_file_id last_file_id;
+        uint8_t last_file_id_valid;
 
         /* Server capabilities */
         uint8_t supports_multi_credit;
@@ -406,6 +417,7 @@ int smb2_process_payload_variable(struct smb2_context *smb2,
 int smb2_get_fixed_size(struct smb2_context *smb2, struct smb2_pdu *pdu);
 
 struct smb2_pdu *smb2_find_pdu(struct smb2_context *smb2, uint64_t message_id);
+void smb2_flush_server_compound_replies(struct smb2_context *smb2);
 void smb2_free_iovector(struct smb2_context *smb2, struct smb2_io_vectors *v);
 
 void smb2_oplock_break_notify(struct smb2_context *smb2, int status, void *command_data, void *cb_data);

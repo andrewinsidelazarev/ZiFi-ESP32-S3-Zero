@@ -283,8 +283,13 @@ size_t directoryEncodedSize(uint8_t informationClass, const char* name) {
   return padTo8(fixed + strlen(name) * 2U);
 }
 
-uint64_t allocationSize(uint64_t size) {
-  return (size + 511U) & ~static_cast<uint64_t>(511U);
+uint64_t roundUpAllocationSize(uint32_t size, uint32_t allocationUnit) {
+  if (size == 0 || allocationUnit == 0) {
+    return 0;
+  }
+  const uint64_t units =
+      (static_cast<uint64_t>(size) + allocationUnit - 1U) / allocationUnit;
+  return units * allocationUnit;
 }
 
 void setExternalError(char* output, size_t capacity, const char* text) {
@@ -660,7 +665,6 @@ struct SmbServer::Impl {
         nextTreeId(kFirstTreeId),
         handles{},
         generationCounter(1),
-        lastCreatedSlot(-1),
         activeSlot(-1),
         activeMode(ActiveMode::kNone),
         activeLogicalOffset(0),
@@ -703,6 +707,8 @@ struct SmbServer::Impl {
         activeRandomRead(false),
         cachedFsInfo{},
         fsInfoValid(false),
+        fsInfoRefreshRequired(true),
+        allocationUnitBytes(0),
         volumeInfo{},
         sizeInfo{},
         fullSizeInfo{},
@@ -777,7 +783,6 @@ struct SmbServer::Impl {
   uint32_t nextTreeId;
   Handle handles[kHandleCount];
   uint32_t generationCounter;
-  int lastCreatedSlot;
   int activeSlot;
   ActiveMode activeMode;
   uint32_t activeLogicalOffset;
@@ -832,6 +837,12 @@ struct SmbServer::Impl {
   // приёма данных блокирует SMB-задачу, и Windows теряет сессию.
   VfsFsInfo cachedFsInfo;
   bool fsInfoValid;
+  // Геометрия FAT32 неизменна, пока плагин монопольно владеет картой. В
+  // начале каждого запуска сбрасываем оба уровня кэша, затем один раз читаем
+  // размер кластера до первого ответа CREATE. Изменения файлов инвалидируют
+  // свободное место, но не эту величину.
+  bool fsInfoRefreshRequired;
+  uint32_t allocationUnitBytes;
   smb2_file_fs_volume_info volumeInfo;
   smb2_file_fs_size_info sizeInfo;
   smb2_file_fs_full_size_info fullSizeInfo;
@@ -919,6 +930,9 @@ struct SmbServer::Impl {
   // может заставить Wild Commander пересчитать всю FAT, а Проводник опрашивает
   // свободное место в течение всего копирования.
   bool loadFsInfo(VfsFsInfo& info, uint8_t& status);
+  bool ensureAllocationUnit(uint8_t& status);
+  uint64_t reportedAllocationSize(uint32_t physicalSize,
+                                  bool directory) const;
   void invalidateFsInfo();
   void dropFileCache();
   void beginFileCache(const char* path, uint32_t size);
@@ -958,7 +972,9 @@ struct SmbServer::Impl {
   bool makeInfoName(const Handle& handle);
 
   int allocateHandle(smb2_context* owner);
-  Handle* findHandle(const uint8_t fileId[SMB2_FD_SIZE], int* slot = nullptr);
+  Handle* findHandle(smb2_context* owner,
+                     const uint8_t fileId[SMB2_FD_SIZE],
+                     int* slot = nullptr);
   void releaseHandle(int slot);
   uint32_t allocateTree(bool ipc, smb2_context* owner);
   const Tree* findTree(uint32_t id) const;
@@ -1105,6 +1121,9 @@ bool SmbServer::Impl::start(const uint8_t* payload, uint16_t length,
   lastProgressText[0] = 0;
   allocateDirectoryBatch();
   resetHandles();
+  fsInfoValid = false;
+  fsInfoRefreshRequired = true;
+  allocationUnitBytes = 0;
   memset(&server, 0, sizeof(server));
   server.fd = -1;
   server.port = portValue;
@@ -1341,7 +1360,6 @@ size_t SmbServer::Impl::clientCount() const {
 void SmbServer::Impl::resetHandles() {
   memset(trees, 0, sizeof(trees));
   memset(handles, 0, sizeof(handles));
-  lastCreatedSlot = -1;
   activeSlot = -1;
   activeMode = ActiveMode::kNone;
   activeLogicalOffset = 0;
@@ -1871,9 +1889,6 @@ void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
       invalidateParent(handle.path);
     }
     memset(&handle, 0, sizeof(handle));
-    if (lastCreatedSlot == static_cast<int>(index)) {
-      lastCreatedSlot = -1;
-    }
     if (activeSlot == static_cast<int>(index)) {
       activeSlot = -1;
       activeMode = ActiveMode::kNone;
@@ -2831,6 +2846,17 @@ void SmbServer::Impl::updateSharedPhysicalSize(const char* path,
 
 bool SmbServer::Impl::loadFsInfo(VfsFsInfo& info, uint8_t& status) {
   status = 0;
+  if (fsInfoRefreshRequired) {
+    VfsResult invalidateResult = {};
+    if (!closeActive(true) ||
+        !requestVfs(VfsOperation::kInvalidateFsInfo, nullptr, 0,
+                    invalidateResult, kNormalVfsTimeoutMs)) {
+      status = invalidateResult.status;
+      return false;
+    }
+    fsInfoRefreshRequired = false;
+    fsInfoValid = false;
+  }
   if (fsInfoValid) {
     info = cachedFsInfo;
     return true;
@@ -2843,6 +2869,15 @@ bool SmbServer::Impl::loadFsInfo(VfsFsInfo& info, uint8_t& status) {
     return false;
   }
   cachedFsInfo = result.fsInfo;
+  const uint64_t allocationUnit =
+      static_cast<uint64_t>(cachedFsInfo.bytesPerSector) *
+      cachedFsInfo.sectorsPerCluster;
+  if (allocationUnit == 0 || allocationUnit > UINT32_MAX ||
+      cachedFsInfo.totalClusters == 0) {
+    snprintf(lastVfsError, sizeof(lastVfsError), "fs-info-geometry");
+    return false;
+  }
+  allocationUnitBytes = static_cast<uint32_t>(allocationUnit);
   if ((cachedFsInfo.flags & 0x04) == 0 ||
       cachedFsInfo.freeClusters > cachedFsInfo.totalClusters) {
     cachedFsInfo.freeClusters = cachedFsInfo.totalClusters / 2;
@@ -2851,6 +2886,26 @@ bool SmbServer::Impl::loadFsInfo(VfsFsInfo& info, uint8_t& status) {
   fsInfoValid = true;
   info = cachedFsInfo;
   return true;
+}
+
+bool SmbServer::Impl::ensureAllocationUnit(uint8_t& status) {
+  if (allocationUnitBytes != 0) {
+    status = 0;
+    return true;
+  }
+  VfsFsInfo info = {};
+  return loadFsInfo(info, status) && allocationUnitBytes != 0;
+}
+
+uint64_t SmbServer::Impl::reportedAllocationSize(
+    uint32_t physicalSize, bool directory) const {
+  // FAT32 не поддерживает sparse-файлы. Для обычного файла занятое место —
+  // физическая длина, округлённая до кластера; каталогам MS-FSCC/Samba
+  // возвращают ноль. Логический SET_EOF reserve сюда не входит, пока кластеры
+  // действительно не материализованы на SD.
+  return directory
+             ? 0
+             : roundUpAllocationSize(physicalSize, allocationUnitBytes);
 }
 
 bool SmbServer::Impl::normalizePath(
@@ -3002,20 +3057,17 @@ int SmbServer::Impl::allocateHandle(smb2_context* owner) {
 }
 
 SmbServer::Impl::Handle* SmbServer::Impl::findHandle(
-    const uint8_t fileId[SMB2_FD_SIZE], int* slot) {
+    smb2_context* owner, const uint8_t fileId[SMB2_FD_SIZE], int* slot) {
   int found = -1;
-  if (isCompoundFileId(fileId)) {
-    found = lastCreatedSlot;
-  } else if (readLe32(fileId) == kFileIdMagic) {
+  if (readLe32(fileId) == kFileIdMagic) {
     const uint32_t encodedSlot = readLe32(fileId + 8);
     if (encodedSlot >= 1 && encodedSlot <= kHandleCount) {
       found = static_cast<int>(encodedSlot - 1);
     }
   }
   if (found < 0 || static_cast<size_t>(found) >= kHandleCount ||
-      !handles[found].used ||
-      (!isCompoundFileId(fileId) &&
-       memcmp(handles[found].fileId, fileId, SMB2_FD_SIZE) != 0)) {
+      !handles[found].used || handles[found].owner != owner ||
+      memcmp(handles[found].fileId, fileId, SMB2_FD_SIZE) != 0) {
     return nullptr;
   }
   if (slot != nullptr) {
@@ -3032,9 +3084,6 @@ void SmbServer::Impl::releaseHandle(int slot) {
     closeActive(true);
   }
   memset(&handles[slot], 0, sizeof(handles[slot]));
-  if (lastCreatedSlot == slot) {
-    lastCreatedSlot = -1;
-  }
 }
 
 uint32_t SmbServer::Impl::visibleSize(const Handle& handle) const {
@@ -3047,8 +3096,8 @@ uint64_t SmbServer::Impl::directoryFileId(const char* path) const {
   return appendDirectoryFileId(kDirectoryFileIdOffset, path);
 }
 
-uint64_t SmbServer::Impl::directoryChildFileId(const char* parentPath,
-                                               const char* name) const {
+uint64_t SmbServer::Impl::directoryChildFileId(
+    const char* parentPath, const char* name) const {
   const char* parent = parentPath == nullptr || parentPath[0] == 0
                            ? "/"
                            : parentPath;
@@ -3088,9 +3137,8 @@ void SmbServer::Impl::fillCreateContextReply(
     }
   }
 
-  // По MS-SMB2 3.3.5.9.9 QFid не возвращается для durable reconnect. Сам
-  // сервер durable handles не выдаёт, но входной список всё равно разбирается
-  // буквально, чтобы не создать противоречивый ответ на reconnect-запрос.
+  // MS-SMB2 3.3.5.9.9 forbids QFid on durable reconnect. Durable handles are
+  // not issued here, but the incoming context list still has to be honored.
   if (requested.queryOnDiskId && !requested.durableReconnect) {
     uint8_t data[32] = {};
     writeLe64Local(data, diskFileId);
@@ -3140,12 +3188,14 @@ void SmbServer::Impl::fillDirectoryInfo(
   info.change_time = fileTime;
   info.file_index = index;
   info.end_of_file = size;
-  info.allocation_size = allocationSize(size);
+  info.allocation_size = reportedAllocationSize(size, directory);
   info.file_attributes = directory ? SMB2_FILE_ATTRIBUTE_DIRECTORY
                                    : SMB2_FILE_ATTRIBUTE_ARCHIVE;
-  // FILE_ID_*_DIRECTORY_INFORMATION, QFid и FileInternalInformation обязаны
-  // возвращать один идентификатор для одного объекта. Хеш basename здесь при
-  // хеше полного handle->path после CREATE делал один файл двумя объектами.
+  // FILE_ID_*_DIRECTORY_INFORMATION и FILE_INTERNAL_INFORMATION обязаны
+  // возвращать один идентификатор для одного объекта. Explorer сначала
+  // запоминает FileId из каталога, затем сверяет его после CREATE. Хеш только
+  // basename здесь, при хеше полного handle->path в QUERY_INFO, заставлял
+  // оболочку считать открытый файл другим объектом и не начинать READ.
   info.file_id = directoryChildFileId(parentPath, name);
   info.name = name;
 }
@@ -3925,11 +3975,6 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
   if (self == nullptr || request == nullptr || reply == nullptr) {
     return createStatus(smb2, request, SMB2_STATUS_INVALID_PARAMETER);
   }
-  // A related compound request uses an all-ones FileId to refer to the
-  // immediately preceding successful CREATE.  Clear the alias before doing
-  // any work so a failed CREATE followed by CLOSE cannot close an older
-  // handle left by a previous compound request.
-  self->lastCreatedSlot = -1;
   RequestedCreateContexts requestedContexts;
   if (!parseRequestedCreateContexts(*request, requestedContexts)) {
     return createStatus(smb2, request, SMB2_STATUS_INVALID_PARAMETER);
@@ -3962,13 +4007,12 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
     handle.rpcContextId = 0xFFFF;
     snprintf(handle.path, sizeof(handle.path), "srvsvc");
     memcpy(reply->file_id, handle.fileId, SMB2_FD_SIZE);
-    self->lastCreatedSlot = slot;
     reply->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
     reply->create_action = kCreateOpened;
     reply->file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
     self->fillCreateContextReply(
         requestedContexts, self->directoryFileId(handle.path),
-        0x005A584556495043ULL, reply->change_time, 0x001F00A9, *reply);
+        0x005A584556495043ULL, reply->change_time, 0x001F00A9UL, *reply);
     self->sendOperation("PIPE", "srvsvc");
     return 0;
   }
@@ -3980,20 +4024,20 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
     return createStatus(smb2, request, SMB2_STATUS_OBJECT_NAME_INVALID);
   }
 
-  uint64_t volumeId = 0;
-  if (requestedContexts.queryOnDiskId &&
-      !requestedContexts.durableReconnect) {
-    VfsFsInfo fsInfo = {};
-    uint8_t fsStatus = 0;
-    if (!self->loadFsInfo(fsInfo, fsStatus)) {
-      return createStatus(smb2, request,
-                          fsStatus != 0 ? smbStatusFromFilex(fsStatus)
-                                        : SMB2_STATUS_IO_DEVICE_ERROR);
-    }
-    // QFid требует 64-битный идентификатор тома. Для FAT естественный и
-    // стабильный источник — записанный в boot sector Volume Serial Number.
-    volumeId = fsInfo.serial;
+  // AllocationSize во всех последующих ответах обязан быть кратен размеру
+  // кластера, который этот же сервер сообщает через FileFsSizeInformation.
+  // Геометрию читаем до STAT/создания, чтобы при ошибке не оставить на SD
+  // объект после неуспешного CREATE.
+  uint8_t fsStatus = 0;
+  if (!self->ensureAllocationUnit(fsStatus)) {
+    return createStatus(smb2, request,
+                        fsStatus != 0 ? smbStatusFromFilex(fsStatus)
+                                      : SMB2_STATUS_IO_DEVICE_ERROR);
   }
+  const uint64_t volumeId =
+      requestedContexts.queryOnDiskId && !requestedContexts.durableReconnect
+          ? self->cachedFsInfo.serial
+          : 0;
 
   VfsResult statResult;
   const bool exists = self->statPath(path, statResult);
@@ -4131,7 +4175,6 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
   handle.sizeReserved = size > physicalSize;
   snprintf(handle.path, sizeof(handle.path), "%s", path);
   memcpy(reply->file_id, handle.fileId, SMB2_FD_SIZE);
-  self->lastCreatedSlot = slot;
 
   const uint64_t fileTime = self->currentFileTime();
   reply->creation_time = fileTime;
@@ -4140,14 +4183,14 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
   reply->change_time = fileTime;
   reply->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
   reply->create_action = action;
-  reply->allocation_size = allocationSize(size);
+  reply->allocation_size =
+      self->reportedAllocationSize(physicalSize, directory);
   reply->end_of_file = size;
   reply->file_attributes = directory ? SMB2_FILE_ATTRIBUTE_DIRECTORY
                                      : SMB2_FILE_ATTRIBUTE_ARCHIVE;
   self->fillCreateContextReply(
       requestedContexts, self->directoryFileId(handle.path), volumeId,
-      reply->change_time,
-      directory ? 0x001F01FFUL : 0x001F019FUL, *reply);
+      reply->change_time, directory ? 0x001F01FFUL : 0x001F019FUL, *reply);
   diagnosticLogEvent("SMB create-ok slot=%d dir=%u size=%lu path=%s", slot,
                      directory ? 1U : 0U,
                      static_cast<unsigned long>(size), path);
@@ -4167,7 +4210,7 @@ int SmbServer::Impl::closeHandler(smb2_server* serverValue,
   int slot = -1;
   Handle* handle = self == nullptr || request == nullptr
                        ? nullptr
-                       : self->findHandle(request->file_id, &slot);
+                       : self->findHandle(smb2, request->file_id, &slot);
   if (handle == nullptr) {
     return replyStatus(smb2, SMB2_CLOSE, SMB2_STATUS_FILE_CLOSED);
   }
@@ -4204,7 +4247,8 @@ int SmbServer::Impl::closeHandler(smb2_server* serverValue,
   memset(reply, 0, sizeof(*reply));
   if ((request->flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB) != 0) {
     reply->flags = SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB;
-    reply->allocation_size = allocationSize(handle->physicalSize);
+    reply->allocation_size = self->reportedAllocationSize(
+        handle->physicalSize, handle->directory);
     reply->end_of_file = handle->physicalSize;
     reply->file_attributes = handle->directory
                                  ? SMB2_FILE_ATTRIBUTE_DIRECTORY
@@ -4247,7 +4291,7 @@ int SmbServer::Impl::flushHandler(smb2_server* serverValue,
   int slot = -1;
   Handle* handle = self == nullptr || request == nullptr
                        ? nullptr
-                       : self->findHandle(request->file_id, &slot);
+                       : self->findHandle(smb2, request->file_id, &slot);
   if (handle == nullptr) {
     return replyStatus(smb2, SMB2_FLUSH, SMB2_STATUS_INVALID_HANDLE);
   }
@@ -4279,7 +4323,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   int slot = -1;
   Handle* handle = self == nullptr || request == nullptr
                        ? nullptr
-                       : self->findHandle(request->file_id, &slot);
+                       : self->findHandle(smb2, request->file_id, &slot);
   if (handle == nullptr || handle->directory) {
     diagnosticLogEvent("SMB read-invalid slot=%d", slot);
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_INVALID_HANDLE);
@@ -4427,7 +4471,7 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
   int slot = -1;
   Handle* handle = self == nullptr || request == nullptr
                        ? nullptr
-                       : self->findHandle(request->file_id, &slot);
+                       : self->findHandle(smb2, request->file_id, &slot);
   if (handle == nullptr || handle->directory) {
     return replyStatus(smb2, SMB2_WRITE, SMB2_STATUS_INVALID_HANDLE);
   }
@@ -4648,7 +4692,7 @@ int SmbServer::Impl::ioctlHandler(smb2_server* serverValue,
   }
   if (self != nullptr && fsctlRequest && reply != nullptr &&
       request->ctl_code == SMB2_FSCTL_PIPE_TRANSCEIVE) {
-    Handle* handle = self->findHandle(request->file_id);
+    Handle* handle = self->findHandle(smb2, request->file_id);
     if (handle == nullptr || !handle->pipe) {
       status = SMB2_STATUS_FILE_CLOSED;
       diagnosticLogEvent("SRVSVC invalid-handle");
@@ -4831,7 +4875,7 @@ int SmbServer::Impl::queryDirectoryHandler(
   int slot = -1;
   Handle* handle = self == nullptr || request == nullptr
                        ? nullptr
-                       : self->findHandle(request->file_id, &slot);
+                       : self->findHandle(smb2, request->file_id, &slot);
   if (handle == nullptr || !handle->directory) {
     return replyStatus(smb2, SMB2_QUERY_DIRECTORY,
                        SMB2_STATUS_NOT_A_DIRECTORY);
@@ -4919,8 +4963,8 @@ int SmbServer::Impl::queryDirectoryHandler(
   snprintf(self->directoryName, sizeof(self->directoryName), "%s",
            result.name);
   self->fillDirectoryInfo(self->directoryInfo, handle->directoryIndex,
-                          result.isDirectory, result.size, handle->path,
-                          self->directoryName);
+                          result.isDirectory, result.size,
+                          handle->path, self->directoryName);
   reply->output_buffer =
       reinterpret_cast<uint8_t*>(&self->directoryInfo);
   reply->output_buffer_length = static_cast<uint32_t>(
@@ -4944,7 +4988,7 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
   Impl* self = from(serverValue);
   Handle* handle = self == nullptr || request == nullptr
                        ? nullptr
-                       : self->findHandle(request->file_id);
+                       : self->findHandle(smb2, request->file_id);
   if (handle == nullptr) {
     diagnosticLogEvent("SMB query-info invalid type=%u class=%u",
                        request == nullptr ? 0U : request->info_type,
@@ -4978,7 +5022,8 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
       }
       case SMB2_FILE_STANDARD_INFORMATION:
         memset(&self->standardInfo, 0, sizeof(self->standardInfo));
-        self->standardInfo.allocation_size = allocationSize(size);
+        self->standardInfo.allocation_size = self->reportedAllocationSize(
+            handle->physicalSize, handle->directory);
         self->standardInfo.end_of_file = size;
         self->standardInfo.number_of_links = 1;
         self->standardInfo.delete_pending = handle->deletePending;
@@ -5005,7 +5050,9 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
         self->allInfo.basic.last_write_time = fileTime;
         self->allInfo.basic.change_time = fileTime;
         self->allInfo.basic.file_attributes = attributes;
-        self->allInfo.standard.allocation_size = allocationSize(size);
+        self->allInfo.standard.allocation_size =
+            self->reportedAllocationSize(handle->physicalSize,
+                                         handle->directory);
         self->allInfo.standard.end_of_file = size;
         self->allInfo.standard.number_of_links = 1;
         self->allInfo.standard.delete_pending = handle->deletePending;
@@ -5032,7 +5079,8 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
         self->networkInfo.last_access_time = fileTime;
         self->networkInfo.last_write_time = fileTime;
         self->networkInfo.change_time = fileTime;
-        self->networkInfo.allocation_size = allocationSize(size);
+        self->networkInfo.allocation_size = self->reportedAllocationSize(
+            handle->physicalSize, handle->directory);
         self->networkInfo.end_of_file = size;
         self->networkInfo.file_attributes = attributes;
         output = &self->networkInfo;
@@ -5065,7 +5113,8 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
           self->streamInfo.stream_name = "::$DATA";
           self->streamInfo.stream_name_length = strlen("::$DATA");
           self->streamInfo.stream_size = size;
-          self->streamInfo.stream_allocation_size = allocationSize(size);
+          self->streamInfo.stream_allocation_size =
+              self->reportedAllocationSize(handle->physicalSize, false);
           output = &self->streamInfo;
           outputLength = sizeof(self->streamInfo);
         }
@@ -5206,7 +5255,7 @@ int SmbServer::Impl::setInfoHandler(smb2_server* serverValue,
   int slot = -1;
   Handle* handle = self == nullptr || request == nullptr
                        ? nullptr
-                       : self->findHandle(request->file_id, &slot);
+                       : self->findHandle(smb2, request->file_id, &slot);
   if (handle == nullptr || request->input_data == nullptr) {
     return replyStatus(smb2, SMB2_SET_INFO, SMB2_STATUS_INVALID_HANDLE);
   }

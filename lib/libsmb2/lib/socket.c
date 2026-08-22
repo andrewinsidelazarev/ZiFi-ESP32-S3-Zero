@@ -537,6 +537,9 @@ read_more_data:
                         *  the tree id to the request's tree id
                         */
                         pdu->header.message_id = smb2->hdr.message_id;
+                        pdu->header.flags = smb2->hdr.flags;
+                        pdu->header.next_command = smb2->hdr.next_command;
+                        pdu->header.session_id = smb2->hdr.session_id;
                         if (!(smb2->hdr.flags & SMB2_FLAGS_ASYNC_COMMAND)) {
                                 pdu->header.sync.tree_id = smb2->hdr.sync.tree_id;
                         }
@@ -849,11 +852,25 @@ read_more_data:
         is_chained = smb2->hdr.next_command;
 
         if (smb2_is_server(smb2)) {
+                if (!smb2->server_compound_active && is_chained) {
+                        smb2->server_compound_active = 1;
+                        smb2->server_compound_request_count = 0;
+                        smb2->server_compound_reply_count = 0;
+                        smb2->server_compound_reply = NULL;
+                        smb2->server_compound_reply_tail = NULL;
+                }
+                if (smb2->server_compound_active) {
+                        ++smb2->server_compound_request_count;
+                }
                 /* queue requests to correlate our replies we send back later */
                 SMB2_LIST_ADD_END(&smb2->waitqueue, pdu);
                 pdu->cb(smb2, smb2->hdr.status, pdu->payload, pdu->cb_data);
                 smb2->pdu = smb2->next_pdu;
                 smb2->next_pdu = NULL;
+                if (smb2->server_compound_active && !is_chained) {
+                        smb2->server_compound_active = 0;
+                        smb2_flush_server_compound_replies(smb2);
+                }
         } else {
                 pdu->cb(smb2, smb2->hdr.status, pdu->payload, pdu->cb_data);
                 if (!pdu->caller_frees_pdu) {

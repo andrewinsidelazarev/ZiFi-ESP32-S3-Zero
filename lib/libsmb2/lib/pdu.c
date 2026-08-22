@@ -697,27 +697,147 @@ smb2_correlate_reply(struct smb2_context *smb2, struct smb2_pdu *pdu)
         return ret;
 }
 
+static void
+smb2_hold_server_compound_reply(struct smb2_context *smb2,
+                                struct smb2_pdu *pdu)
+{
+        struct smb2_pdu *tail;
+        uint16_t count = 0;
+
+        if (smb2->server_compound_reply_tail) {
+                smb2->server_compound_reply_tail->next_compound = pdu;
+        } else {
+                smb2->server_compound_reply = pdu;
+        }
+
+        tail = pdu;
+        while (tail) {
+                ++count;
+                if (!tail->next_compound) {
+                        break;
+                }
+                tail = tail->next_compound;
+        }
+        smb2->server_compound_reply_tail = tail;
+        smb2->server_compound_reply_count += count;
+}
+
+static int
+smb2_server_replies_are_related(struct smb2_context *smb2,
+                                struct smb2_pdu *head)
+{
+        struct smb2_pdu *reply;
+        uint16_t index = 0;
+
+        if (!head || smb2->server_compound_reply_count < 2 ||
+            smb2->server_compound_reply_count !=
+                    smb2->server_compound_request_count) {
+                return 0;
+        }
+
+        for (reply = head; reply; reply = reply->next_compound, ++index) {
+                struct smb2_pdu *request =
+                        smb2_find_pdu(smb2, reply->header.message_id);
+                if (!request || reply->header.status == SMB2_STATUS_PENDING) {
+                        return 0;
+                }
+                if (index == 0) {
+                        if (request->header.flags &
+                            SMB2_FLAGS_RELATED_OPERATIONS) {
+                                return 0;
+                        }
+                } else if (!(request->header.flags &
+                             SMB2_FLAGS_RELATED_OPERATIONS)) {
+                        return 0;
+                }
+        }
+        return 1;
+}
+
+static void
+smb2_prepare_server_compound_reply(struct smb2_context *smb2,
+                                   struct smb2_pdu *head)
+{
+        struct smb2_pdu *reply;
+
+        for (reply = head; reply && reply->next_compound;
+             reply = reply->next_compound) {
+                struct smb2_pdu *next = reply->next_compound;
+                int i;
+                int offset = 0;
+
+                for (i = 0; i < reply->out.niov; ++i) {
+                        offset += (int)reply->out.iov[i].len;
+                }
+                reply->header.next_command = (uint32_t)offset;
+                next->header.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+        }
+}
+
+void
+smb2_flush_server_compound_replies(struct smb2_context *smb2)
+{
+        struct smb2_pdu *head = smb2->server_compound_reply;
+        int compound;
+
+        if (!head) {
+                smb2->server_compound_reply_tail = NULL;
+                smb2->server_compound_reply_count = 0;
+                smb2->server_compound_request_count = 0;
+                return;
+        }
+
+        compound = smb2_server_replies_are_related(smb2, head);
+        smb2->server_compound_reply = NULL;
+        smb2->server_compound_reply_tail = NULL;
+        smb2->server_compound_reply_count = 0;
+        smb2->server_compound_request_count = 0;
+
+        if (compound) {
+                smb2_prepare_server_compound_reply(smb2, head);
+                smb2_queue_pdu(smb2, head);
+                return;
+        }
+
+        /* Preserve the old behavior for unrelated, incomplete or asynchronous
+         * chains.  In particular, STATUS_PENDING must remain an independent
+         * interim response. */
+        while (head) {
+                struct smb2_pdu *next = head->next_compound;
+                head->next_compound = NULL;
+                head->header.next_command = 0;
+                head->header.flags &= ~SMB2_FLAGS_RELATED_OPERATIONS;
+                smb2_queue_pdu(smb2, head);
+                head = next;
+        }
+}
+
 void
 smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
 {
         struct smb2_pdu *p;
         uint64_t prev_compound_mid = 0;
 
+        if (smb2_is_server(smb2) && smb2->server_compound_active) {
+                smb2_hold_server_compound_reply(smb2, pdu);
+                return;
+        }
+
         /* Update all the PDU headers in this chain */
         for (p = pdu; p; p = p->next_compound) {
                 if (smb2_is_server(smb2)) {
                         /* set reply flag, servers will only reply */
-                        pdu->header.flags |= SMB2_FLAGS_SERVER_TO_REDIR;
+                        p->header.flags |= SMB2_FLAGS_SERVER_TO_REDIR;
 
                         /* set async flag for status==pending */
-                        if (pdu->header.status == SMB2_STATUS_PENDING) {
-                                pdu->header.flags |= SMB2_FLAGS_ASYNC_COMMAND;
+                        if (p->header.status == SMB2_STATUS_PENDING) {
+                                p->header.flags |= SMB2_FLAGS_ASYNC_COMMAND;
                         }
 
                         /* the server handler functions must set message id unless this
                          * is a negotiate request, in which case it should be 0
                          */
-                        if (!pdu->header.message_id && pdu->header.command != SMB2_NEGOTIATE) {
+                        if (!p->header.message_id && p->header.command != SMB2_NEGOTIATE) {
                                 smb2_set_error(smb2, "Queued pdu has no message id");
                                 smb2_free_pdu(smb2, pdu);
                                 return;

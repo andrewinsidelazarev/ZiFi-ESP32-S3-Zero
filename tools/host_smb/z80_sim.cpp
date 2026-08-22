@@ -539,28 +539,39 @@ void Z80Simulator::handleFsInfo() {
   const uint32_t free = static_cast<uint32_t>(
       std::min<uint64_t>(space.available / clusterBytes, total));
 
-  // VFS_FS_INFO v1: status + 48-byte payload. Старый 24-байтный ответ был
-  // достаточен, пока host-тесты не запрашивали сведения о томе, но реальный
-  // VfsClient закономерно отвергает его как fs-info-short.
+  // Ответ повторяет FILEX GET_FS_INFO: один байт статуса и 48-байтная
+  // структура версии 1. Старый 24-байтный макет не соответствовал реальному
+  // плагину и не позволял host-тесту проверить размер кластера.
   uint8_t answer[49] = {};
+  uint8_t* info = answer + 1;
   answer[0] = kStatusOk;
-  answer[1] = 48;
-  answer[2] = 1;
-  answer[3] = 0x04 | 0x08;  // свободные кластеры достоверны, метка тома есть
-  answer[4] = kSectorsPerCluster;
-  answer[5] = static_cast<uint8_t>(kBytesPerSector);
-  answer[6] = static_cast<uint8_t>(kBytesPerSector >> 8);
-  writeLe32(answer + 9, total);
-  writeLe32(answer + 13, free);
-  writeLe32(answer + 17, 0x9016'4EF8u);
-  std::memcpy(answer + 21, "HOSTSIM", 7);
-  writeLe32(answer + 33, total * kSectorsPerCluster);
-  writeLe32(answer + 37, 0xFFFFFFFFu);
-  answer[41] = 2;  // две FAT, как на обычной FAT32 SD-карте
-  answer[42] = 0;
-  answer[43] = 0;
-  answer[44] = 0;
-  writeLe32(answer + 45, total / 128u + 1u);
+  info[0] = 48;
+  info[1] = 1;
+  info[2] = 0x04 | 0x08;  // свободные кластеры достоверны, метка тома есть
+  info[3] = kSectorsPerCluster;
+  info[4] = static_cast<uint8_t>(kBytesPerSector);
+  info[5] = static_cast<uint8_t>(kBytesPerSector >> 8);
+  writeLe32(info + 8, total);
+  writeLe32(info + 12, free);
+  writeLe32(info + 16, 0x9016'4EF8u);
+  std::memset(info + 20, ' ', 11);
+  std::memcpy(info + 20, "HOSTSIM", 7);
+  const uint64_t totalSectors =
+      static_cast<uint64_t>(total) * kSectorsPerCluster;
+  writeLe32(info + 32,
+            static_cast<uint32_t>(std::min<uint64_t>(totalSectors,
+                                                     0xFFFFFFFFULL)));
+  writeLe32(info + 36, 0xFFFFFFFFUL);
+  info[40] = 2;  // две FAT, активна FAT0, зеркалирование включено
+  info[41] = 0;
+  info[42] = 0;
+  info[43] = 0;
+  const uint64_t fatBytes = (static_cast<uint64_t>(total) + 2U) * 4U;
+  const uint64_t fatSectors =
+      (fatBytes + kBytesPerSector - 1U) / kBytesPerSector;
+  writeLe32(info + 44,
+            static_cast<uint32_t>(std::min<uint64_t>(fatSectors,
+                                                     0xFFFFFFFFULL)));
   reply(kVfsFsInfo, answer, sizeof(answer));
 }
 

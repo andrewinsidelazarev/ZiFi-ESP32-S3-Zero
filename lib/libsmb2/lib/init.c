@@ -357,6 +357,11 @@ void smb2_destroy_context(struct smb2_context *smb2)
                 }
                 smb2_free_pdu(smb2, pdu);
         }
+        if (smb2->server_compound_reply) {
+                smb2_free_pdu(smb2, smb2->server_compound_reply);
+                smb2->server_compound_reply = NULL;
+                smb2->server_compound_reply_tail = NULL;
+        }
         if (smb2->pdu) {
                 struct smb2_pdu *pdu = smb2->pdu;
 

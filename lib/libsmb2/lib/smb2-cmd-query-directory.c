@@ -282,7 +282,12 @@ smb2_encode_query_directory_reply(struct smb2_context *smb2,
 
         len = rep->output_buffer_length;
         len = PAD_TO_32BIT(len);
-        buf = malloc(len);
+        /* Every alignment byte is part of the wire response.  malloc() left
+         * the gaps between FILE_*_DIRECTORY_INFORMATION records filled with
+         * unrelated heap data.  Apart from leaking memory contents, this made
+         * Explorer's directory parser see a response that varied from one
+         * request to the next. */
+        buf = calloc(len, sizeof(uint8_t));
         if (buf == NULL) {
                 smb2_set_error(smb2, "Failed to allocate output buf");
                 return -1;
