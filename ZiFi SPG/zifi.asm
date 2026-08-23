@@ -91,6 +91,10 @@ load_sw		ld a,0
 		cp save_file
 		jr c,do_after_load
 		call create_filename
+		call validate_zip_body
+		jr nc,do_after_load
+		xor a
+		ld (do_after_load+1),a
 do_after_load	ld a,0
 		cp save_file
 		jr c,1f
@@ -344,6 +348,86 @@ create_filename_ext_ready
 		ld (ix+thread.full_len),hl	; hl - low 16bit lenght
 		ret
 
+; Если имя оканчивается на .zip, тело обязано начинаться с допустимой ZIP
+; сигнатуры. Так PHP/HTML-ошибка или текст прокси никогда не запишется на SD
+; под видом архива. Для остальных форматов эта проверка ничего не меняет.
+validate_zip_body
+		ld hl,(ix+thread.file_ext)
+		ld a,(hl)
+		or #20
+		cp "z"
+		jr nz,validate_zip_not_zip
+		inc hl
+		ld a,(hl)
+		or #20
+		cp "i"
+		jr nz,validate_zip_not_zip
+		inc hl
+		ld a,(hl)
+		or #20
+		cp "p"
+		jr nz,validate_zip_not_zip
+		inc hl
+		ld a,(hl)
+		or a
+		jr nz,validate_zip_not_zip
+
+		ld a,(ix+thread.full_len_high)
+		or a
+		jr nz,validate_zip_signature
+		ld hl,(ix+thread.full_len)
+		ld de,4
+		or a
+		sbc hl,de
+		jr c,validate_zip_bad
+
+validate_zip_signature
+		ld a,(ix+thread.page)
+		call set_page1
+		ld hl,(ix+thread.adress)
+		ld a,(hl)
+		cp "P"
+		jr nz,validate_zip_bad
+		inc hl
+		ld a,(hl)
+		cp "K"
+		jr nz,validate_zip_bad
+		inc hl
+		ld a,(hl)
+		inc hl
+		cp #03
+		jr z,validate_zip_local
+		cp #05
+		jr z,validate_zip_empty
+		cp #07
+		jr nz,validate_zip_bad
+		ld a,(hl)
+		cp #08
+		jr nz,validate_zip_bad
+		or a
+		ret
+validate_zip_local
+		ld a,(hl)
+		cp #04
+		jr nz,validate_zip_bad
+		or a
+		ret
+validate_zip_empty
+		ld a,(hl)
+		cp #06
+		jr nz,validate_zip_bad
+		or a
+		ret
+validate_zip_not_zip
+		or a
+		ret
+validate_zip_bad
+		ld hl,net_bad_zip_msg
+		ld b,1
+		call zifi_log
+		scf
+		ret
+
 /*
 Address         Mode Name Description
 0x00EF..0xBFEF  R    DR   Data register. Get byte from input FIFO. Input FIFO must not be empty (IFR > 0).
@@ -475,15 +559,25 @@ zifi_get	call wait_frame
 		ld (readed_len_high+1),a
 
 		call Net_HttpGet
-		jr c,zifi_get_open_failed
+		jr c,zifi_get_open_timeout
 		or a
 		jr z,zifi_get_open_failed
+		ld hl,(NetHttpCode)
+		ld de,200
+		or a
+		sbc hl,de
+		jr c,zifi_get_http_status_failed
+		ld hl,(NetHttpCode)
+		ld de,300
+		or a
+		sbc hl,de
+		jr nc,zifi_get_http_status_failed
 
-; Тянуть данные, пока сервер не закроет соединение.
+; Тянуть данные до Content-Length либо пока сервер не закроет соединение.
 zifi_get_pump	call Net_Recv
 		jr c,zifi_get_recv_failed	; молчание/ошибка прошивки — обрыв
 		or a
-		jr nz,zifi_get_done	; сервер закрыл соединение
+		jp nz,zifi_get_done	; сервер закрыл соединение
 		ld bc,(NetChunkLen)
 		ld a,b
 		or c
@@ -493,6 +587,7 @@ zifi_get_pump	call Net_Recv
 ; store_body_byte сохраняет HL/DE/BC, поэтому цикл обходится без стека.
 zifi_get_store	ld a,(hl)
 		call store_body_byte
+		jr c,zifi_get_too_large
 		inc hl
 		dec bc
 		ld a,b
@@ -502,15 +597,19 @@ zifi_get_store	ld a,(hl)
 		ld hl,(NetChunkLen)
 		ld b,h
 		call view_progress_bar
+		call zifi_get_content_complete
+		jp z,zifi_get_done	; известная длина принята: TLS FIN не нужен
 		jr zifi_get_pump
 
+zifi_get_open_timeout
+		ld hl,net_open_timeout_msg
+		jr zifi_get_failed
 zifi_get_open_failed
 		ld hl,net_open_failed_msg
 		jr zifi_get_failed
 zifi_get_recv_failed
 		ld hl,net_recv_failed_msg
 
-; Ошибка остаётся видна во встроенной консоли zifi.spg. Если ESP прислал
 ; Ошибка остаётся видна во встроенной консоли zifi.spg: под названием операции
 ; печатается её причина.
 zifi_get_failed
@@ -518,7 +617,18 @@ zifi_get_failed
 		call zifi_log
 		call net_report_reason
 		call Net_Close
-		jr zifi_get_return
+		jp zifi_get_discard
+
+zifi_get_http_status_failed
+		ld hl,net_http_status_msg
+		jr zifi_get_rejected
+zifi_get_too_large
+		ld hl,net_too_large_msg
+zifi_get_rejected
+		ld b,1
+		call zifi_log
+		call Net_Close
+		jp zifi_get_discard
 
 ; Причина отказа: если ESP присылала пакет #EE, печатается её текст, например
 ; "recv:104"; иначе спрашиваем GET_STEP — метку шага, на котором встал
@@ -545,7 +655,55 @@ net_report_reason
 		ld b,1
 		jp zifi_log
 
+; Z=1, если ненулевой Content-Length в точности совпал с 24-битным счётчиком
+; принятых байтов. Ноль в NetHttpLen означает «заголовка длины не было».
+zifi_get_content_complete
+		ld hl,(NetHttpLen)
+		ld a,h
+		or l
+		ld hl,(NetHttpLen+2)
+		or h
+		or l
+		jr nz,.known
+.not_complete	ld a,1
+		or a
+		ret
+.known		ld a,(NetHttpLen+3)
+		or a
+		jr nz,.not_complete
+		ld a,(NetHttpLen+2)
+		ld hl,readed_len_high+1
+		cp (hl)
+		ret nz
+		ld hl,(NetHttpLen)
+		ld de,(readed_len_low+1)
+		or a
+		sbc hl,de
+		ret
+
 zifi_get_done	call Net_Close
+		; Если сервер назвал Content-Length, EOF обязан прийти ровно после
+		; этого числа байтов. Ноль означает, что заголовка длины не было.
+		ld hl,(NetHttpLen)
+		ld a,h
+		or l
+		ld hl,(NetHttpLen+2)
+		or h
+		or l
+		jr z,zifi_get_length_ok
+		ld a,(NetHttpLen+3)
+		or a
+		jr nz,zifi_get_length_failed
+		ld a,(NetHttpLen+2)
+		ld hl,readed_len_high+1
+		cp (hl)
+		jr nz,zifi_get_length_failed
+		ld hl,(NetHttpLen)
+		ld de,(readed_len_low+1)
+		or a
+		sbc hl,de
+		jr nz,zifi_get_length_failed
+zifi_get_length_ok
 		ld a,(readed_len_high+1)
 		or a
 		jr nz,zifi_get_return
@@ -556,13 +714,28 @@ zifi_get_done	call Net_Close
 		ld hl,net_empty_body_msg
 		ld b,1
 		call zifi_log
+		jr zifi_get_return
+zifi_get_length_failed
+		ld hl,net_short_body_msg
+		ld b,1
+		call zifi_log
+zifi_get_discard
+		xor a
+		ld (readed_len_high+1),a
+		ld hl,0
+		ld (readed_len_low+1),hl
 zifi_get_return	ld a,(readed_len_high+1)
 		ld c,a
 		ld hl,(readed_len_low+1)
 		ret
 
-net_open_failed_msg	db "HTTP request failed",0,0
+net_open_timeout_msg	db "HTTP(S) request timeout",0,0
+net_open_failed_msg	db "HTTP(S) request failed",0,0
 net_recv_failed_msg	db "NET_RECV failed",0,0
+net_http_status_msg	db "HTTP status is not 2xx",0,0
+net_short_body_msg	db "HTTP body length mismatch",0,0
+net_too_large_msg	db "ZIP exceeds 640 KiB buffer",0,0
+net_bad_zip_msg		db "Rejected: .zip body is not ZIP",0,0
 net_empty_body_msg	db "NET EOF: empty HTTP body",0,0
 net_diag_no_reply_msg	db "GET_STEP: no reply",0,0
 net_diag_empty_msg	db "GET_STEP: no error text",0,0
@@ -588,6 +761,15 @@ zifi_log
 ; состояния — почти сотня строк, каждая со своим поводом ошибиться.
 ; Регистры HL/DE/BC сохраняются, поэтому цикл вызова обходится без стека.
 store_body_byte
+		push af
+		ld a,(do_after_load+1)
+		cp save_file
+		jr nz,store_body_has_room
+		ld a,(readed_len_high+1)
+		cp #0a			; download_page..+#27 = 640 KiB
+		jr nc,store_body_full
+store_body_has_room
+		pop af
 		push hl
 		push de
 		push bc
@@ -622,6 +804,11 @@ store_body_done
 		pop bc
 		pop de
 		pop hl
+		or a
+		ret
+store_body_full
+		pop af
+		scf
 		ret
 
 
@@ -1289,10 +1476,23 @@ td1		exa
 ; 	in hl - adress:
 ;	http://zxaaa.untergrund.net/get.php?f=DEMO6/a_brief_history_of_vacuum_cleaner_nozzle_attachments.zip
 
-; Разобрать URL: адрес сервера и путь, каждый строкой с нулём на конце. Текст
-; HTTP-запроса тут больше не собирается — его составляет ESP по этим двум полям.
-parse_url	ld de,cmd_conn2site_adr
-pu1		ld a,(hl)	; пропустить http://
+; Разобрать HTTP/HTTPS URL: адрес сервера, порт и путь. Текст запроса и TLS
+; выполняет ESP; Z80 только передаёт 80 для http:// или 443 для https://.
+parse_url	ld de,80
+		ld (request_port),de
+		push hl
+		ld de,4
+		add hl,de
+		ld a,(hl)
+		or #20
+		pop hl
+		cp "s"
+		jr nz,parse_url_scheme_ready
+		ld de,443
+		ld (request_port),de
+parse_url_scheme_ready
+		ld de,cmd_conn2site_adr
+pu1		ld a,(hl)	; пропустить http:// или https://
 		inc hl
 		cp "/"
 		jr nz,pu1
@@ -1381,7 +1581,7 @@ site_list	dw download_site_list,gfx_site_list,music_site_list,press_site_list
 
 download_site_list	
 		db "Games: vtrd.in ",#0d,#0a, "http://ex.vtrd.in/vt/export.php?t=g",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
-		db "Games: prods.tslabs.info - ZX Enhanced",#0d,#0a, "http://prods.tslabs.info/prods_zifi.php?t=2",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Games: prods.tslabs.info - ZX Enhanced",#0d,#0a, "https://prods.tslabs.info/prods_zifi.php?t=2",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
 		db "Demos: bbb.retroscene.org",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=0",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
 		db " Classic demos",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=1",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
 		db " Most liked",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=2",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
@@ -1389,7 +1589,7 @@ download_site_list
 		db " ZX Enhanced",#0d,#0a, "http://bbb.retroscene.org/zxn_zifi.php?t=4",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
 
 		db "Demo Packs: vtrd.in",#0d,#0a, "http://ex.vtrd.in/vt/export.php?t=d",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
-		db "Demos: prods.tslabs.info - ZX Enhanced",#0d,#0a, "http://prods.tslabs.info/prods_zifi.php?t=1",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
+		db "Demos: prods.tslabs.info - ZX Enhanced",#0d,#0a, "https://prods.tslabs.info/prods_zifi.php?t=1",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
 		db "Demos: pouet.net - ZX Spectrum",#0d,#0a, "http://zifi.vtrd.in/pouet.php?src=pouet_zx",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
 		db "Demos: pouet.net - ZX Enhanced",#0d,#0a, "http://zifi.vtrd.in/pouet.php?src=pouet_zxe",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a
 		db "System: vtrd.in",#0d,#0a, "http://ex.vtrd.in/vt/export.php?t=s",#0d,#0a, save_file,download_page,#0d,#0a, " ",#0d,#0a, " ",#0d,#0a		
@@ -1505,11 +1705,19 @@ sites_list	dec a		; highlight menu gfx
 set_text_colors
 		call off_int_dma
 		call set_Textpage
+		; Text_page не входит в SPG как отдельный блок и после загрузчика может
+		; содержать его рабочий хвост. На EVO это видно буквально: первая строка
+		; экрана совпала с menu.tga.pix+2CF0 ("[WUWUWU[=)xx(KKJ"), а ниже
+		; остались цветные байты той же картинки. Прежний DMA_FILL с одинаковыми
+		; source/destination page это содержимое очищал ненадёжно. Обнуляем все
+		; 32 строки text mode (256 байт на строку) обычным LDIR до показа слоя.
+		xor a
 		ld hl,0
-		ld (#0000),hl
-		ld hl,clr_text_screen
-		call set_ports
-		
+		ld de,1
+		ld bc,#1fff
+		ld (hl),a
+		ldir
+
 		ld hl,#0080
 set_text_colors_color
 		ld a,#07
@@ -2477,17 +2685,9 @@ sum_list_lines	ld a,0
 		jr main_list_url		; paging for text files
 
 1		push hl
-		cp save_file			; проверка на файло для закачки
-		jr nz,not_unzip
-						; проверка на zip
-		ld de,zip_url_buffer_data
-		ld bc,#0d0a
-		call find_copy_char
-		ld a,#0d
-		ld (de),a		
-		ld hl,zip_url_buffer
-
-not_unzip	call parse_url
+		; Ссылка из каталога передаётся напрямую. Серверный unzipremote.php
+		; больше не участвует: HTTPS и сырой ZIP принимает ESP.
+		call parse_url
 		pop hl
 		call scan_0d
 		ld a,(hl)			; проверка на клик по списку сайтов в разделе
@@ -3209,18 +3409,6 @@ clr_analizator	defb #1a,low analizator_screen_adr	;
 		defb #27,DMA_FILL+DMA_ASZ+DMA_DALGN
 		db #ff
 
-clr_text_screen
-		defb #1a,0	;
-		defb #1b,0	;
-		defb #1c,Text_page	;
-		defb #1d,0	;
-		defb #1e,0	;
-		defb #1f,Text_page	;
-		defb #26,#ff	;
-		defb #28,32-1	;
-		defb #27,%00000100
-		db #ff
-
 link_page_copy	db #1a,0
 		db #1b,0
 		db #1c,download_page
@@ -3443,6 +3631,8 @@ ini_length		dw 0
 ; Путь файла на сервере строкой с нулём: его кладёт parse_url, а забирает
 ; NET_HTTP_GET. Текст самого запроса собирает ESP.
 request_path		ds 256
+; Порт текущего URL: 80 для http://, 443 для https://.
+request_port		dw 80
 ; Адрес сервера строкой с нулём на конце: его кладёт сюда parse_url, а берёт
 ; NET_OPEN. Раньше строка была частью команды AT+CIPSTART.
 cmd_conn2site_adr	ds #40
@@ -3465,9 +3655,6 @@ readed_len_high		ds 1
 
 ; Заготовки строк запроса удалены: «GET … HTTP/1.0», Host, User-Agent и
 ; Connection собирает ESP в http_get. На Z80 этой склейки больше нет.
-
-zip_url_buffer	db "http://zifi.vtrd.in/unzipremote.php?f="
-zip_url_buffer_data	ds 256
 
 list_search_db
 		db "Search:"

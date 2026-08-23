@@ -26,9 +26,12 @@ struct raw_async_read_state {
   uint32_t expected_length;
   uint64_t offset;
   int *completed_total;
+  int *event_counter;
   int completed;
   int pending_count;
   int final_count;
+  int pending_order;
+  int final_order;
   int final_status;
   int corrupted;
   uint16_t pending_command;
@@ -81,9 +84,10 @@ struct windows_compound_state {
   int context_copy_ok;
   uint32_t create_context_length;
   uint8_t create_context[128];
-  int directory_payload_valid;
-  int directory_padding_zero;
-  uint32_t directory_output_length;
+  int directory_payload_valid[2];
+  int directory_padding_zero[2];
+  int directory_entry_count[2];
+  uint32_t directory_output_length[2];
 };
 
 struct internal_id_state {
@@ -160,6 +164,7 @@ static void raw_async_read_cb(struct smb2_context *smb2, int status,
       (struct raw_async_read_state*)private_data;
   if ((uint32_t)status == SMB2_STATUS_PENDING) {
     ++state->pending_count;
+    state->pending_order = ++*state->event_counter;
     state->pending_command = smb2->hdr.command;
     state->pending_credit = smb2->hdr.credit_request_response;
     state->pending_flags = smb2->hdr.flags;
@@ -170,6 +175,7 @@ static void raw_async_read_cb(struct smb2_context *smb2, int status,
   }
 
   ++state->final_count;
+  state->final_order = ++*state->event_counter;
   state->final_status = status;
   state->final_command = smb2->hdr.command;
   state->final_credit = smb2->hdr.credit_request_response;
@@ -275,9 +281,14 @@ static void capture_compound_header(struct smb2_context *smb2,
   state->message_id[index] = smb2->hdr.message_id;
 }
 
-static int directory_padding_is_zero(const uint8_t *data, uint32_t length) {
+static int directory_padding_is_zero(const uint8_t *data, uint32_t length,
+                                     int *entry_count) {
   uint32_t offset = 0;
   int entries = 0;
+  if (entry_count == NULL) {
+    return 0;
+  }
+  *entry_count = 0;
   while (offset < length) {
     uint32_t next;
     uint32_t name_length;
@@ -306,6 +317,7 @@ static int directory_padding_is_zero(const uint8_t *data, uint32_t length) {
     }
     offset += next;
   }
+  *entry_count = entries;
   return entries > 0;
 }
 
@@ -341,12 +353,17 @@ static void windows_compound_directory_cb_index(
   struct smb2_query_directory_reply *reply =
       (struct smb2_query_directory_reply*)command_data;
   capture_compound_header(smb2, state, index, status);
-  if (index == 1 && (uint32_t)status == SMB2_STATUS_SUCCESS &&
+  if (index >= 1 && index <= 2 &&
+      (uint32_t)status == SMB2_STATUS_SUCCESS &&
       reply != NULL && reply->output_buffer != NULL) {
-    state->directory_output_length = reply->output_buffer_length;
-    state->directory_payload_valid = 1;
-    state->directory_padding_zero = directory_padding_is_zero(
-        reply->output_buffer, reply->output_buffer_length);
+    const int directory_index = index - 1;
+    state->directory_output_length[directory_index] =
+        reply->output_buffer_length;
+    state->directory_payload_valid[directory_index] = 1;
+    state->directory_padding_zero[directory_index] =
+        directory_padding_is_zero(
+            reply->output_buffer, reply->output_buffer_length,
+            &state->directory_entry_count[directory_index]);
   }
   ++state->completed;
 }
@@ -1960,9 +1977,10 @@ test_18:
 test_19:
   /* TEST 19: точная форма запроса Проводника при открытии каталога. Сервер
    * обязан вернуть CREATE + оба QUERY_DIRECTORY в одном compound-ответе,
+   * выдать каждым QUERY_DIRECTORY ровно одну потоковую запись,
    * разрешить all-ones related FileId в рамках этого соединения и обнулить
    * все байты выравнивания между directory records. */
-  printf("\n--- TEST 19: Windows related directory compound wire contract ---\n");
+  printf("\n--- TEST 19: Windows related streamed directory compound ---\n");
   {
     const char *directory = test_directory[0] == '\0' ? "" : test_directory;
     struct windows_compound_state state;
@@ -2018,9 +2036,14 @@ test_19:
     test_ok = test_ok && header_ok &&
         (uint32_t)state.status[0] == SMB2_STATUS_SUCCESS &&
         (uint32_t)state.status[1] == SMB2_STATUS_SUCCESS &&
-        (uint32_t)state.status[2] == SMB2_STATUS_NO_MORE_FILES &&
+        (uint32_t)state.status[2] == SMB2_STATUS_SUCCESS &&
         state.oplock_level == SMB2_OPLOCK_LEVEL_NONE &&
-        state.directory_payload_valid && state.directory_padding_zero;
+        state.directory_payload_valid[0] &&
+        state.directory_payload_valid[1] &&
+        state.directory_padding_zero[0] &&
+        state.directory_padding_zero[1] &&
+        state.directory_entry_count[0] == 1 &&
+        state.directory_entry_count[1] == 1;
 
     if (test_ok) {
       test_ok = inspect_windows_create_contexts(
@@ -2056,9 +2079,13 @@ test_19:
            (unsigned long)state.next_command[2],
            (unsigned)state.flags[0], (unsigned)state.flags[1],
            (unsigned)state.flags[2], header_ok ? "COMPOUND" : "SPLIT");
-    printf("  Directory bytes=%lu zero-padding=%s MxAc=%08x/%08x\n",
-           (unsigned long)state.directory_output_length,
-           state.directory_padding_zero ? "PASS" : "FAIL",
+    printf("  Directory bytes=%lu/%lu entries=%d/%d zero-padding=%s/%s\n",
+           (unsigned long)state.directory_output_length[0],
+           (unsigned long)state.directory_output_length[1],
+           state.directory_entry_count[0], state.directory_entry_count[1],
+           state.directory_padding_zero[0] ? "PASS" : "FAIL",
+           state.directory_padding_zero[1] ? "PASS" : "FAIL");
+    printf("  MxAc=%08x/%08x\n",
            (unsigned)query_status, (unsigned)maximal_access);
     printf("  QFid=0x%016llx Internal=0x%016llx Volume=0x%016llx\n",
            (unsigned long long)disk_file_id,
@@ -2071,21 +2098,23 @@ test_19:
   if (only_test != NULL) goto done;
 
 test_20:
-  /* TEST 20: точный CopyFile READ burst для файла 600001 байт. Каждый
-   * отложенный READ обязан сначала получить самостоятельный STATUS_PENDING,
-   * затем финальный async-ответ с тем же AsyncId. Именно отсутствие pending
-   * оставляло поздние блоки без ответа дольше таймаута Windows. */
-  printf("\n--- TEST 20: CopyFile async READ interim/final wire contract ---\n");
+  /* TEST 20: клиент ставит 64 READ, но сервер физически обслуживает один.
+   * STATUS_PENDING должен сдвигаться вместе с единственным сервисным окном:
+   * следующий READ становится async только после финала предыдущего. Поэтому
+   * число ожидающих на сервере определяется постоянным SMB credit window, а
+   * не числом блоков в файле. */
+  printf("\n--- TEST 20: bounded sliding READ credit window ---\n");
   {
     const uint32_t chunk_size = 65536;
-    const uint32_t file_size = 600001;
-    const int read_count = 10;
-    struct raw_async_read_state states[10];
+    const int read_count = 64;
+    const uint32_t file_size = (read_count - 1) * chunk_size + 15704;
+    struct raw_async_read_state states[64];
     uint8_t *write_buffer = (uint8_t*)malloc(chunk_size);
     struct smb2fh *write_handle = NULL;
     struct smb2fh *read_handle = NULL;
     struct probe_fh_mirror *mirror = NULL;
     int completed = 0;
+    int event_counter = 0;
     int queued = 0;
     int old_passthrough = 0;
     int test_ok = write_buffer != NULL;
@@ -2093,7 +2122,7 @@ test_20:
 
     memset(states, 0, sizeof(states));
     if (test_ok) {
-      write_handle = smb2_open(smb2, test_path("async_pending_600001.bin"),
+      write_handle = smb2_open(smb2, test_path("async_pending_many.bin"),
                                O_CREAT | O_TRUNC | O_WRONLY);
       test_ok = write_handle != NULL;
     }
@@ -2116,7 +2145,7 @@ test_20:
     free(write_buffer);
 
     if (test_ok) {
-      read_handle = smb2_open(smb2, test_path("async_pending_600001.bin"),
+      read_handle = smb2_open(smb2, test_path("async_pending_many.bin"),
                               O_RDONLY);
       test_ok = read_handle != NULL;
     }
@@ -2135,6 +2164,7 @@ test_20:
       states[index].expected_length = expected;
       states[index].offset = offset;
       states[index].completed_total = &completed;
+      states[index].event_counter = &event_counter;
       states[index].final_status = -1;
       if (states[index].buffer == NULL) {
         test_ok = 0;
@@ -2155,7 +2185,7 @@ test_20:
       ++queued;
     }
     if (queued != 0 &&
-        wait_for_count(smb2, &completed, queued, 180000) != 0) {
+        wait_for_count(smb2, &completed, queued, 360000) != 0) {
       printf("  Timeout/service failure: %s\n", smb2_get_error(smb2));
       test_ok = 0;
     }
@@ -2196,14 +2226,35 @@ test_20:
         test_ok = 0;
       }
       printf("  READ %d off=%llu pending=%d async=0x%016llx credit=%u "
-             "final=%08x/0x%016llx credit=%u bytes=%lu bad=%d\n",
+             "final=%08x/0x%016llx credit=%u bytes=%lu bad=%d order=%d/%d\n",
              index, (unsigned long long)state->offset, state->pending_count,
              (unsigned long long)state->pending_async_id,
              (unsigned)state->pending_credit, (unsigned)state->final_status,
              (unsigned long long)state->final_async_id,
              (unsigned)state->final_credit,
-             (unsigned long)state->expected_length, state->corrupted);
+             (unsigned long)state->expected_length, state->corrupted,
+             state->pending_order, state->final_order);
       free(states[index].buffer);
+    }
+    /* При глубине физического сервиса 1 порядок обязан быть строго
+     * PENDING(i), FINAL(i), PENDING(i+1). Если все PENDING пришли заранее,
+     * сервер снова превратил размер файла в глубину многоминутной очереди. */
+    {
+      int sliding_window_ok = states[0].pending_order > 0 &&
+                              states[0].pending_order < states[0].final_order;
+      for (index = 1; index < read_count; ++index) {
+        sliding_window_ok = sliding_window_ok &&
+                            states[index].pending_order >
+                                states[index - 1].final_order &&
+                            states[index].pending_order <
+                                states[index].final_order;
+      }
+      printf("  Sliding window: %s (READ0 %d/%d, READ%d %d/%d)\n",
+             sliding_window_ok ? "PASS" : "FAIL",
+             states[0].pending_order, states[0].final_order,
+             read_count - 1, states[read_count - 1].pending_order,
+             states[read_count - 1].final_order);
+      test_ok = test_ok && sliding_window_ok;
     }
     if (read_handle != NULL) {
       test_ok = smb2_close(smb2, read_handle) == 0 && test_ok;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -32,15 +33,34 @@ class NetClient {
   bool active();
 
  private:
+  bool openTls(const char* host, uint16_t port,
+               char* error, size_t errorSize);
+  bool applyRedirect(uint16_t& port, bool& useTls,
+                     char* error, size_t errorSize);
   bool readHttpHeader(uint16_t& statusCode, uint32_t& contentLength,
                       char* error, size_t errorSize);
+  bool tlsPeerClosed() const;
 
   WiFiClient client_;
+  WiFiClientSecure secureClient_;
+  WiFiClient* transport_;
+  bool transportTls_;
+  bool caBundleLoaded_;
+  bool bodyActive_;
+  bool bodyLengthKnown_;
+  uint32_t bodyExpected_;
+  uint32_t bodyReceived_;
+  uint32_t bodyLastActivityMs_;
   char proxyHost_[128];
   uint16_t proxyPort_;
   bool proxyEnabled_;
-  // Буфер заголовка живёт в объекте, а не на 6-КБ стеке сетевой задачи.
+  // Крупные HTTP-буферы живут в объекте, а не на стеке сетевой задачи: поверх
+  // httpGet на том же стеке выполняется ресурсоёмкое TLS-рукопожатие mbedTLS.
   char httpHeader_[2049];
+  char httpHost_[128];
+  char httpPath_[384];
+  char httpRequest_[640];
+  char redirectLocation_[512];
   uint8_t pending_[256];
   size_t pendingOffset_;
   size_t pendingLength_;

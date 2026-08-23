@@ -62,6 +62,8 @@ VFS_APPEND_SIZE equ #4000               ; один физический commit A
 VFS_FILEX_DATA  equ #8020
 VFS_FILEX_DATA_C equ #C020
 VFS_FILEX_WINDOW equ #3FE0
+        ASSERT VFS_FILEX_DATA = #8000+FILEX_BLOCK_SIZE
+        ASSERT VFS_FILEX_DATA+VFS_FILEX_WINDOW = #C000
 VFS_BLOCK_HEAD  equ 8
 VFS_CONT_HEAD   equ 4
 VFS_WINDOW_HEAD equ 8
@@ -811,8 +813,9 @@ Vfs_FatCompress:
         pop ix
         ret
 
-; Прочитать за один запрос до 16 КиБ. Wild Commander умеет LOAD512 с B=32,
-; поэтому сначала заполняется вся page1, затем она уходит серией UART-кадров.
+; Прочитать за один запрос до 16 КиБ. Последовательный режим заполняет page1
+; через LOAD512, позиционный — одним FILEX READ_AT на окно #3FE0; затем готовая
+; page1 уходит серией UART-кадров.
 ; Формат каждого ответа:
 ; Поля: [status][flags][seq][offset:2][total:2][crc16:2][data...].
 Vfs_ReadWindow:
@@ -840,7 +843,10 @@ Vfs_ReadWindow:
         ld hl,(VfsReadWanted)
         call Vfs_LengthFilex
         jp c,Vfs_ReadWindowFail
-        call Vfs_FilexReadPageFallback
+        ; Один FILEX READ_AT заполняет всё окно page1. Секторный fallback здесь
+        ; запрещён: он заново проверяет FENTRY и позиционируется для каждых 512
+        ; байт, превращая один сетевой READ 64 КиБ в 129 вызовов API 77.
+        call Vfs_FilexReadPage
         cp FILEX_STATUS_OK
         jr z,.random_status_ok
         cp FILEX_STATUS_EOF
@@ -1969,110 +1975,6 @@ Vfs_FilexPageCall_Resume:
         or a
         ret
 
-; Резервное позиционное чтение без замены code-page в окне #8000. Каждый
-; READ_AT принимает не больше одного сектора в VfsBuf, после чего данные
-; переносятся в page1. Это медленнее единого окна, но сохраняет прямое
-; 32-битное смещение и никогда не проходит содержимое файла от его начала.
-; Выход совпадает с Vfs_FilexReadPage: A=status, VfsFilexCount=прочитано.
-Vfs_FilexReadPageFallback:
-        call Vfs_MapData
-        ld hl,VFS_FILEX_DATA_C
-        ld (VfsFilexStagePtr),hl
-        ld hl,(VfsReadWanted)
-        ld (VfsFilexRemaining),hl
-        ld hl,0
-        ld (VfsFilexCount),hl
-        ld (VfsFilexCount+2),hl
-        ld hl,(VfsRandomOffset)
-        ld (VfsFilexWorkOffset),hl
-        ld hl,(VfsRandomOffset+2)
-        ld (VfsFilexWorkOffset+2),hl
-.next:
-        ld hl,(VfsFilexRemaining)
-        ld a,h
-        or l
-        jp z,.complete
-        ld de,IO_SIZE
-        or a
-        sbc hl,de
-        jr nc,.full_sector
-        ld bc,(VfsFilexRemaining)
-        jr .chunk_ready
-.full_sector:
-        ld bc,IO_SIZE
-.chunk_ready:
-        ld (VfsFilexChunk),bc
-        call Vfs_FilexReset
-        ld a,FILEX_OP_READ_AT
-        ld (VfsFilexBlock+FILEX_P_OPERATION),a
-        ld hl,(VfsFilexWorkOffset)
-        ld (VfsFilexBlock+FILEX_P_OFFSET),hl
-        ld hl,(VfsFilexWorkOffset+2)
-        ld (VfsFilexBlock+FILEX_P_OFFSET+2),hl
-        ld hl,VfsBuf
-        ld (VfsFilexBlock+FILEX_P_BUFFER),hl
-        ld bc,(VfsFilexChunk)
-        ld (VfsFilexBlock+FILEX_P_LENGTH),bc
-        ld hl,VfsFilexBlock
-        call WC_FILEX
-        ld (VfsFilexStatus),a
-        cp FILEX_STATUS_OK
-        jr z,.status_ready
-        cp FILEX_STATUS_EOF
-        jr nz,.failed
-.status_ready:
-        ld hl,(VfsFilexBlock+FILEX_P_RESULT_COUNT+2)
-        ld a,h
-        or l
-        jr nz,.internal
-        ld hl,(VfsFilexBlock+FILEX_P_RESULT_COUNT)
-        ld (VfsFilexPart),hl
-        ld a,h
-        or l
-        jr z,.internal
-        ld de,(VfsFilexChunk)
-        or a
-        sbc hl,de
-        jr z,.count_ready
-        jr nc,.internal
-        ld a,(VfsFilexStatus)
-        cp FILEX_STATUS_EOF
-        jr nz,.internal
-.count_ready:
-        ld hl,VfsBuf
-        ld de,(VfsFilexStagePtr)
-        ld bc,(VfsFilexPart)
-        ldir
-        ld (VfsFilexStagePtr),de
-
-        ld hl,(VfsFilexCount)
-        ld de,(VfsFilexPart)
-        add hl,de
-        ld (VfsFilexCount),hl
-        ld hl,(VfsFilexRemaining)
-        or a
-        sbc hl,de
-        ld (VfsFilexRemaining),hl
-        ld hl,(VfsFilexWorkOffset)
-        add hl,de
-        ld (VfsFilexWorkOffset),hl
-        ld hl,(VfsFilexWorkOffset+2)
-        ld de,0
-        adc hl,de
-        ld (VfsFilexWorkOffset+2),hl
-        ld a,(VfsFilexStatus)
-        cp FILEX_STATUS_EOF
-        jp nz,.next
-        ret
-.complete:
-        xor a
-        ret
-.internal:
-        ld a,FILEX_STATUS_INTERNAL
-.failed:
-        or a
-        ret
-
 Vfs_AddRandomCount:
         ld hl,(VfsRandomOffset)
         ld de,(VfsFilexCount)
@@ -2754,11 +2656,6 @@ VfsMetaBuffer:  ds FILEX_META_SIZE
 VfsFilexCaps:   db 0
 VfsFilexStatus: db 0
 VfsFilexCount:  ds 4
-VfsFilexStagePtr: ds 2
-VfsFilexRemaining: ds 2
-VfsFilexChunk:  ds 2
-VfsFilexPart:   ds 2
-VfsFilexWorkOffset: ds 4
 VfsRandomOffset:
                 ds 4
 VfsWriteCount:  dw 0                    ; распаковано в page1:#C000 (0..#4000)

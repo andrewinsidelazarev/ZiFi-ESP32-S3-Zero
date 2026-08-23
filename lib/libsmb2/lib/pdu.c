@@ -616,12 +616,15 @@ smb2_correlate_reply(struct smb2_context *smb2, struct smb2_pdu *pdu)
 
                 /* This server has one serialized physical FILEX backend.  Do
                  * not inflate Windows' credit window to 128: a large window
-                 * lets Explorer queue several 64 KiB requests and hides copy
-                 * progress until the whole queue completes.  Windows requires
-                 * at least four credits; with three, CopyFile stops after its
-                 * three preliminary READ requests and waits forever for the
-                 * fourth credit.  Afterwards grant back exactly what each
-                 * request consumed, keeping the connection at that depth. */
+                 * lets Explorer queue requests far ahead of the SD channel.
+                 * Windows requires at least four credits; with three,
+                 * CopyFile stops after its three preliminary READ requests and
+                 * waits forever for the fourth credit.  Afterwards grant back
+                 * exactly what each request consumed.  For ordinary responses
+                 * this keeps the connection at that depth.  A credit returned
+                 * by STATUS_PENDING permits one replacement request while the
+                 * original is still outstanding, so the application must only
+                 * promote one READ into its physical async service at a time. */
                 if (smb2_is_server(smb2)) {
                         credit_grant = req_pdu->header.credit_charge;
                         if (credit_grant == 0) {

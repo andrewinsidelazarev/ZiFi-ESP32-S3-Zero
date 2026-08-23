@@ -89,15 +89,22 @@ constexpr uint32_t kSmbAdvertisedIoSize = 64 * 1024;
 // 640 КиБ — это ровно образ TRD, самое частое, что копируют с карты ZX.
 constexpr uint32_t kFileCacheLimit = 640 * 1024;
 constexpr size_t kFileCachePsramFloor = 320 * 1024;
-// READ и WRITE_THROUGH удерживают свой SMB-кредит до физического завершения,
-// поэтому watchdog должен сработать раньше обычного 120-секундного PDU timeout.
+// После STATUS_PENDING READ больше не подчиняется обычному PDU timeout;
+// watchdog контролирует отсутствие физического прогресса самостоятельно.
+// WRITE_THROUGH удерживает свой SMB-кредит до физического завершения.
 constexpr uint32_t kAsyncIoProgressTimeoutMs = 90 * 1000;
 // Windows CopyFile держит несколько READ/WRITE одновременно и вправе присылать
-// их не по порядку файловых смещений. Каждый запрос получает собственный слот в
-// PSRAM, после чего core 1 обрабатывает последовательные offsets. Один общий
-// пул не конфликтует с отдельной областью кэша каталога и не удваивает память.
-// 12 слотов покрывают наблюдавшееся окно из десяти запросов с запасом.
-constexpr size_t kAsyncIoQueueDepth = 12;
+// их не по порядку файловых смещений. Шестнадцать слотов — физический пул
+// 64-КиБ буферов для READ/WRITE, но физический FILEX-канал к SD всё равно один.
+constexpr size_t kAsyncIoQueueDepth = 16;
+// В async переводим только тот READ, который реально может обслуживаться
+// сейчас. Остальные запросы сохраняются маленькими QueuedRead без interim-
+// ответа и поэтому продолжают удерживать свои SMB credits. После финала окно
+// сдвигается ровно на один READ: клиент не может выгрузить на сервер очередь,
+// растущую вместе с размером файла, а каждый promoted READ получает PENDING
+// непосредственно перед физической работой. Это flow control, а не предел
+// размера файла; физический backend сериализован, поэтому глубина сервиса 1.
+constexpr size_t kAsyncReadServiceDepth = 1;
 // Размер реестра соединений. Это НЕ предел: соединение сверх реестра всё
 // равно обслуживается, просто не попадает в учёт. Один Dolphin поднимает три
 // рабочих процесса разом, Проводник — свои, плюс соседние машины.
@@ -644,6 +651,21 @@ struct SmbServer::Impl {
     uint32_t lastProgressMs = 0;
   };
 
+  // Запрос сохранён внутри сервера, но ещё НЕ получил STATUS_PENDING. Исходный
+  // PDU остаётся синхронным и удерживает credit клиента. Когда предыдущий READ
+  // завершится, запрос получает рабочий буфер и только тогда становится async.
+  // Поэтому число таких дескрипторов ограничивается кредитным окном клиента,
+  // а не числом блоков в файле.
+  struct QueuedRead {
+    QueuedRead* next = nullptr;
+    smb2_context* context = nullptr;
+    uint64_t messageId = 0;
+    int slot = -1;
+    uint32_t generation = 0;
+    uint32_t offset = 0;
+    uint32_t length = 0;
+  };
+
   Impl(VfsBridge& bridgeValue, EventSink sink, void* sinkContext)
       : bridge(bridgeValue),
         eventSink(sink),
@@ -676,6 +698,9 @@ struct SmbServer::Impl {
         activeAsyncWrite(-1),
         asyncReadCount(0),
         asyncWriteCount(0),
+        queuedReadHead(nullptr),
+        queuedReadTail(nullptr),
+        queuedReadCount(0),
         portValue(kDefaultPort),
         share{},
         hostname{},
@@ -794,6 +819,9 @@ struct SmbServer::Impl {
   int activeAsyncWrite;
   size_t asyncReadCount;
   size_t asyncWriteCount;
+  QueuedRead* queuedReadHead;
+  QueuedRead* queuedReadTail;
+  size_t queuedReadCount;
 
   uint16_t portValue;
   char share[32];
@@ -879,8 +907,19 @@ struct SmbServer::Impl {
   bool allocateAsyncIoStorage();
   void releaseAsyncIoStorage();
   void resetAsyncIo();
+  void clearQueuedReads();
   int allocateAsyncRead();
   int allocateAsyncWrite();
+  bool enqueueAsyncRead(smb2_context* context, uint64_t messageId, int slot,
+                        uint32_t generation, uint32_t offset,
+                        uint32_t length);
+  bool beginAsyncRead(smb2_context* context, uint64_t messageId, int slot,
+                      uint32_t generation, uint32_t offset, uint32_t length,
+                      int index, bool sendPending);
+  void promoteQueuedReads();
+  void failQueuedReads(uint32_t status);
+  void dropQueuedReadsForOwner(smb2_context* owner);
+  bool cancelQueuedRead(smb2_context* owner, uint64_t messageId);
   int findReadyAsyncRead() const;
   int findReadyAsyncWrite() const;
   bool hasAsyncWritesForHandle(int slot, uint32_t generation) const;
@@ -1389,6 +1428,7 @@ void SmbServer::Impl::releaseAsyncIoStorage() {
 }
 
 void SmbServer::Impl::resetAsyncIo() {
+  clearQueuedReads();
   memset(asyncReads, 0, sizeof(asyncReads));
   memset(asyncWrites, 0, sizeof(asyncWrites));
   activeAsyncRead = -1;
@@ -1397,7 +1437,20 @@ void SmbServer::Impl::resetAsyncIo() {
   asyncWriteCount = 0;
 }
 
+void SmbServer::Impl::clearQueuedReads() {
+  while (queuedReadHead != nullptr) {
+    QueuedRead* const current = queuedReadHead;
+    queuedReadHead = current->next;
+    heap_caps_free(current);
+  }
+  queuedReadTail = nullptr;
+  queuedReadCount = 0;
+}
+
 int SmbServer::Impl::allocateAsyncRead() {
+  if (asyncReadCount >= kAsyncReadServiceDepth) {
+    return -1;
+  }
   if (asyncReadCount + asyncWriteCount >= kAsyncIoQueueDepth) {
     return -1;
   }
@@ -1421,6 +1474,202 @@ int SmbServer::Impl::allocateAsyncWrite() {
     }
   }
   return -1;
+}
+
+bool SmbServer::Impl::enqueueAsyncRead(smb2_context* context,
+                                       uint64_t messageId, int slot,
+                                       uint32_t generation, uint32_t offset,
+                                       uint32_t length) {
+  if (context == nullptr || messageId == 0 || slot < 0 || length == 0) {
+    return false;
+  }
+  QueuedRead* pending = static_cast<QueuedRead*>(heap_caps_calloc(
+      1, sizeof(QueuedRead), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (pending == nullptr) {
+    pending = static_cast<QueuedRead*>(heap_caps_calloc(
+        1, sizeof(QueuedRead), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  }
+  if (pending == nullptr) {
+    return false;
+  }
+  pending->context = context;
+  pending->messageId = messageId;
+  pending->slot = slot;
+  pending->generation = generation;
+  pending->offset = offset;
+  pending->length = length;
+  if (queuedReadTail == nullptr) {
+    queuedReadHead = pending;
+  } else {
+    queuedReadTail->next = pending;
+  }
+  queuedReadTail = pending;
+  ++queuedReadCount;
+  diagnosticLogEvent("SMB read-deferred off=%lu len=%lu waiting=%u",
+                     static_cast<unsigned long>(offset),
+                     static_cast<unsigned long>(length),
+                     static_cast<unsigned>(queuedReadCount));
+  return true;
+}
+
+bool SmbServer::Impl::beginAsyncRead(smb2_context* context,
+                                     uint64_t messageId, int slot,
+                                     uint32_t generation, uint32_t offset,
+                                     uint32_t length, int index,
+                                     bool sendPending) {
+  if (context == nullptr || messageId == 0 || index < 0 ||
+      static_cast<size_t>(index) >= kAsyncIoQueueDepth ||
+      asyncIoBuffers[index] == nullptr || asyncReads[index].used ||
+      asyncWrites[index].used) {
+    return false;
+  }
+
+  AsyncRead& pending = asyncReads[index];
+  pending = {};
+  pending.used = true;
+  pending.context = context;
+  pending.owner = context;
+  pending.messageId = messageId;
+  pending.slot = slot;
+  pending.generation = generation;
+  pending.offset = offset;
+  pending.length = length;
+  pending.lastProgressMs = millis();
+  ++asyncReadCount;
+
+  if (sendPending &&
+      !queueAsyncStatus(context, SMB2_READ, SMB2_STATUS_PENDING, messageId)) {
+    pending = {};
+    if (asyncReadCount != 0) {
+      --asyncReadCount;
+    }
+    return false;
+  }
+  return true;
+}
+
+void SmbServer::Impl::promoteQueuedReads() {
+  while (queuedReadHead != nullptr) {
+    const int index = allocateAsyncRead();
+    if (index < 0) {
+      return;
+    }
+
+    QueuedRead* const queued = queuedReadHead;
+    queuedReadHead = queued->next;
+    if (queuedReadHead == nullptr) {
+      queuedReadTail = nullptr;
+    }
+    if (queuedReadCount != 0) {
+      --queuedReadCount;
+    }
+
+    const bool validHandle =
+        queued->slot >= 0 &&
+        static_cast<size_t>(queued->slot) < kHandleCount &&
+        handles[queued->slot].used &&
+        handles[queued->slot].owner == queued->context &&
+        handles[queued->slot].generation == queued->generation;
+    if (!validHandle) {
+      const bool replyQueued = queueAsyncStatus(
+          queued->context, SMB2_READ, SMB2_STATUS_FILE_CLOSED,
+          queued->messageId);
+      smb2_context* const context = queued->context;
+      heap_caps_free(queued);
+      if (!replyQueued) {
+        smb2_close_context(context);
+      }
+      continue;
+    }
+
+    const bool started = beginAsyncRead(
+        queued->context, queued->messageId, queued->slot,
+        queued->generation, queued->offset, queued->length, index, true);
+    smb2_context* const context = queued->context;
+    const uint32_t offset = queued->offset;
+    heap_caps_free(queued);
+    if (!started) {
+      smb2_close_context(context);
+      return;
+    }
+    diagnosticLogEvent("SMB read-promoted off=%lu waiting=%u",
+                       static_cast<unsigned long>(offset),
+                       static_cast<unsigned>(queuedReadCount));
+  }
+}
+
+void SmbServer::Impl::failQueuedReads(uint32_t status) {
+  while (queuedReadHead != nullptr) {
+    QueuedRead* const queued = queuedReadHead;
+    queuedReadHead = queued->next;
+    smb2_context* const context = queued->context;
+    const bool replyQueued =
+        queueAsyncStatus(context, SMB2_READ, status, queued->messageId);
+    heap_caps_free(queued);
+    if (!replyQueued) {
+      smb2_close_context(context);
+    }
+  }
+  queuedReadTail = nullptr;
+  queuedReadCount = 0;
+}
+
+void SmbServer::Impl::dropQueuedReadsForOwner(smb2_context* owner) {
+  QueuedRead* previous = nullptr;
+  QueuedRead* current = queuedReadHead;
+  while (current != nullptr) {
+    QueuedRead* const next = current->next;
+    if (current->context != owner) {
+      previous = current;
+      current = next;
+      continue;
+    }
+    if (previous == nullptr) {
+      queuedReadHead = next;
+    } else {
+      previous->next = next;
+    }
+    if (queuedReadTail == current) {
+      queuedReadTail = previous;
+    }
+    heap_caps_free(current);
+    if (queuedReadCount != 0) {
+      --queuedReadCount;
+    }
+    current = next;
+  }
+}
+
+bool SmbServer::Impl::cancelQueuedRead(smb2_context* owner,
+                                       uint64_t messageId) {
+  QueuedRead* previous = nullptr;
+  QueuedRead* current = queuedReadHead;
+  while (current != nullptr) {
+    if (current->context != owner || current->messageId != messageId) {
+      previous = current;
+      current = current->next;
+      continue;
+    }
+    if (previous == nullptr) {
+      queuedReadHead = current->next;
+    } else {
+      previous->next = current->next;
+    }
+    if (queuedReadTail == current) {
+      queuedReadTail = previous;
+    }
+    const bool queued = queueAsyncStatus(
+        owner, SMB2_READ, SMB2_STATUS_CANCELLED, current->messageId);
+    heap_caps_free(current);
+    if (queuedReadCount != 0) {
+      --queuedReadCount;
+    }
+    if (!queued) {
+      smb2_close_context(owner);
+    }
+    return true;
+  }
+  return false;
 }
 
 int SmbServer::Impl::findReadyAsyncRead() const {
@@ -1524,6 +1773,12 @@ bool SmbServer::Impl::hasAsyncIoForOwner(smb2_context* owner) const {
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     if ((asyncReads[index].used && asyncReads[index].owner == owner) ||
         (asyncWrites[index].used && asyncWrites[index].owner == owner)) {
+      return true;
+    }
+  }
+  for (const QueuedRead* pending = queuedReadHead; pending != nullptr;
+       pending = pending->next) {
+    if (pending->context == owner) {
       return true;
     }
   }
@@ -1663,6 +1918,7 @@ void SmbServer::Impl::failAsyncReads(uint32_t status) {
     }
     diagnosticLogEvent("SMB bridge-reclaim-timeout op=%u",
                        static_cast<unsigned>(bridge.pendingOperation()));
+    failQueuedReads(status);
     return;
   }
   discardAsyncReadData(activeAsyncRead);
@@ -1681,6 +1937,7 @@ void SmbServer::Impl::failAsyncReads(uint32_t status) {
   }
   activeAsyncRead = -1;
   asyncReadCount = 0;
+  failQueuedReads(status);
   closeActive(false);
   if (contextToClose != nullptr) {
     smb2_close_context(contextToClose);
@@ -1800,6 +2057,9 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
   diagnosticLogEvent("SMB cleanup-owner client=%p count=%u known=%u", smb2,
                      static_cast<unsigned>(clientCount()),
                      knownClient(smb2) ? 1U : 0U);
+  // Эти запросы ещё синхронны и не владеют PSRAM/VFS. При разрушении transport
+  // их исходные PDU всё равно освобождает libsmb2.
+  dropQueuedReadsForOwner(smb2);
   bool hadAsyncIo = false;
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     AsyncRead& pending = asyncReads[index];
@@ -3868,6 +4128,11 @@ int SmbServer::Impl::serviceHandler(smb2_server* serverValue) {
       return 0;
     }
     self->pollAsyncRead();
+    // После финала сдвигаем кредитное окно ровно на один запрос. Старейший
+    // deferred READ только сейчас получает STATUS_PENDING и становится async;
+    // выданный interim credit позволяет Windows прислать ровно одну замену.
+    self->promoteQueuedReads();
+    self->pollAsyncRead();
     self->pollAsyncWrite();
   }
   return 0;
@@ -4438,38 +4703,26 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     self->beginFileCache(handle->path, handle->physicalSize);
   }
 
-  const int index = self->allocateAsyncRead();
+  const uint64_t messageId = smb2_get_last_request_message_id(smb2);
+  int index = -1;
+  // Не обгоняем уже поставленные в очередь READ. Пока единственный физический
+  // FILEX-сервис занят, сохраняем только метаданные и НЕ возвращаем interim-
+  // credit. Клиентское окно остаётся постоянным и не превращает весь файл в
+  // десятки многоминутных async-запросов.
+  if (self->queuedReadHead == nullptr) {
+    index = self->allocateAsyncRead();
+  }
   if (index < 0) {
-    return replyStatus(smb2, SMB2_READ,
-                       SMB2_STATUS_INSUFFICIENT_RESOURCES);
+    if (!self->enqueueAsyncRead(smb2, messageId, slot, handle->generation,
+                                offset, wanted)) {
+      return replyStatus(smb2, SMB2_READ,
+                         SMB2_STATUS_INSUFFICIENT_RESOURCES);
+    }
+    return 1;
   }
 
-  AsyncRead& pending = self->asyncReads[index];
-  pending = {};
-  pending.used = true;
-  pending.context = smb2;
-  pending.owner = smb2;
-  pending.messageId = smb2_get_last_request_message_id(smb2);
-  pending.slot = slot;
-  pending.generation = handle->generation;
-  pending.offset = offset;
-  pending.length = wanted;
-  pending.filled = 0;
-  pending.windowLength = 0;
-  pending.lastProgressMs = millis();
-  ++self->asyncReadCount;
-
-  // Физическое FILEX-чтение одного 64-КиБ SMB-запроса занимает несколько
-  // окон UART, а следующие READ ждут общий мост. Как Samba, переводим каждый
-  // такой запрос в SMB2 async до начала работы: Windows продлевает его таймер,
-  // получает credit в STATUS_PENDING, а libsmb2 сохраняет тот же AsyncId для
-  // финального READ-ответа. Без interim-ответа хвост CopyFile истекал примерно
-  // через минуту, хотя сервер продолжал последовательно читать данные.
-  if (replyStatus(smb2, SMB2_READ, SMB2_STATUS_PENDING) < 0) {
-    pending = {};
-    if (self->asyncReadCount != 0) {
-      --self->asyncReadCount;
-    }
+  if (!self->beginAsyncRead(smb2, messageId, slot, handle->generation, offset,
+                            wanted, index, true)) {
     return -1;
   }
 
@@ -4773,6 +5026,10 @@ int SmbServer::Impl::cancelHandler(smb2_server* serverValue,
   // По протоколу SMB2 CANCEL не имеет отдельного ответа.
   Impl* self = from(serverValue);
   if (self != nullptr) {
+    const uint64_t messageId = smb2_get_last_request_message_id(smb2);
+    if (self->cancelQueuedRead(smb2, messageId)) {
+      return 0;
+    }
     for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
       AsyncRead& read = self->asyncReads[index];
       if (read.used && read.context == smb2) {
@@ -4924,27 +5181,14 @@ int SmbServer::Impl::queryDirectoryHandler(
                        SMB2_STATUS_NO_MORE_FILES);
   }
   VfsResult result;
-  CacheLoadResult cacheResult = CacheLoadResult::kUnavailable;
   if (self->directoryCache.contains(handle->path)) {
-    cacheResult = CacheLoadResult::kReady;
-  } else if (!handle->directoryCacheUnavailable) {
-    cacheResult = self->ensureDirectoryCached(handle->path);
-    if (cacheResult == CacheLoadResult::kUnavailable) {
-      // Если конкретный снимок не поместился, не перечитываем весь каталог
-      // заново перед каждым следующим элементом этого же HANDLE.
-      handle->directoryCacheUnavailable = true;
-    }
-  }
-  if (cacheResult == CacheLoadResult::kIoError) {
-    return replyStatus(smb2, SMB2_QUERY_DIRECTORY,
-                       SMB2_STATUS_IO_DEVICE_ERROR);
-  }
-  if (cacheResult == CacheLoadResult::kReady) {
     return self->queryCachedDirectory(smb2, *handle, request, reply);
   }
 
-  // PSRAM отсутствует либо единственный каталог не поместился в лимит.
-  // Функциональность не теряется: остаётся старый потоковый путь через UART.
+  // Не строим снимок каталога синхронно из QUERY_DIRECTORY. Полный обход до
+  // EOF удерживал единственную SMB-задачу, а связанный compound-ответ Windows
+  // не отправлялся до завершения обхода. Потоковый путь ограничивает каждый
+  // ответ одной записью VFS; уже готовый снимок выше по-прежнему допустим.
   if (!self->activateDirectory(slot)) {
     return replyStatus(smb2, SMB2_QUERY_DIRECTORY,
                        SMB2_STATUS_IO_DEVICE_ERROR);

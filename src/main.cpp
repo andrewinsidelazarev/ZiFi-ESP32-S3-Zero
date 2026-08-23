@@ -36,7 +36,11 @@ namespace zifi {
 namespace {
 
 constexpr uint32_t kWifiTimeoutMs = 10000;
-constexpr uint32_t kNetworkStackBytes = 6144;
+// Обычному TCP хватало 6 КиБ, но цепочка processHttpGet -> WiFiClientSecure ->
+// mbedTLS использует существенно больше стека во время проверки сертификата и
+// рукопожатия. Переполнение этой задачи перезапускает ESP, а Z80 продолжает
+// ждать уже потерянный ответ NET_HTTP_GET. Оставляем измеримый запас.
+constexpr uint32_t kNetworkStackBytes = 16384;
 constexpr UBaseType_t kNetworkPriority = 2;
 constexpr BaseType_t kNetworkCore = 0;
 
@@ -1038,10 +1042,14 @@ void Application::handleSysInfo() {
   const int length = snprintf(
       reinterpret_cast<char*>(response_), sizeof(response_),
       "RAM:%uB PSRAM:%u/%uB Flash:%uB Sketch:%uB RST:%u "
-      "CORE:UART+VFS1/NET+EVT0 CTRL:%s VFSBUF:%s:%u+%u PROXY:%s FW:%s",
+      "CORE:UART+VFS1/NET+EVT0 NETSTK:%uB CTRL:%s "
+      "VFSBUF:%s:%u+%u PROXY:%s FW:%s",
       ESP.getFreeHeap(), ESP.getFreePsram(), ESP.getPsramSize(),
       ESP.getFlashChipSize(), ESP.getSketchSize(),
       static_cast<unsigned>(esp_reset_reason()),
+      static_cast<unsigned>(networkTask_ != nullptr
+                                ? uxTaskGetStackHighWaterMark(networkTask_)
+                                : 0),
       exchangeInPsram_ ? "PSRAM" : "RAM",
       vfsBridge_.buffersInPsram() ? "PSRAM" : "RAM",
       static_cast<unsigned>(vfsBridge_.ringCapacity()),
