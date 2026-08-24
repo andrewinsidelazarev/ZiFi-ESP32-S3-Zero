@@ -21,7 +21,7 @@
         dd 0
 
 .plugin_name
-        db "ZiFi Online Update v0.2"
+        db "ZiFi Online Update v0.3"
         ds 32-($-.plugin_name),' '
         db #03                        ; ручной запуск из меню плагинов
         ds 6

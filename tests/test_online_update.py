@@ -118,6 +118,8 @@ class OnlineUpdateTest(unittest.TestCase):
         )
         self.assertIn('db "Current: "', ui)
         self.assertIn('db "Available: "', ui)
+        self.assertIn('db "Progress: ["', ui)
+        self.assertIn("UI_PROGRESS_BAR_WIDTH equ 32", ui)
         self.assertIn("Same version. ENTER = reinstall", ui)
         self.assertIn("ENTER - install or reinstall", ui)
 
@@ -128,7 +130,7 @@ class OnlineUpdateTest(unittest.TestCase):
         self.assertEqual(plugin[32], 0x0A)
         self.assertEqual(plugin[34:36], b"\x01\x00")
         self.assertEqual(
-            plugin[165:197].rstrip(b" "), b"ZiFi Online Update v0.2"
+            plugin[165:197].rstrip(b" "), b"ZiFi Online Update v0.3"
         )
         self.assertEqual(plugin[197], 0x03)
 

@@ -3,6 +3,7 @@
 
 UI_STATUS_WIDTH  equ 38
 UI_VERSION_WIDTH equ 30
+UI_PROGRESS_BAR_WIDTH equ 32
 
 Ui_Open:
         ld ix,UpdateWindow
@@ -38,9 +39,46 @@ Ui_SetAvailable:
         ld b,UI_VERSION_WIDTH
         jp Ui_CopyField
 
-; A=0..100. Поле всегда занимает три позиции без ведущих нулей.
+; A=0..100. Полоса содержит 32 знакоместа, справа остаётся точное значение.
 Ui_SetProgress:
         ld (UiPercentValue),a
+
+        ; filled = floor(percent * 32 / 100). Произведение помещается в HL:
+        ; максимум 3200, поэтому достаточно обычного повторного вычитания.
+        ld l,a
+        ld h,0
+        add hl,hl
+        add hl,hl
+        add hl,hl
+        add hl,hl
+        add hl,hl
+        ld de,100
+        ld b,0
+.divide:
+        or a
+        sbc hl,de
+        jr c,.draw_bar
+        inc b
+        jr .divide
+.draw_bar:
+        ld hl,UiProgressBarField
+        ld c,UI_PROGRESS_BAR_WIDTH
+.bar_cell:
+        ld a,b
+        or a
+        jr z,.empty_cell
+        ld a,'#'
+        ld (hl),a
+        dec b
+        jr .next_cell
+.empty_cell:
+        ld a,'.'
+        ld (hl),a
+.next_cell:
+        inc hl
+        dec c
+        jr nz,.bar_cell
+
         ld hl,UiProgressField
         ld (hl),' '
         inc hl
@@ -150,7 +188,10 @@ UiAvailableField:
 UiStatusField:
         ds UI_STATUS_WIDTH,' '
         db #0D
-        db "Progress: "
+        db "Progress: ["
+UiProgressBarField:
+        ds UI_PROGRESS_BAR_WIDTH,'.'
+        db "] "
 UiProgressField:
         ds 3,' '
         db "%",#0D,#0D
