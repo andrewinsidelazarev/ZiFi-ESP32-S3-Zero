@@ -19,6 +19,7 @@
 #include "zifi/ftp_server.hpp"
 #include "zifi/net_client.hpp"
 #include "zifi/ntp_client.hpp"
+#include "zifi/online_updater.hpp"
 #include "zifi/ota_server.hpp"
 #include "zifi/protocol.hpp"
 #include "zifi/smb_server.hpp"
@@ -72,6 +73,49 @@ void copyIp(uint8_t* output, const IPAddress& address) {
   }
 }
 
+bool parseReleaseVersion(const char* text, unsigned& major, unsigned& minor,
+                         unsigned& patch) {
+  if (text == nullptr) {
+    return false;
+  }
+  int consumed = 0;
+  return sscanf(text, "s3-native-%u.%u.%u%n", &major, &minor, &patch,
+                &consumed) == 3 && text[consumed] == 0;
+}
+
+uint8_t comparePublishedVersion(const char* installed,
+                                const char* published) {
+  if (installed != nullptr && published != nullptr &&
+      strcmp(installed, published) == 0) {
+    return kOnlineUpdateSame;
+  }
+  unsigned installedMajor = 0;
+  unsigned installedMinor = 0;
+  unsigned installedPatch = 0;
+  unsigned publishedMajor = 0;
+  unsigned publishedMinor = 0;
+  unsigned publishedPatch = 0;
+  if (!parseReleaseVersion(installed, installedMajor, installedMinor,
+                           installedPatch) ||
+      !parseReleaseVersion(published, publishedMajor, publishedMinor,
+                           publishedPatch)) {
+    return kOnlineUpdateDifferent;
+  }
+  if (publishedMajor != installedMajor) {
+    return publishedMajor > installedMajor ? kOnlineUpdateNewer
+                                            : kOnlineUpdateOlder;
+  }
+  if (publishedMinor != installedMinor) {
+    return publishedMinor > installedMinor ? kOnlineUpdateNewer
+                                            : kOnlineUpdateOlder;
+  }
+  if (publishedPatch != installedPatch) {
+    return publishedPatch > installedPatch ? kOnlineUpdateNewer
+                                            : kOnlineUpdateOlder;
+  }
+  return kOnlineUpdateDifferent;
+}
+
 // В очередях между ядрами передаётся только однобайтовый сигнал. Сами тела
 // команд и ответов живут в PSRAM. Потоковые данные VFS передаются отдельно
 // через два SPSC-кольца VfsBridge, поэтому управляющий слот не блокирует поток.
@@ -106,7 +150,9 @@ class Application {
  private:
   static void networkTaskEntry(void* context);
   static bool networkEventEntry(void* context, uint8_t command,
-                                const uint8_t* data, uint16_t length);
+                                 const uint8_t* data, uint16_t length);
+  static bool onlineUpdateProgressEntry(void* context, uint8_t stage,
+                                        uint8_t percent);
   void networkTaskLoop();
   void processNetworkRequest();
   void processWifiConnect();
@@ -119,6 +165,8 @@ class Application {
   void processSmbStop();
   void processUpdateStart();
   void processUpdateStop();
+  void processOnlineUpdateCheck();
+  void processOnlineUpdate();
   void processNetOpen();
   void processNetSend();
   void processNetReceive();
@@ -155,6 +203,7 @@ class Application {
   ConfigStore configStore_;
   VfsBridge vfsBridge_;
   NetClient netClient_;
+  OnlineUpdater onlineUpdater_;
   FtpServer ftp_;
   SmbServer smb_;
   OtaServer ota_;
@@ -167,6 +216,7 @@ class Application {
   bool requestPending_;
   bool exchangeInPsram_;
   bool configStoreReady_;
+  bool restartAfterOnlineUpdate_;
   uint8_t lastStep_;
   char lastError_[49];
   char activeSsid_[33];
@@ -186,6 +236,7 @@ Application::Application()
       configStore_(),
       vfsBridge_(transport_),
       netClient_(),
+      onlineUpdater_(netClient_),
       ftp_(vfsBridge_, networkEventEntry, this),
       smb_(vfsBridge_, networkEventEntry, this),
       ota_(),
@@ -198,6 +249,7 @@ Application::Application()
       requestPending_(false),
       exchangeInPsram_(false),
       configStoreReady_(false),
+      restartAfterOnlineUpdate_(false),
       lastStep_(0),
       lastError_{},
       activeSsid_{},
@@ -343,9 +395,16 @@ void Application::networkTaskEntry(void* context) {
 }
 
 bool Application::networkEventEntry(void* context, uint8_t command,
-                                    const uint8_t* data, uint16_t length) {
+                                     const uint8_t* data, uint16_t length) {
   return static_cast<Application*>(context)->enqueueNetworkEvent(
       command, data, length);
+}
+
+bool Application::onlineUpdateProgressEntry(void* context, uint8_t stage,
+                                            uint8_t percent) {
+  const uint8_t data[2] = {stage, percent};
+  return static_cast<Application*>(context)->enqueueNetworkEvent(
+      kEventOnlineUpdateProgress, data, sizeof(data));
 }
 
 bool Application::enqueueNetworkEvent(uint8_t command, const uint8_t* data,
@@ -693,6 +752,84 @@ void Application::processUpdateStop() {
   exchange_->response[0] = 1;
 }
 
+void Application::processOnlineUpdateCheck() {
+  exchange_->responseCommand = kRespOnlineUpdateCheck;
+  exchange_->responseLength = 1;
+  exchange_->response[0] = 0;
+
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (!connected && config_.ssid()[0] != 0) {
+    connected = connectWifi(config_.ssid(), config_.password());
+  }
+  if (!connected) {
+    setNetworkError("update-check:no wifi");
+    return;
+  }
+  if (ota_.running()) {
+    setNetworkError("update-check:ota listener active");
+    return;
+  }
+
+  netClient_.close();
+  OnlineUpdateManifest manifest{};
+  char error[64] = {};
+  if (!onlineUpdater_.check(exchange_->request, sizeof(exchange_->request),
+                            manifest, onlineUpdateProgressEntry, this, error,
+                            sizeof(error))) {
+    setNetworkError("update-check:%s", error);
+    return;
+  }
+  const size_t versionLength = strlen(manifest.version);
+  exchange_->response[0] = 1;
+  exchange_->response[1] =
+      comparePublishedVersion(ZIFI_BUILD_VERSION, manifest.version);
+  memcpy(exchange_->response + 2, manifest.version, versionLength);
+  exchange_->responseLength = static_cast<uint16_t>(2 + versionLength);
+}
+
+void Application::processOnlineUpdate() {
+  exchange_->responseCommand = kRespOnlineUpdate;
+  exchange_->responseLength = 1;
+  exchange_->response[0] = 0;
+  restartAfterOnlineUpdate_ = false;
+
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (!connected && config_.ssid()[0] != 0) {
+    connected = connectWifi(config_.ssid(), config_.password());
+  }
+  if (!connected) {
+    setNetworkError("update:no wifi");
+    return;
+  }
+  if (ota_.running()) {
+    setNetworkError("update:ota listener active");
+    return;
+  }
+
+  netClient_.close();
+  ftp_.stop();
+  if (!smb_.stop()) {
+    setNetworkError("update:smb stopping");
+    return;
+  }
+#if ZIFI_DIAGNOSTIC_LOG
+  diagnosticLogFlush();
+#endif
+
+  char error[64] = {};
+  uint8_t digest[32] = {};
+  if (!onlineUpdater_.install(
+          exchange_->request, sizeof(exchange_->request), digest,
+          onlineUpdateProgressEntry, this, error, sizeof(error))) {
+    setNetworkError("update:%s", error);
+    return;
+  }
+  exchange_->response[0] = 1;
+  memcpy(exchange_->response + 1, digest, sizeof(digest));
+  exchange_->responseLength = 1 + sizeof(digest);
+  restartAfterOnlineUpdate_ = true;
+}
+
 void Application::processNetOpen() {
   char host[254];
   size_t next = 0;
@@ -892,6 +1029,12 @@ void Application::processNetworkRequest() {
     case kUpdateStop:
       processUpdateStop();
       break;
+    case kOnlineUpdateCheck:
+      processOnlineUpdateCheck();
+      break;
+    case kOnlineUpdate:
+      processOnlineUpdate();
+      break;
     case kNetOpen:
       processNetOpen();
       break;
@@ -976,6 +1119,12 @@ void Application::sendNetworkFailure(uint8_t command) {
     case kUpdateStop:
       transport_.send(kRespUpdateStop, failed, 1);
       break;
+    case kOnlineUpdateCheck:
+      transport_.send(kRespOnlineUpdateCheck, failed, 1);
+      break;
+    case kOnlineUpdate:
+      transport_.send(kRespOnlineUpdate, failed, 1);
+      break;
     case kNetOpen:
       transport_.send(kRespNetOpen, failed, 1);
       break;
@@ -1023,6 +1172,16 @@ void Application::pollNetworkResponse() {
   }
   transport_.send(exchange_->responseCommand, exchange_->response,
                   exchange_->responseLength);
+  if (restartAfterOnlineUpdate_ &&
+      exchange_->responseCommand == kRespOnlineUpdate &&
+      exchange_->responseLength != 0 && exchange_->response[0] != 0) {
+    restartAfterOnlineUpdate_ = false;
+    // Сначала физически отправляем Z80 финальный SHA-verified ответ. Только
+    // после этого можно перезапускаться в уже выбранный OTA-раздел.
+    transport_.flush();
+    delay(250);
+    ESP.restart();
+  }
 }
 
 void Application::pollNetworkEvent() {
@@ -1127,6 +1286,8 @@ void Application::handle(const PacketView& packet) {
     case kSmbStop:
     case kUpdateStart:
     case kUpdateStop:
+    case kOnlineUpdateCheck:
+    case kOnlineUpdate:
     case kNetOpen:
     case kNetSend:
     case kNetClose:

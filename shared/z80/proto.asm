@@ -25,6 +25,8 @@ CMD_UPDATE_START equ #08
 CMD_UPDATE_STOP equ #09
 CMD_SMB_START   equ #0B
 CMD_SMB_STOP    equ #0C
+CMD_ONLINE_UPDATE equ #0D              ; GitHub SHA-256 + firmware.bin -> OTA
+CMD_ONLINE_UPDATE_CHECK equ #0E        ; только версия и SHA из manifest
 CMD_SYS_RESET   equ #0F
 CMD_SYS_INFO    equ #02
 CMD_NET_IPCONFIG equ #21               ; текущие IP, маска, шлюз, DNS
@@ -46,6 +48,7 @@ EVT_FTP_COMMAND equ #61
 EVT_SMB_CLIENT  equ #62
 EVT_SMB_COMMAND equ #63
 EVT_SMB_PROGRESS equ #64               ; готовая строка хода передачи файла
+EVT_ONLINE_UPDATE_PROGRESS equ #65     ; [этап][проценты]
 
 RESP_SYS_INFO   equ #82
 RESP_WIFI_INI   equ #83
@@ -56,6 +59,12 @@ RESP_UPDATE_START equ #88
 RESP_UPDATE_STOP equ #89
 RESP_SMB_START  equ #8B
 RESP_SMB_STOP   equ #8C
+RESP_ONLINE_UPDATE equ #8D             ; [успех][SHA-256 32 байта]
+RESP_ONLINE_UPDATE_CHECK equ #8E       ; [успех][relation][версия ASCII]
+ONLINE_UPDATE_SAME      equ 0
+ONLINE_UPDATE_NEWER     equ 1
+ONLINE_UPDATE_OLDER     equ 2
+ONLINE_UPDATE_DIFFERENT equ 3
 RESP_NET_IPCONFIG equ #A0
 RESP_NET_PING   equ #A1
 RESP_NET_NTP    equ #A2                ; ГГГГММДДЧЧММСС, 14 символов ASCII

@@ -18,6 +18,9 @@ if errorlevel 1 exit /b %errorlevel%
 call "%~dp0Update Mode\build.bat"
 if errorlevel 1 exit /b %errorlevel%
 
+call "%~dp0Online Update\build.bat"
+if errorlevel 1 exit /b %errorlevel%
+
 call "%~dp0SMB Server\build.bat"
 if errorlevel 1 exit /b %errorlevel%
 

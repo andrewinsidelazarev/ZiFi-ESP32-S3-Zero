@@ -70,8 +70,16 @@ def package_firmware(source, target, env) -> None:
         factory_output.unlink()
         raise RuntimeError("Merged factory image exceeds the 4 MB flash size")
 
+    version = env.GetProjectOption("custom_zifi_version")
+    if not version or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-"
+        for character in version
+    ):
+        raise RuntimeError("custom_zifi_version is missing or unsafe")
+
     hashes = OUTPUT / "firmware.sha256"
     hashes.write_text(
+        f"VERSION {version}\n"
         f"{sha256(app_output)}  firmware.bin\n"
         f"{sha256(factory_output)}  firmware.factory.bin\n",
         encoding="ascii",

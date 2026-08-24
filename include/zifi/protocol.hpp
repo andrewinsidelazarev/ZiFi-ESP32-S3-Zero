@@ -23,6 +23,8 @@ enum Command : uint8_t {
   kFtpRamStats = 0x0A,
   kSmbStart = 0x0B,
   kSmbStop = 0x0C,
+  kOnlineUpdate = 0x0D,
+  kOnlineUpdateCheck = 0x0E,
   kSysReset = 0x0F,
   kNetOpen = 0x10,
   kNetSend = 0x11,
@@ -62,6 +64,8 @@ enum Command : uint8_t {
   // Ход текущей передачи файла отдельной строкой. Идёт редко и с готовым
   // текстом, поэтому плагину не нужно ни считать байты, ни делить их.
   kEventSmbProgress = 0x64,
+  // [этап][проценты] автономной загрузки firmware.bin с GitHub.
+  kEventOnlineUpdateProgress = 0x65,
 
   kRespSysInfo = 0x82,
   kRespWifiConnect = 0x81,
@@ -74,6 +78,8 @@ enum Command : uint8_t {
   kRespFtpRamStats = 0x8A,
   kRespSmbStart = 0x8B,
   kRespSmbStop = 0x8C,
+  kRespOnlineUpdate = 0x8D,
+  kRespOnlineUpdateCheck = 0x8E,
   kRespNetOpen = 0x90,
   kRespNetSend = 0x91,
   kRespNetRecv = 0x92,
@@ -86,6 +92,13 @@ enum Command : uint8_t {
   kReady = 0xF0,
   kError = 0xEE,
   kAck = 0xFE,
+};
+
+enum OnlineUpdateRelation : uint8_t {
+  kOnlineUpdateSame = 0,
+  kOnlineUpdateNewer = 1,
+  kOnlineUpdateOlder = 2,
+  kOnlineUpdateDifferent = 3,
 };
 
 struct PacketView {

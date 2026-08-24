@@ -1,6 +1,6 @@
 # ZiFi SMB Server для ZX Evolution
 
-Плагин `ZIFISMB.WMF` v0.5.7 и прошивка `s3-native-0.6.67` с выключенным
+Плагин `ZIFISMB.WMF` v0.5.7 и прошивка `s3-native-0.6.69` с выключенным
 диагностическим журналом для ESP32-S3 Zero открывают выбранную
 SD-карту Wild Commander как сетевой ресурс SMB:
 
