@@ -54,7 +54,7 @@ WebDAV ещё не включён. Сетевой файловый listener за
 | **Первая прошивка (USB)** | [**`firmware.factory.bin`**](firmware/firmware.factory.bin) | Полный 4 МБ образ для первой прошивки ESP32-S3 через USB Type-C (смещение `0x0`) |
 | **Обновление по Wi-Fi (OTA)** | [**`firmware.bin`**](firmware/firmware.bin) | Образ приложения для сетевого обновления ([SHA-256](firmware/firmware.sha256)) |
 | **Автономный апдейтер** | [**`ZIFIUPD.WMF`**](Online%20Update/build/ZIFIUPD.WMF) | Пользовательский плагин Wild Commander: читает `zifi.ini`, скачивает и устанавливает прошивку с GitHub |
-| **Режим обновления с PC** | [**`update.sna`**](firmware/update.sna) | Snapshot для ZX-Evolution, запускающий приём OTA-обновления на порту 8267 |
+| **Режим обновления с PC** | [**`Update Mode`**](Update%20Mode/src/update.asm) | Исходник локально собираемого `update.sna`, запускающего приём OTA на порту 8267 |
 | **Скрипт-прошивальщик (OTA)** | [**`esp_tool.py`**](tools/esp_tool.py) | Python-утилита для прошивки ESP32-S3 по Wi-Fi и выгрузки логов |
 | **SMB-сервер (Windows)** | [**`ZIFISMB.WMF`**](SMB%20Server/build/ZIFISMB.WMF) | Плагин Wild Commander: доступ к SD-карте по сети `\\ZX-Evo\SD` |
 | **FTP-сервер** | [**`ZIFIFTP.WMF`**](FTP%20Server/build/ZIFIFTP.WMF) | Плагин Wild Commander: полнофункциональный FTP-сервер |
@@ -115,8 +115,9 @@ Wild Commander по 16 КиБ; каталожный кэш остаётся в �
   Wi-Fi, показывает установленную и опубликованную версии, затем по подтверждению
   запускает прямую HTTPS-загрузку `firmware.sha256` и `firmware.bin` из GitHub.
   PC и Python не нужны; повторная установка той же версии разрешена.
-* **`Update Mode` (`firmware/update.sna`):**
-  Режим совместимого обновления с PC через `tools/esp_tool.py`.
+* **`Update Mode` (`Update Mode/src/update.asm`):**
+  Исходник совместимого обновления с PC через `tools/esp_tool.py`. Snapshot
+  `firmware/update.sna` создаётся локально сборкой и не публикуется в Git.
 
 
 ## Сборка прошивки
@@ -136,7 +137,8 @@ PlatformIO автоматически создаёт:
 - `firmware/firmware.bin` — приложение по адресу `0x10000`;
 - `firmware/firmware.factory.bin` — объединённый образ для записи с `0x0`;
 - `firmware/firmware.sha256` — опубликованная версия и SHA-256 обоих образов;
-- `firmware/update.sna` — экран включения сетевого updater на порту `8267`.
+- `firmware/update.sna` — локальный игнорируемый результат сборки: экран
+  включения сетевого updater на порту `8267`.
 
 Параметры платы закреплены в `platformio.ini`: официальный совместимый профиль
 `esp32-s3-devkitm-1` переопределён под 4 МБ QIO Flash и 2 МБ QSPI PSRAM.
