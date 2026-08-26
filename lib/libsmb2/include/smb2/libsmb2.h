@@ -675,6 +675,9 @@ uint64_t smb2_get_pdu_message_id(struct smb2_context *smb2, struct smb2_pdu *pdu
 uint64_t smb2_get_last_request_message_id(struct smb2_context *smb2);
 uint64_t smb2_get_last_reply_message_id(struct smb2_context *smb2);
 int smb2_pdu_is_compound(struct smb2_context *smb2);
+/* Оставить текущий серверный Request PDU синхронным на проводе, но снять с
+ * него обычный таймаут: финальный ответ будет поставлен приложением позже. */
+int smb2_set_current_request_internal_async(struct smb2_context *smb2);
 
 /*
  * OPENDIR

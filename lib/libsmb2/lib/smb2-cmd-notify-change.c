@@ -160,16 +160,15 @@ smb2_encode_change_notify_reply(struct smb2_context *smb2,
                 return -1;
         }
 
-        if (smb2->passthrough) {
-                memcpy(buf, rep->output, rep->output_buffer_length);
-                memset(buf + rep->output_buffer_length, 0, len - rep->output_buffer_length);
-                iov->len = rep->output_buffer_length;
-        }
-        else {
-                smb2_set_error(smb2, "Change-notify buffer "
-                                "packing not implemented");
-                return -1;
-        }
+        /* FILE_NOTIFY_INFORMATION уже является wire-структурой: в публичном
+         * reply API нет типизированного списка, только output/length. Серверу
+         * поэтому разрешено передать готовый little-endian буфер и без
+         * глобального passthrough, который отключил бы штатное кодирование
+         * QUERY_INFO и QUERY_DIRECTORY. */
+        memcpy(buf, rep->output, rep->output_buffer_length);
+        memset(buf + rep->output_buffer_length, 0,
+               len - rep->output_buffer_length);
+        iov->len = rep->output_buffer_length;
 
         return 0;
 }

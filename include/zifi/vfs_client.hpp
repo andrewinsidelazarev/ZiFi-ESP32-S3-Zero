@@ -41,6 +41,11 @@ struct VfsMetadata {
   uint16_t accessDate = 0;
   uint16_t writeTime = 0;
   uint16_t writeDate = 0;
+  // Эти значения нужны только SMB-серверу для согласованного QUERY_INFO.
+  // В UART-пакет FILEX по-прежнему уходят первые 16 байт в формате FAT.
+  uint64_t createFileTime = 0;
+  uint64_t accessFileTime = 0;
+  uint64_t writeFileTime = 0;
 };
 
 // Синхронный клиент файлового API Wild Commander. Вызывать его разрешено

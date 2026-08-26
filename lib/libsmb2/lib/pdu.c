@@ -112,7 +112,8 @@ smb2_allocate_pdu(struct smb2_context *smb2, enum smb2_command command,
 
         if (smb2->dialect == SMB2_VERSION_0202) {
                 hdr->credit_charge = 0;
-        } else if (hdr->command == SMB2_NEGOTIATE) {
+        } else if (hdr->command == SMB2_NEGOTIATE ||
+                   hdr->command == SMB2_CANCEL) {
                 /* We don't have any credits yet during negprot by
                  * looking at traces.
                  */
@@ -132,7 +133,7 @@ smb2_allocate_pdu(struct smb2_context *smb2, enum smb2_command command,
         case SMB2_SESSION_SETUP:
         case SMB2_LOGOFF:
         case SMB2_ECHO:
-        /* case SMB2_CANCEL: */
+        case SMB2_CANCEL:
                 hdr->sync.tree_id = 0;
                 break;
         case SMB2_TREE_CONNECT:
@@ -149,6 +150,12 @@ smb2_allocate_pdu(struct smb2_context *smb2, enum smb2_command command,
                 break;
         default:
                hdr->session_id = smb2->session_id;
+        }
+
+        if (command == SMB2_CANCEL) {
+                /* CANCEL повторяет идентификатор исходной команды и не
+                 * запрашивает новый SMB credit. */
+                hdr->credit_request_response = 0;
         }
 
         pdu->cb = cb;
@@ -220,7 +227,7 @@ smb2_get_tree_id_for_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu, uint32
                 case SMB2_SESSION_SETUP:
                 case SMB2_LOGOFF:
                 case SMB2_ECHO:
-                /* case SMB2_CANCEL: */
+                case SMB2_CANCEL:
                 case SMB2_TREE_CONNECT:
                         *tree_id  = 0;
                         return 0;
@@ -252,7 +259,7 @@ smb2_set_tree_id_for_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu, uint32
                 case SMB2_SESSION_SETUP:
                 case SMB2_LOGOFF:
                 case SMB2_ECHO:
-                /* case SMB2_CANCEL: */
+                case SMB2_CANCEL:
                         break;
                 case SMB2_TREE_CONNECT:
                         break;
@@ -357,6 +364,11 @@ smb2_free_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
 
         if (pdu->next_compound) {
                 smb2_free_pdu(smb2, pdu->next_compound);
+        }
+        if (pdu->server_compound_reply) {
+                struct smb2_pdu *reply = pdu->server_compound_reply;
+                pdu->server_compound_reply = NULL;
+                smb2_free_pdu(smb2, reply);
         }
 
         smb2_free_iovector(smb2, &pdu->out);
@@ -469,7 +481,9 @@ static void
 smb2_encode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
                    struct smb2_header *hdr)
 {
-        if (!smb2_is_server(smb2)) {
+        if (!smb2_is_server(smb2) && hdr->command != SMB2_CANCEL) {
+                /* MS-SMB2: CANCEL использует MessageId целевого запроса и
+                 * не расходует номер последовательности. */
                 hdr->message_id = smb2->message_id++;
                 if (hdr->credit_charge > 1) {
                         smb2->message_id += (hdr->credit_charge - 1);
@@ -592,6 +606,58 @@ smb2_add_to_outqueue(struct smb2_context *smb2, struct smb2_pdu *pdu)
         smb2_change_events(smb2, smb2->fd, smb2_which_events(smb2));
 }
 
+static uint16_t
+smb2_server_credit_charge(struct smb2_context *smb2,
+                          const struct smb2_pdu *req_pdu)
+{
+        /* CANCEL не расходует кредит. В SMB 2.0.2 поле CreditCharge равно
+         * нулю; некоторые клиенты также присылают ноль для однокредитных
+         * команд новых диалектов, поэтому считаем их расходом одного кредита. */
+        if (req_pdu->header.command == SMB2_CANCEL) {
+                return 0;
+        }
+        if (smb2->dialect <= SMB2_VERSION_0202 ||
+            req_pdu->header.credit_charge == 0) {
+                return 1;
+        }
+        return req_pdu->header.credit_charge;
+}
+
+static uint16_t
+smb2_server_credit_grant(struct smb2_context *smb2,
+                         const struct smb2_pdu *req_pdu)
+{
+        uint32_t held = smb2->server_credit_window;
+        uint32_t consumed = smb2_server_credit_charge(smb2, req_pdu);
+        uint32_t requested = req_pdu->header.credit_request_response;
+        uint32_t grant_limit;
+        uint32_t grant;
+
+        if (held == 0) {
+                held = 1;
+        } else if (held > SMB2_SERVER_CREDIT_TARGET) {
+                held = SMB2_SERVER_CREDIT_TARGET;
+        }
+        if (consumed > held) {
+                /* Корректный клиент не может израсходовать больше имеющихся
+                 * кредитов. Не допускаем переполнения при ошибочном значении. */
+                consumed = held;
+        }
+        if (requested == 0) {
+                requested = 1;
+        }
+
+        /* Сначала вычитаем кредиты этого запроса, затем выдаём не больше,
+         * чем запросил клиент и сколько помещается в окно из четырёх кредитов.
+         * Возврат ровно израсходованного сохраняет полное окно, а увеличенный
+         * ответ NEGOTIATE расширяет начальное окно из одного кредита. */
+        grant_limit = SMB2_SERVER_CREDIT_TARGET - (held - consumed);
+        grant = requested < grant_limit ? requested : grant_limit;
+        smb2->server_credit_window =
+                (uint16_t)(held - consumed + grant);
+        return (uint16_t)grant;
+}
+
 static int
 smb2_correlate_reply(struct smb2_context *smb2, struct smb2_pdu *pdu)
 {
@@ -613,27 +679,9 @@ smb2_correlate_reply(struct smb2_context *smb2, struct smb2_pdu *pdu)
                 }
         }  else {
                 uint16_t credit_grant = req_pdu->header.credit_request_response;
-
-                /* This server has one serialized physical FILEX backend.  Do
-                 * not inflate Windows' credit window to 128: a large window
-                 * lets Explorer queue requests far ahead of the SD channel.
-                 * Windows requires at least four credits; with three,
-                 * CopyFile stops after its three preliminary READ requests and
-                 * waits forever for the fourth credit.  Afterwards grant back
-                 * exactly what each request consumed.  For ordinary responses
-                 * this keeps the connection at that depth.  A credit returned
-                 * by STATUS_PENDING permits one replacement request while the
-                 * original is still outstanding, so the application must only
-                 * promote one READ into its physical async service at a time. */
-                if (smb2_is_server(smb2)) {
-                        credit_grant = req_pdu->header.credit_charge;
-                        if (credit_grant == 0) {
-                                credit_grant = 1;
-                        }
-                        if (req_pdu->header.command == SMB2_NEGOTIATE) {
-                                credit_grant = 4;
-                        }
-                }
+                int async_credit_already_granted =
+                        (req_pdu->header.flags & SMB2_FLAGS_ASYNC_COMMAND) &&
+                        pdu->header.status != SMB2_STATUS_PENDING;
 
                 /* some clients (lookin at you nautilus) break if their credits
                  * increment too far (and probably wrap to 0) so limit credits
@@ -643,13 +691,19 @@ smb2_correlate_reply(struct smb2_context *smb2, struct smb2_pdu *pdu)
                  */
                 /* Credits for an asynchronous request are granted exactly
                  * once, in the interim STATUS_PENDING response. */
-                if ((req_pdu->header.flags & SMB2_FLAGS_ASYNC_COMMAND) &&
-                    pdu->header.status != SMB2_STATUS_PENDING) {
+                if (async_credit_already_granted) {
                         pdu->header.credit_request_response = 0;
-                } else if (credit_grant > 0xf000) {
-                        pdu->header.credit_request_response = 0xffff;
                 } else {
-                        pdu->header.credit_request_response = credit_grant;
+                        if (smb2_is_server(smb2)) {
+                                credit_grant =
+                                        smb2_server_credit_grant(smb2, req_pdu);
+                        }
+                        if (credit_grant > 0xf000) {
+                                pdu->header.credit_request_response = 0xffff;
+                        } else {
+                                pdu->header.credit_request_response =
+                                        credit_grant;
+                        }
                 }
 
                 if (req_pdu->header.credit_charge > pdu->header.credit_charge) {
@@ -700,131 +754,195 @@ smb2_correlate_reply(struct smb2_context *smb2, struct smb2_pdu *pdu)
         return ret;
 }
 
-static void
-smb2_hold_server_compound_reply(struct smb2_context *smb2,
-                                struct smb2_pdu *pdu)
+static void smb2_queue_pdu_direct(struct smb2_context *smb2,
+                                  struct smb2_pdu *pdu);
+
+static struct smb2_pdu *
+smb2_server_compound_request(struct smb2_context *smb2, uint32_t serial,
+                             uint16_t index)
 {
-        struct smb2_pdu *tail;
-        uint16_t count = 0;
-
-        if (smb2->server_compound_reply_tail) {
-                smb2->server_compound_reply_tail->next_compound = pdu;
-        } else {
-                smb2->server_compound_reply = pdu;
-        }
-
-        tail = pdu;
-        while (tail) {
-                ++count;
-                if (!tail->next_compound) {
-                        break;
+        struct smb2_pdu *request;
+        for (request = smb2->waitqueue; request; request = request->next) {
+                if (request->server_compound_serial == serial &&
+                    request->server_compound_index == index) {
+                        return request;
                 }
-                tail = tail->next_compound;
         }
-        smb2->server_compound_reply_tail = tail;
-        smb2->server_compound_reply_count += count;
+        return NULL;
+}
+
+static void
+smb2_prepare_server_compound_reply(struct smb2_pdu *head)
+{
+        struct smb2_pdu *reply;
+        for (reply = head; reply; reply = reply->next_compound) {
+                reply->header.next_command = 0;
+                if (reply->next_compound) {
+                        int i;
+                        int offset = 0;
+                        for (i = 0; i < reply->out.niov; ++i) {
+                                offset += (int)reply->out.iov[i].len;
+                        }
+                        reply->header.next_command = (uint32_t)offset;
+                        reply->next_compound->header.flags |=
+                                SMB2_FLAGS_RELATED_OPERATIONS;
+                }
+        }
 }
 
 static int
-smb2_server_replies_are_related(struct smb2_context *smb2,
-                                struct smb2_pdu *head)
+smb2_try_flush_server_compound(struct smb2_context *smb2, uint32_t serial)
 {
-        struct smb2_pdu *reply;
-        uint16_t index = 0;
+        struct smb2_pdu *first;
+        struct smb2_pdu *request;
+        struct smb2_pdu *head = NULL;
+        struct smb2_pdu *tail = NULL;
+        uint16_t count;
+        uint16_t index;
+        int related = 1;
 
-        if (!head || smb2->server_compound_reply_count < 2 ||
-            smb2->server_compound_reply_count !=
-                    smb2->server_compound_request_count) {
+        if (serial == 0) {
                 return 0;
         }
-
-        for (reply = head; reply; reply = reply->next_compound, ++index) {
-                struct smb2_pdu *request =
-                        smb2_find_pdu(smb2, reply->header.message_id);
-                if (!request || reply->header.status == SMB2_STATUS_PENDING) {
+        first = smb2_server_compound_request(smb2, serial, 0);
+        if (!first || first->server_compound_count < 2) {
+                return 0;
+        }
+        count = first->server_compound_count;
+        for (index = 0; index < count; ++index) {
+                request = smb2_server_compound_request(smb2, serial, index);
+                if (!request || request->server_compound_count != count ||
+                    !request->server_compound_reply) {
                         return 0;
                 }
-                if (index == 0) {
-                        if (request->header.flags &
-                            SMB2_FLAGS_RELATED_OPERATIONS) {
-                                return 0;
-                        }
-                } else if (!(request->header.flags &
-                             SMB2_FLAGS_RELATED_OPERATIONS)) {
-                        return 0;
+                if ((index == 0 &&
+                     (request->header.flags & SMB2_FLAGS_RELATED_OPERATIONS)) ||
+                    (index != 0 &&
+                     !(request->header.flags & SMB2_FLAGS_RELATED_OPERATIONS))) {
+                        related = 0;
+                }
+        }
+
+        /* Сначала отвязываем всю группу от Request PDU. После начала
+         * корреляции сами Request PDU освобождаются по одному. */
+        for (index = 0; index < count; ++index) {
+                struct smb2_pdu *reply;
+                request = smb2_server_compound_request(smb2, serial, index);
+                reply = request->server_compound_reply;
+                request->server_compound_reply = NULL;
+                request->server_compound_serial = 0;
+                reply->next_compound = NULL;
+                if (!head) {
+                        head = reply;
+                } else {
+                        tail->next_compound = reply;
+                }
+                tail = reply;
+        }
+
+        if (related) {
+                smb2_prepare_server_compound_reply(head);
+                smb2_queue_pdu_direct(smb2, head);
+        } else {
+                while (head) {
+                        struct smb2_pdu *next = head->next_compound;
+                        head->next_compound = NULL;
+                        head->header.next_command = 0;
+                        head->header.flags &= ~SMB2_FLAGS_RELATED_OPERATIONS;
+                        smb2_queue_pdu_direct(smb2, head);
+                        head = next;
                 }
         }
         return 1;
 }
 
 static void
-smb2_prepare_server_compound_reply(struct smb2_context *smb2,
-                                   struct smb2_pdu *head)
+smb2_break_server_compound(struct smb2_context *smb2, uint32_t serial)
 {
-        struct smb2_pdu *reply;
+        struct smb2_pdu *request;
+        struct smb2_pdu *head = NULL;
+        struct smb2_pdu *tail = NULL;
 
-        for (reply = head; reply && reply->next_compound;
-             reply = reply->next_compound) {
-                struct smb2_pdu *next = reply->next_compound;
-                int i;
-                int offset = 0;
-
-                for (i = 0; i < reply->out.niov; ++i) {
-                        offset += (int)reply->out.iov[i].len;
+        for (request = smb2->waitqueue; request; request = request->next) {
+                struct smb2_pdu *reply;
+                if (request->server_compound_serial != serial) {
+                        continue;
                 }
-                reply->header.next_command = (uint32_t)offset;
-                next->header.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+                reply = request->server_compound_reply;
+                request->server_compound_reply = NULL;
+                request->server_compound_serial = 0;
+                if (reply) {
+                        reply->next_compound = NULL;
+                        if (!head) {
+                                head = reply;
+                        } else {
+                                tail->next_compound = reply;
+                        }
+                        tail = reply;
+                }
+        }
+        if (smb2->server_compound_active_serial == serial) {
+                smb2->server_compound_broken = 1;
+        }
+        while (head) {
+                struct smb2_pdu *next = head->next_compound;
+                head->next_compound = NULL;
+                head->header.next_command = 0;
+                head->header.flags &= ~SMB2_FLAGS_RELATED_OPERATIONS;
+                smb2_queue_pdu_direct(smb2, head);
+                head = next;
         }
 }
 
 void
 smb2_flush_server_compound_replies(struct smb2_context *smb2)
 {
-        struct smb2_pdu *head = smb2->server_compound_reply;
-        int compound;
-
-        if (!head) {
-                smb2->server_compound_reply_tail = NULL;
-                smb2->server_compound_reply_count = 0;
-                smb2->server_compound_request_count = 0;
-                return;
-        }
-
-        compound = smb2_server_replies_are_related(smb2, head);
-        smb2->server_compound_reply = NULL;
-        smb2->server_compound_reply_tail = NULL;
-        smb2->server_compound_reply_count = 0;
-        smb2->server_compound_request_count = 0;
-
-        if (compound) {
-                smb2_prepare_server_compound_reply(smb2, head);
-                smb2_queue_pdu(smb2, head);
-                return;
-        }
-
-        /* Preserve the old behavior for unrelated, incomplete or asynchronous
-         * chains.  In particular, STATUS_PENDING must remain an independent
-         * interim response. */
-        while (head) {
-                struct smb2_pdu *next = head->next_compound;
-                head->next_compound = NULL;
-                head->header.next_command = 0;
-                head->header.flags &= ~SMB2_FLAGS_RELATED_OPERATIONS;
-                smb2_queue_pdu(smb2, head);
-                head = next;
+        struct smb2_pdu *request;
+        /* Вызывается после разбора последней команды и после каждого позднего
+         * ответа. После успешной выдачи начинаем обход заново: корреляция
+         * освободила Request PDU этой группы. */
+        request = smb2->waitqueue;
+        while (request) {
+                if (request->server_compound_serial != 0) {
+                        const uint32_t serial =
+                                request->server_compound_serial;
+                        if (smb2_try_flush_server_compound(smb2, serial)) {
+                                request = smb2->waitqueue;
+                                continue;
+                        }
+                }
+                request = request->next;
         }
 }
 
 void
 smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
 {
+        struct smb2_pdu *request;
+
+        if (smb2_is_server(smb2)) {
+                request = smb2_find_pdu(smb2, pdu->header.message_id);
+                if (request && request->server_compound_serial != 0) {
+                        uint32_t serial = request->server_compound_serial;
+                        if (pdu->header.status == SMB2_STATUS_PENDING) {
+                                /* Настоящий wire-async разрывает синхронную
+                                 * compound-цепочку; interim уходит отдельно. */
+                                smb2_break_server_compound(smb2, serial);
+                        } else {
+                                request->server_compound_reply = pdu;
+                                smb2_try_flush_server_compound(smb2, serial);
+                                return;
+                        }
+                }
+        }
+        smb2_queue_pdu_direct(smb2, pdu);
+}
+
+static void
+smb2_queue_pdu_direct(struct smb2_context *smb2, struct smb2_pdu *pdu)
+{
         struct smb2_pdu *p;
         uint64_t prev_compound_mid = 0;
-
-        if (smb2_is_server(smb2) && smb2->server_compound_active) {
-                smb2_hold_server_compound_reply(smb2, pdu);
-                return;
-        }
 
         /* Update all the PDU headers in this chain */
         for (p = pdu; p; p = p->next_compound) {
@@ -916,6 +1034,24 @@ smb2_get_last_request_message_id(struct smb2_context *smb2)
         if (smb2) {
                 return smb2->message_id;
         }
+        return 0;
+}
+
+int
+smb2_set_current_request_internal_async(struct smb2_context *smb2)
+{
+        struct smb2_pdu *request;
+        if (!smb2 || !smb2_is_server(smb2)) {
+                return -1;
+        }
+        request = smb2_find_pdu(smb2, smb2->message_id);
+        if (!request) {
+                return -1;
+        }
+        /* Как async_internal в Samba: MessageId и sync-заголовок остаются
+         * обычными, STATUS_PENDING не отправляется, но жизнью операции
+         * управляет сервер приложения. */
+        request->timeout = 0;
         return 0;
 }
 

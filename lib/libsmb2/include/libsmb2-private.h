@@ -130,6 +130,7 @@ enum smb2_recv_state {
 #define smb2_tree_id(smb2) (((smb2)->tree_id_cur >= 0)?smb2->tree_id[(smb2)->tree_id_cur]:0xdeadbeef)
 
 #define MAX_CREDITS 1024
+#define SMB2_SERVER_CREDIT_TARGET 4
 #define SMB2_SALT_SIZE 32
 
 /*
@@ -235,15 +236,15 @@ struct smb2_context {
         struct smb2_pdu *outqueue;
         struct smb2_pdu *waitqueue;
 
-        /* Synchronous replies produced while a related compound request is
-         * being decoded.  A server must not send the first reply before it
-         * has seen the rest of the related chain: doing so loses the compound
-         * relationship that Windows uses for CREATE + QUERY_DIRECTORY. */
-        struct smb2_pdu *server_compound_reply;
-        struct smb2_pdu *server_compound_reply_tail;
+        /* Состояние серверной compound-цепочки. Ответ закрепляется за тем
+         * Request PDU, который его породил: так поздний async-ответ не может
+         * попасть в соседнюю цепочку. */
+        uint32_t server_compound_serial;
+        uint32_t server_compound_active_serial;
         uint16_t server_compound_request_count;
-        uint16_t server_compound_reply_count;
+        uint16_t server_credit_window;
         uint8_t server_compound_active;
+        uint8_t server_compound_broken;
 
         /*
          * For receiving PDUs
@@ -325,6 +326,13 @@ struct smb2_pdu {
 
         struct smb2_pdu *next_compound;
         uint64_t prev_compound_mid;
+
+        /* Принадлежность серверного Request PDU к compound-цепочке и
+         * синхронный ответ, который ждёт завершения остальных команд. */
+        struct smb2_pdu *server_compound_reply;
+        uint32_t server_compound_serial;
+        uint16_t server_compound_index;
+        uint16_t server_compound_count;
 
         int caller_frees_pdu;
         smb2_command_cb cb;

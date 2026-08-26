@@ -6,7 +6,7 @@
 // поверх обычной папки.
 //
 // Запуск:
-//   host_smb.exe <папка-ресурса> [порт]
+//   host_smb.exe <папка-ресурса> [порт] [байт/с] [имя] [задержка каталога, мс]
 //
 // К нему подключается обычный Проводник Windows по \\127.0.0.1\SD, и любая
 // поломка ловится отладчиком с полным стеком вместо reset_reason=4.
@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
   const std::string root = argv[1];
   const uint16_t port =
       argc >= 3 ? static_cast<uint16_t>(std::atoi(argv[2])) : 445;
+  const char* hostname = argc >= 5 ? argv[4] : "ZX-Evo";
 
   zifi::host::installCrashReporter();
 
@@ -88,6 +89,9 @@ int main(int argc, char** argv) {
   if (argc >= 4) {
     simulator.setThrottle(static_cast<unsigned>(std::atoi(argv[3])));
   }
+  if (argc >= 6) {
+    simulator.setDirectoryDelay(static_cast<unsigned>(std::atoi(argv[5])));
+  }
 
   zifi::UartTransport transport(Serial);
   transport.begin();
@@ -106,7 +110,7 @@ int main(int argc, char** argv) {
   size_t offset = 0;
   payload[offset++] = static_cast<uint8_t>(port);
   payload[offset++] = static_cast<uint8_t>(port >> 8);
-  for (const char* field : {"SD", "ZX-Evo", "WORKGROUP", "zx", "zx"}) {
+  for (const char* field : {"SD", hostname, "WORKGROUP", "zx", "zx"}) {
     const size_t size = std::strlen(field) + 1;
     std::memcpy(payload + offset, field, size);
     offset += size;

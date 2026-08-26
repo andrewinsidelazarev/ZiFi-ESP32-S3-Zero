@@ -160,6 +160,10 @@ smb2_get_real_credit_charge_for_one_pdu(struct smb2_context *smb2, struct smb2_h
 {
         int credits;
 
+        if (hdr->command == SMB2_CANCEL) {
+                /* CANCEL повторяет MessageId и не расходует SMB credit. */
+                return 0;
+        }
         credits = hdr->credit_charge;
         if (hdr->command == SMB2_NEGOTIATE) {
                 /* Mirror the special case in smb2_allocate_pdu. */
@@ -318,8 +322,14 @@ smb2_write_to_socket(struct smb2_context *smb2)
 
                                 if (!smb2_is_server(smb2)) {
                                         smb2->credits -= smb2_get_real_credit_charge_for_one_pdu(smb2, &pdu->header);
-                                        /* queue requests we send to correlate replies with */
-                                        SMB2_LIST_ADD_END(&smb2->waitqueue, pdu);
+                                        if (pdu->header.command == SMB2_CANCEL) {
+                                                /* На CANCEL отдельного ответа нет, поэтому
+                                                 * его нельзя оставлять в waitqueue. */
+                                                smb2_free_pdu(smb2, pdu);
+                                        } else {
+                                                /* queue requests we send to correlate replies with */
+                                                SMB2_LIST_ADD_END(&smb2->waitqueue, pdu);
+                                        }
                                 }
                                 else {
                                         /* alway allow writing replies */
@@ -855,20 +865,53 @@ read_more_data:
                 if (!smb2->server_compound_active && is_chained) {
                         smb2->server_compound_active = 1;
                         smb2->server_compound_request_count = 0;
-                        smb2->server_compound_reply_count = 0;
-                        smb2->server_compound_reply = NULL;
-                        smb2->server_compound_reply_tail = NULL;
+                        smb2->server_compound_broken = 0;
+                        if (++smb2->server_compound_serial == 0) {
+                                ++smb2->server_compound_serial;
+                        }
+                        smb2->server_compound_active_serial =
+                                smb2->server_compound_serial;
                 }
                 if (smb2->server_compound_active) {
+                        if (!smb2->server_compound_broken) {
+                                pdu->server_compound_serial =
+                                        smb2->server_compound_active_serial;
+                                pdu->server_compound_index =
+                                        smb2->server_compound_request_count;
+                        }
                         ++smb2->server_compound_request_count;
                 }
-                /* queue requests to correlate our replies we send back later */
-                SMB2_LIST_ADD_END(&smb2->waitqueue, pdu);
-                pdu->cb(smb2, smb2->hdr.status, pdu->payload, pdu->cb_data);
+                if (pdu->header.command == SMB2_CANCEL) {
+                        /* CANCEL не создаёт Request и не получает ответа. Пока
+                         * callback работает, целевой PDU остаётся в waitqueue. */
+                        pdu->cb(smb2, smb2->hdr.status, pdu->payload,
+                                pdu->cb_data);
+                        smb2_free_pdu(smb2, pdu);
+                } else {
+                        /* queue requests to correlate our replies we send back later */
+                        SMB2_LIST_ADD_END(&smb2->waitqueue, pdu);
+                        pdu->cb(smb2, smb2->hdr.status, pdu->payload,
+                                pdu->cb_data);
+                }
                 smb2->pdu = smb2->next_pdu;
                 smb2->next_pdu = NULL;
                 if (smb2->server_compound_active && !is_chained) {
+                        struct smb2_pdu *request;
+                        const uint32_t serial =
+                                smb2->server_compound_active_serial;
+                        if (!smb2->server_compound_broken) {
+                                for (request = smb2->waitqueue; request;
+                                     request = request->next) {
+                                        if (request->server_compound_serial ==
+                                            serial) {
+                                                request->server_compound_count =
+                                                        smb2->server_compound_request_count;
+                                        }
+                                }
+                        }
                         smb2->server_compound_active = 0;
+                        smb2->server_compound_active_serial = 0;
+                        smb2->server_compound_request_count = 0;
                         smb2_flush_server_compound_replies(smb2);
                 }
         } else {

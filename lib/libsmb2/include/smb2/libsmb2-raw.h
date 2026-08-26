@@ -420,6 +420,12 @@ struct smb2_pdu *smb2_cmd_logoff_async(struct smb2_context *smb2,
 struct smb2_pdu *smb2_cmd_logoff_reply_async(struct smb2_context *smb2,
                                        smb2_command_cb cb, void *cb_data);
 
+/* CANCEL не имеет callback: сервер отвечает только исходной команде. Для
+ * асинхронной команды передаётся AsyncId из interim STATUS_PENDING. */
+struct smb2_pdu *smb2_cmd_cancel_async(struct smb2_context *smb2,
+                                       uint64_t message_id,
+                                       uint64_t async_id);
+
 /*
  * Asynchronous SMB2 Flush
  *

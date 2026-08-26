@@ -2,6 +2,8 @@
 # собираются тесты проекта. Прошивочный код берётся как есть, из src/ и lib/:
 # симулятор существует именно для того, чтобы проверять его, а не копию.
 
+param([switch]$ServerOnly)
+
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $root
@@ -74,6 +76,10 @@ cmd /c ('"' + $vcvars + '" >nul && ' + $command)
 if ($LASTEXITCODE -ne 0) { throw "Сборка не удалась ($LASTEXITCODE)" }
 Write-Output "Готово: $out\host_smb.exe"
 
+if ($ServerOnly) {
+    return
+}
+
 # Клиент-пробник: Проводник к симулятору не подпустить (порт в UNC не указать,
 # 445 занят ядром), поэтому сценарии прогоняет он.
 $probe = "cl.exe /nologo /TC /utf-8 /Zi /MDd /W3 /D_CRT_SECURE_NO_WARNINGS " +
@@ -127,3 +133,34 @@ cmd /c ('"' + $vcvars + '" >nul && ' + $reproduce)
 if ($LASTEXITCODE -ne 0) { throw "Сборка проверялки воспроизведения не удалась ($LASTEXITCODE)" }
 Write-Output "Готово: $out\smb_reproduce_test.exe"
 
+# Проводник Windows всегда подключается к TCP/445, но этот порт уже занят
+# системным LanmanServer. Не останавливаем системные службы: отдельный
+# пакетный мост представляет 192.168.1.222:445 и переводит только этот поток в
+# нативный ZiFi SMB-сервер на 127.0.0.1:1445.
+$winDivert = Join-Path $out 'windivert\WinDivert-2.2.2-A'
+$winDivertHeader = Join-Path $winDivert 'include\windivert.h'
+$winDivertLib = Join-Path $winDivert 'x64\WinDivert.lib'
+if ((Test-Path -LiteralPath $winDivertHeader) -and
+    (Test-Path -LiteralPath $winDivertLib)) {
+    $virtualBridge = "cl.exe /nologo /std:c++17 /EHsc /utf-8 /Zi /MDd /W4 " +
+        "/D_CRT_SECURE_NO_WARNINGS " +
+        "/I`"$winDivert\include`" tools\host_smb\virtual_ip_bridge.cpp " +
+        "`"$winDivertLib`" /Fo$out\virtual-bridge\ " +
+        "/Fd$out\zifi_virtual_ip_bridge.pdb " +
+        "/Fe$out\zifi_virtual_ip_bridge.exe /link ws2_32.lib"
+    if (-not (Test-Path "$out\virtual-bridge")) {
+        New-Item -ItemType Directory -Force "$out\virtual-bridge" | Out-Null
+    }
+    Write-Output 'Сборка виртуального SMB-адреса...'
+    cmd /c ('"' + $vcvars + '" >nul && ' + $virtualBridge)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Сборка виртуального SMB-адреса не удалась ($LASTEXITCODE)"
+    }
+    Copy-Item -LiteralPath (Join-Path $winDivert 'x64\WinDivert.dll') `
+        -Destination $out -Force
+    Copy-Item -LiteralPath (Join-Path $winDivert 'x64\WinDivert64.sys') `
+        -Destination $out -Force
+    Write-Output "Готово: $out\zifi_virtual_ip_bridge.exe"
+} else {
+    Write-Warning 'WinDivert не найден; виртуальный адрес не собран.'
+}

@@ -18,10 +18,16 @@ class Z80Simulator {
  public:
   Z80Simulator(HardwareSerial& serial, const std::string& root);
 
-  // Скорость линии, байт в секунду. Ноль — отвечать мгновенно, как раньше.
+  // Скорость линии в обоих направлениях, байт в секунду. Ноль —
+  // отвечать мгновенно, как раньше.
   // Настоящий канал Z80 <-> ESP держит около 6000 байт/с, и гонки, которые
   // на нём воспроизводятся, без задержки не возникают вовсе.
   void setThrottle(unsigned bytesPerSecond) { throttle_ = bytesPerSecond; }
+  // Фиксированная задержка OPENDIR/FINDNEXT воспроизводит медленный FILEX без
+  // искусственного замедления многомегабайтных READ/WRITE тестов.
+  void setDirectoryDelay(unsigned milliseconds) {
+    directoryDelayMs_ = milliseconds;
+  }
 
 
  private:
@@ -56,6 +62,7 @@ class Z80Simulator {
   void handleReadWindow(const std::vector<uint8_t>& payload);
   void handleWriteWindow(const std::vector<uint8_t>& payload);
   void handleSetEof(const std::vector<uint8_t>& payload);
+  void handleSetMetadata(const std::vector<uint8_t>& payload);
   void handleClose();
   void handleOpenDir(const std::vector<uint8_t>& payload);
   void handleReadDir();
@@ -91,6 +98,7 @@ class Z80Simulator {
   // Сколько окон чтения эмулятор реально отдал: повторный проход по файлу,
   // обслуженный кэшем прошивки, не должен увеличивать этот счётчик.
   unsigned throttle_ = 0;
+  unsigned directoryDelayMs_ = 0;
   unsigned long long windowsServed_ = 0;
   unsigned long long bytesServed_ = 0;
 

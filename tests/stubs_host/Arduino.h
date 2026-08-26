@@ -139,7 +139,7 @@ extern HardwareSerial Serial0;
 
 class EspClass {
  public:
-  // Стабильный «MAC» нужен серверу только для устойчивого GUID.
+  // Стабильный «MAC» нужен для устойчивого WSD EndpointReference устройства.
   uint64_t getEfuseMac() const { return 0x00A1B2C3D4E5ULL; }
   uint32_t getFreeHeap() const { return 200u * 1024u; }
   void restart() { std::exit(0); }

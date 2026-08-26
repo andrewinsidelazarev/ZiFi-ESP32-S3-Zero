@@ -315,6 +315,9 @@ struct smb2_context *smb2_init_context(void)
         smb2->sec = SMB2_SEC_UNDEFINED;
         smb2->version = SMB2_VERSION_ANY;
         smb2->ndr = 1;
+        /* По MS-SMB2 3.3.1.2 новое соединение начинается с одного кредита.
+         * Ответы сервера расширяют окно только до локального предела. */
+        smb2->server_credit_window = 1;
 
         for (i = 0; i < 8; i++) {
                 smb2->client_challenge[i] = random() & 0xff;
@@ -356,11 +359,6 @@ void smb2_destroy_context(struct smb2_context *smb2)
                         pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL, pdu->cb_data);
                 }
                 smb2_free_pdu(smb2, pdu);
-        }
-        if (smb2->server_compound_reply) {
-                smb2_free_pdu(smb2, smb2->server_compound_reply);
-                smb2->server_compound_reply = NULL;
-                smb2->server_compound_reply_tail = NULL;
         }
         if (smb2->pdu) {
                 struct smb2_pdu *pdu = smb2->pdu;

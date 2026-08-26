@@ -19,6 +19,7 @@
 #include <chrono>
 #include <thread>
 #include <vector>
+#include <windows.h>
 
 namespace fs = std::filesystem;
 
@@ -44,6 +45,7 @@ constexpr uint8_t kVfsWriteWindow = 0x57;
 constexpr uint8_t kVfsReadWindow = 0x58;
 constexpr uint8_t kVfsSeek = 0x5B;
 constexpr uint8_t kVfsSetEof = 0x5C;
+constexpr uint8_t kVfsSetMetadata = 0x5E;
 
 // Окно позиционного тракта: 16 КиБ минус 32 байта под блок параметров FILEX.
 constexpr size_t kFilexWindow = 16 * 1024 - 32;
@@ -96,6 +98,21 @@ void writeLe32(uint8_t* out, uint32_t value) {
   out[3] = static_cast<uint8_t>(value >> 24);
 }
 
+bool fatDateTimeToFileTime(uint16_t date, uint16_t timeValue,
+                           uint8_t tenth, FILETIME& output) {
+  SYSTEMTIME parts = {};
+  parts.wYear = static_cast<WORD>(1980 + ((date >> 9) & 0x7F));
+  parts.wMonth = static_cast<WORD>((date >> 5) & 0x0F);
+  parts.wDay = static_cast<WORD>(date & 0x1F);
+  parts.wHour = static_cast<WORD>((timeValue >> 11) & 0x1F);
+  parts.wMinute = static_cast<WORD>((timeValue >> 5) & 0x3F);
+  parts.wSecond = static_cast<WORD>((timeValue & 0x1F) * 2 + tenth / 100);
+  parts.wMilliseconds = static_cast<WORD>((tenth % 100) * 10);
+  // ESP преобразует SMB FILETIME в FAT через UTC, поэтому нативный стенд
+  // трактует те же поля как UTC и не добавляет часовой пояс машины Windows.
+  return SystemTimeToFileTime(&parts, &output) != FALSE;
+}
+
 }  // namespace
 
 Z80Simulator::Z80Simulator(HardwareSerial& serial, const std::string& root)
@@ -111,6 +128,17 @@ void Z80Simulator::sinkThunk(void* context, const uint8_t* data,
 // Разбор потока от сервера. Кадр отдаётся обработчику только целиком и только
 // с верной контрольной суммой — как это делает настоящий плагин.
 void Z80Simulator::consume(const uint8_t* data, size_t length) {
+  // UART ограничивает оба направления. Раньше нативный стенд замедлял только
+  // ответы Z80 -> ESP, а данные WRITE из ESP -> Z80 проходили мгновенно. Такой
+  // стенд не мог воспроизвести заполнение кредитного окна SMB на реальной
+  // скорости Wild Commander.
+  if (throttle_ != 0 && length != 0) {
+    const unsigned ms =
+        static_cast<unsigned>(length * 1000ULL / throttle_);
+    if (ms != 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+  }
   for (size_t index = 0; index < length; ++index) {
     const uint8_t value = data[index];
     switch (state_) {
@@ -200,6 +228,11 @@ fs::path Z80Simulator::resolve(const std::string& path) const {
 
 void Z80Simulator::handle(uint8_t command,
                           const std::vector<uint8_t>& payload) {
+  if (directoryDelayMs_ != 0 &&
+      (command == kVfsOpenDir || command == kVfsReadDir)) {
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(directoryDelayMs_));
+  }
   switch (command) {
     case kVfsStat:
       handleStat(payload);
@@ -239,6 +272,9 @@ void Z80Simulator::handle(uint8_t command,
       break;
     case kVfsSetEof:
       handleSetEof(payload);
+      break;
+    case kVfsSetMetadata:
+      handleSetMetadata(payload);
       break;
     default:
       replyStatus(command, kStatusFail);
@@ -477,6 +513,95 @@ void Z80Simulator::handleSetEof(const std::vector<uint8_t>& payload) {
   answer[0] = kStatusOk;
   writeLe32(answer + 1, size);
   reply(kVfsSetEof, answer, sizeof(answer));
+}
+
+// SET_METADATA повторяет 16-байтный блок FILEX. Нативный стенд обязан
+// изменять настоящие метаданные файла Windows, иначе успешный ответ проверял
+// бы только код возврата, но не результат операции.
+void Z80Simulator::handleSetMetadata(
+    const std::vector<uint8_t>& payload) {
+  if (!openValid_ || openMode_ != 3 || payload.size() != 16 ||
+      payload[0] != 16) {
+    replyStatus(kVfsSetMetadata, kStatusFail);
+    return;
+  }
+
+  const uint8_t timeMask = payload[3];
+  if (timeMask != 0) {
+    FILETIME creation = {};
+    FILETIME access = {};
+    FILETIME write = {};
+    FILETIME* creationPtr = nullptr;
+    FILETIME* accessPtr = nullptr;
+    FILETIME* writePtr = nullptr;
+    if ((timeMask & 0x01U) != 0) {
+      if (!fatDateTimeToFileTime(readLe16(payload.data() + 7),
+                                 readLe16(payload.data() + 5), payload[4],
+                                 creation)) {
+        replyStatus(kVfsSetMetadata, kStatusFail);
+        return;
+      }
+      creationPtr = &creation;
+    }
+    if ((timeMask & 0x02U) != 0) {
+      if (!fatDateTimeToFileTime(readLe16(payload.data() + 9), 0, 0,
+                                 access)) {
+        replyStatus(kVfsSetMetadata, kStatusFail);
+        return;
+      }
+      accessPtr = &access;
+    }
+    if ((timeMask & 0x04U) != 0) {
+      if (!fatDateTimeToFileTime(readLe16(payload.data() + 13),
+                                 readLe16(payload.data() + 11), 0, write)) {
+        replyStatus(kVfsSetMetadata, kStatusFail);
+        return;
+      }
+      writePtr = &write;
+    }
+
+    HANDLE file = CreateFileW(
+        openPath_.c_str(), FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (file == INVALID_HANDLE_VALUE ||
+        !SetFileTime(file, creationPtr, accessPtr, writePtr)) {
+      if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+      }
+      replyStatus(kVfsSetMetadata, kStatusFail);
+      return;
+    }
+    CloseHandle(file);
+  }
+
+  const DWORD current = GetFileAttributesW(openPath_.c_str());
+  if (current == INVALID_FILE_ATTRIBUTES) {
+    replyStatus(kVfsSetMetadata, kStatusFail);
+    return;
+  }
+  const DWORD mask = payload[1] & 0x27U;
+  DWORD updated = (current & ~mask) | (payload[2] & mask);
+  if (mask != 0) {
+    if ((updated & 0x27U) == 0) {
+      updated |= FILE_ATTRIBUTE_NORMAL;
+    } else {
+      updated &= ~FILE_ATTRIBUTE_NORMAL;
+    }
+    if (!SetFileAttributesW(openPath_.c_str(), updated)) {
+      replyStatus(kVfsSetMetadata, kStatusFail);
+      return;
+    }
+  }
+
+  const DWORD applied = GetFileAttributesW(openPath_.c_str());
+  if (applied == INVALID_FILE_ATTRIBUTES) {
+    replyStatus(kVfsSetMetadata, kStatusFail);
+    return;
+  }
+  uint8_t answer[2] = {kStatusOk,
+                       static_cast<uint8_t>(applied & 0x27U)};
+  reply(kVfsSetMetadata, answer, sizeof(answer));
 }
 
 void Z80Simulator::handleClose() {
