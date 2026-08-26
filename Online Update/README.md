@@ -1,8 +1,7 @@
 # ZiFi Online Update
 
 `ZIFIUPD.WMF v0.6` — пользовательский плагин Wild Commander для автономного
-обновления ZiFi ESP32-S3 Zero. Компьютер, Python, IP-адрес и `update.sna` для
-обычного обновления не нужны.
+обновления ZiFi ESP32-S3 Zero "по воздуху" (OTA) прошивкой из этого репозитория.
 
 ## Установка
 
