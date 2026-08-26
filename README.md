@@ -52,6 +52,7 @@ WebDAV ещё не включён. Сетевой файловый listener за
 | Категория | Файл для скачивания | Назначение |
 |---|---|---|
 | **Первая прошивка (USB)** | [**`firmware.factory.bin`**](firmware/firmware.factory.bin) | Полный 4 МБ образ для первой прошивки ESP32-S3 через USB Type-C (смещение `0x0`) |
+| **Проверка без Wi-Fi** | [**`esp_info.sna`**](tools/esp_info.sna) | Программа для ZX Evolution: проверяет запуск прошивки и UART-связь с ESP до настройки `zifi.ini` и Wi-Fi |
 | **Обновление по Wi-Fi (OTA)** | [**`firmware.bin`**](firmware/firmware.bin) | Образ приложения для сетевого обновления ([SHA-256](firmware/firmware.sha256)) |
 | **Автономный апдейтер** | [**`ZIFIUPD.WMF`**](Online%20Update/build/ZIFIUPD.WMF) | Пользовательский плагин Wild Commander: читает `zifi.ini`, скачивает и устанавливает прошивку с GitHub |
 | **Режим обновления с PC** | [**`Update Mode`**](Update%20Mode/src/update.asm) | Исходник локально собираемого `update.sna`, запускающего приём OTA на порту 8267 |
