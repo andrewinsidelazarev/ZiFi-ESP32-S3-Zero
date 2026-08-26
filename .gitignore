@@ -3,6 +3,7 @@
 .pio/
 .test-build/
 baselines/
+/Update Mode/
 
 # Python & OS artifacts
 __pycache__/
