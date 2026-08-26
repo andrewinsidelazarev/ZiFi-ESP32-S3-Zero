@@ -1,6 +1,6 @@
 # ZiFi ESP32-S3 Zero NTP Time Sync
 
-Плагин Wild Commander Improved типа `#06`: после инициализации WC загружает
+Плагин Wild Commander Improved типа `#06` (исполняемый при запуске WC) : после инициализации WC загружает
 `/zifi/zifi.ini`, передаёт его ESP32-S3-Zero командой `WIFI_INI`, запрашивает
 `NET_NTP` и при расхождении не менее минуты обновляет RTC Mr.Gluk.
 
