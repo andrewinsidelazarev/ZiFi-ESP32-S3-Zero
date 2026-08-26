@@ -11,9 +11,19 @@
 
 CONFIG_SECTOR_SIZE equ 512
 
-; Найти, прочитать и разобрать конфигурацию. Читается один сектор: значение
-; каждого параметра обязано начаться до байта 511. Выход: CF=0 — настройки и
-; CmdCwjap готовы; CF=1 — ConfigError содержит этап ошибки 1..5.
+; По умолчанию старые плагины сохраняют прежний односекторный предел. Online
+; Update задаёт препроцессорный флаг CONFIG_FULL_INI перед INCLUDE.
+        IFDEF CONFIG_FULL_INI
+CONFIG_MAX_INI_SIZE    equ 1024
+CONFIG_INI_BUFFER_SIZE equ 1025
+        ELSE
+CONFIG_MAX_INI_SIZE    equ CONFIG_SECTOR_SIZE-1
+CONFIG_INI_BUFFER_SIZE equ CONFIG_SECTOR_SIZE
+        ENDIF
+
+; Найти и прочитать конфигурацию. Старые плагины читают один сектор, а при
+; CONFIG_FULL_INI — до двух секторов/1024 байтов. Выход: CF=0 — файл готов;
+; CF=1 — ConfigError содержит этап ошибки.
 Config_Load:
         call Config_Defaults
 
@@ -42,8 +52,24 @@ Config_Load:
         jp .file_error
 
 .file_open:
-        ; Размер WC_FENTRY приходит как DE:HL. Для парсера достаточно не более
-        ; 511 байтов: последний байт сектора резервируется под завершающий ноль.
+        IFDEF CONFIG_FULL_INI
+        ; Размер WC_FENTRY приходит как DE:HL. Проверяем его до чтения, чтобы
+        ; плагин с полным WIFI_INI не выдавал молча усечённую конфигурацию.
+        ld a,d
+        or e
+        jr nz,.limit_ini
+        ld bc,CONFIG_MAX_INI_SIZE+1
+        or a
+        sbc hl,bc
+        jr nc,.limit_ini
+        add hl,bc
+        ld (IniLength),hl
+        jr .length_ready
+.limit_ini:
+        ld a,4
+        jp .fail
+        ELSE
+        ; Прежний контракт серверных плагинов: взять не более 511 байтов.
         ld a,d
         or e
         jr nz,.limit_ini
@@ -55,10 +81,24 @@ Config_Load:
 .limit_ini:
         ld hl,CONFIG_SECTOR_SIZE-1
         ld (IniLength),hl
+        ENDIF
 .length_ready:
         call WC_GFILE
         ld hl,IniBuffer
         ld b,1
+        IFDEF CONFIG_FULL_INI
+        ; Ровно 512 байтов помещаются в один сектор; 513..1024 требуют два.
+        ld a,(IniLength+1)
+        cp 2
+        jr c,.load_ini
+        jr nz,.load_two
+        ld a,(IniLength)
+        or a
+        jr z,.load_ini
+.load_two:
+        ld b,2
+.load_ini:
+        ENDIF
         call WC_LOAD512
         ld de,(IniLength)
         ld hl,IniBuffer
@@ -211,4 +251,4 @@ ConfigTryDevice:      db 0
 ConfigError:          db 0
 IniLength:            dw 0
 FtpPort:              dw 21
-IniBuffer:            ds CONFIG_SECTOR_SIZE
+IniBuffer:            ds CONFIG_INI_BUFFER_SIZE

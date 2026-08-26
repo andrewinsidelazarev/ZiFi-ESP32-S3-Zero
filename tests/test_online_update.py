@@ -91,6 +91,12 @@ class OnlineUpdateTest(unittest.TestCase):
         plugin = (ROOT / "Online Update" / "src" / "updater.asm").read_text(
             encoding="utf-8"
         )
+        plugin_main = (ROOT / "Online Update" / "src" / "main.asm").read_text(
+            encoding="utf-8"
+        )
+        config = (ROOT / "shared" / "z80" / "config.asm").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("kOnlineUpdate = 0x0D", protocol)
         self.assertIn("kOnlineUpdateCheck = 0x0E", protocol)
@@ -109,19 +115,84 @@ class OnlineUpdateTest(unittest.TestCase):
         )
         self.assertIn("ld a,CMD_WIFI_INI", plugin)
         self.assertIn("ld a,CMD_ONLINE_UPDATE_CHECK", plugin)
+        self.assertIn("DEFINE CONFIG_FULL_INI", plugin_main)
+        self.assertIn("CONFIG_MAX_INI_SIZE    equ 1024", config)
+        self.assertIn("CONFIG_INI_BUFFER_SIZE equ 1025", config)
+        self.assertIn("ds CONFIG_INI_BUFFER_SIZE", config)
+        self.assertIn("ld b,2", config)
+        link_error = plugin[plugin.index(".link_error:"):plugin.index(".update_error:")]
+        self.assertIn("ld hl,ProtoErrText", link_error)
+        start_link = plugin[
+            plugin.index("Updater_StartLink:"):plugin.index("Updater_WaitWifiResult:")
+        ]
+        self.assertLess(
+            start_link.index("ld a,CMD_SYS_RESET"),
+            start_link.index("call Updater_WaitReady"),
+        )
+        self.assertLess(
+            start_link.index("call Updater_WaitReady"),
+            start_link.index("call Updater_ReadVersion"),
+        )
+        self.assertLess(
+            start_link.index("call Updater_ReadVersion"),
+            start_link.index("ld a,CMD_WIFI_INI"),
+        )
+        wifi_wait = plugin[
+            plugin.index("Updater_WaitWifiResult:"):plugin.index("Updater_WaitReady:")
+        ]
+        self.assertIn("ld (UpdaterKeepWaiting),a", wifi_wait)
+        self.assertIn("ld a,RESP_WIFI_INI", wifi_wait)
+        error_handler = plugin[plugin.index(".error:"):plugin.index(".idle:")]
+        self.assertIn("call Proto_SaveErr", error_handler)
+        self.assertIn("ld a,(UpdaterKeepWaiting)", error_handler)
+        self.assertIn("jr nz,.alive", error_handler)
+        stock_ini = (ROOT / "ZiFi SPG" / "build" / "zifi.ini").read_bytes()
+        self.assertGreater(len(stock_ini), 511)
+        self.assertLessEqual(len(stock_ini), 1024)
         self.assertLess(
             plugin.index("call Updater_CheckPublished"),
             plugin.index(".confirm:"),
         )
+        downgrade_gate = plugin[
+            plugin.index("call Updater_CheckPublished"):plugin.index(".confirm:")
+        ]
+        self.assertIn("call Updater_ResolveCurrent", downgrade_gate)
+        self.assertIn("ld a,(UpdaterRelation)", downgrade_gate)
+        self.assertIn("cp ONLINE_UPDATE_OLDER", downgrade_gate)
+        self.assertIn("jp z,.wait_exit", downgrade_gate)
+        self.assertNotIn("ld a,CMD_ONLINE_UPDATE", downgrade_gate)
+        relation_decode = plugin[
+            plugin.index("ld a,(ProtoBuf+1)"):plugin.index(".show:")
+        ]
+        self.assertIn("ld (UpdaterRelation),a", relation_decode)
         ui = (ROOT / "Online Update" / "src" / "ui.asm").read_text(
             encoding="utf-8"
         )
         self.assertIn('db "Current: "', ui)
         self.assertIn('db "Available: "', ui)
         self.assertIn('db "Progress: ["', ui)
+        self.assertIn("Restarting ZiFi before update", ui)
         self.assertIn("UI_PROGRESS_BAR_WIDTH equ 32", ui)
         self.assertIn("Same version. ENTER = reinstall", ui)
-        self.assertIn("ENTER - install or reinstall", ui)
+        self.assertIn("ENTER - install newer / reinstall same version", ui)
+        self.assertIn("Older version. DOWNGRADE BLOCKED", ui)
+        self.assertNotIn("Published version is older. ENTER = install", ui)
+        self.assertIn('UiUnavailable:      db "unavailable",0', ui)
+
+        version_reader = plugin[
+            plugin.index("Updater_ReadVersion:"):plugin.index("Updater_FindVersion:")
+        ]
+        self.assertIn("ld b,3", version_reader)
+        self.assertIn("djnz .try", version_reader)
+        self.assertIn("call Updater_FindVersion\n        ret c", version_reader)
+        self.assertIn("ld (UpdaterVersionValid),a", version_reader)
+        version_recovery = plugin[
+            plugin.index("Updater_ResolveCurrent:"):plugin.index("Updater_FindVersion:")
+        ]
+        self.assertIn("cp ONLINE_UPDATE_SAME", version_recovery)
+        self.assertIn("ld hl,UiAvailableField", version_recovery)
+        self.assertIn("ld de,UiVersionField", version_recovery)
+        self.assertIn("ld hl,UiUnavailable", version_recovery)
 
     def test_built_wmf_has_wild_commander_menu_header(self) -> None:
         plugin = (ROOT / "Online Update" / "build" / "ZIFIUPD.WMF").read_bytes()
@@ -130,9 +201,29 @@ class OnlineUpdateTest(unittest.TestCase):
         self.assertEqual(plugin[32], 0x0A)
         self.assertEqual(plugin[34:36], b"\x01\x00")
         self.assertEqual(
-            plugin[165:197].rstrip(b" "), b"ZiFi Online Update v0.3"
+            plugin[165:197].rstrip(b" "), b"ZiFi Online Update v0.6"
         )
         self.assertEqual(plugin[197], 0x03)
+
+    def test_wifi_diagnostic_precedes_the_mandatory_final_response(self) -> None:
+        firmware = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
+        wifi_ini = firmware[
+            firmware.index("void Application::processWifiIni()"):
+            firmware.index("void Application::processNetProxyStatus()")
+        ]
+        response = firmware[
+            firmware.index("void Application::pollNetworkResponse()"):
+            firmware.index("void Application::pollNetworkEvent()")
+        ]
+
+        self.assertLess(
+            wifi_ini.index('setNetworkError("ini cache:%s"'),
+            wifi_ini.index("const bool connected = connectWifi"),
+        )
+        self.assertLess(
+            response.index('reportError("%s", exchange_->error)'),
+            response.index("transport_.send(exchange_->responseCommand"),
+        )
 
 
 if __name__ == "__main__":

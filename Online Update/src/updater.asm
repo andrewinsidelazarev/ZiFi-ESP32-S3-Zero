@@ -27,6 +27,13 @@ PLUGIN:
         call Ui_Draw
         call Updater_CheckPublished
         jp c,.update_error
+        call Updater_ResolveCurrent
+
+        ; Понижение запрещено до подтверждения: при ONLINE_UPDATE_OLDER Enter
+        ; не опрашивается и CMD_ONLINE_UPDATE физически не отправляется.
+        ld a,(UpdaterRelation)
+        cp ONLINE_UPDATE_OLDER
+        jp z,.wait_exit
 
 .confirm:
         ei
@@ -53,11 +60,11 @@ PLUGIN:
         ld (ProtoErr),a
         ld a,CMD_ONLINE_UPDATE
         call Proto_SendEmpty
-        jr c,.update_error
+        jp c,.update_error
         ld a,RESP_ACK
         ld de,UPDATER_WAIT
         call Proto_WaitCmd
-        jr c,.update_error
+        jp c,.update_error
         ld a,RESP_ONLINE_UPDATE
         call Updater_WaitResult
         jr c,.update_error
@@ -97,6 +104,9 @@ PLUGIN:
         cp 2
         ld hl,UiErrorDir
         jr z,.fatal
+        cp 4
+        ld hl,UiErrorIniLarge
+        jr z,.fatal
         ld hl,UiErrorIni
         jr .fatal
 
@@ -109,6 +119,10 @@ PLUGIN:
         ld hl,UiErrorFirmware
         jr z,.fatal
         ld hl,UiErrorWifi
+        ld a,(ProtoErr)
+        or a
+        jr z,.fatal
+        ld hl,ProtoErrText
         jr .fatal
 
 .update_error:
@@ -154,6 +168,15 @@ Updater_StartLink:
         scf
         ret
 .zifi_ok:
+        ; Как FTP/SMB, начинаем с чистого состояния ESP. RESET ZX модуль не
+        ; перезапускает, поэтому без SYS_RESET могли остаться прежний сервер,
+        ; сетевые запросы и раздробленная куча. ACK специально не ждём: после
+        ; команды критерием служит только READY уже от новой загрузки.
+        ld hl,UiResettingZiFi
+        call Ui_SetStatus
+        call Ui_Draw
+        ld a,CMD_SYS_RESET
+        call Proto_SendEmpty
         call Updater_WaitReady
         jr nc,.ready
         ld a,2
@@ -177,8 +200,7 @@ Updater_StartLink:
         ld de,UPDATER_WAIT
         call Proto_WaitCmd
         jr c,.wifi_fail
-        ld a,RESP_WIFI_INI
-        call Updater_WaitResult
+        call Updater_WaitWifiResult
         jr c,.wifi_fail
         ld a,(ProtoBuf)
         or a
@@ -189,6 +211,19 @@ Updater_StartLink:
         ld a,3
         ld (UpdaterError),a
         scf
+        ret
+
+; WIFI_INI присылает сначала точный текст #EE, затем обязательный ответ #83 со
+; статусом. Для этого единственного этапа сохраняем ошибку, но ждём сам #83.
+Updater_WaitWifiResult:
+        ld a,1
+        ld (UpdaterKeepWaiting),a
+        ld a,RESP_WIFI_INI
+        call Updater_WaitResult
+        push af
+        xor a
+        ld (UpdaterKeepWaiting),a
+        pop af
         ret
 
 Updater_WaitReady:
@@ -207,8 +242,8 @@ Updater_WaitReady:
         ret
 
 ; Прочитать только опубликованный manifest. Flash не открывается на запись.
-; Ответ: [1][relation][available version ASCII]. Enter разрешён при любом
-; relation, включая ONLINE_UPDATE_SAME — это восстановительная переустановка.
+; Ответ: [1][relation][available version ASCII]. SAME разрешает восстановительную
+; переустановку, NEWER — обновление, OLDER блокируется вызывающим кодом.
 Updater_CheckPublished:
         xor a
         ld (ProtoErr),a
@@ -238,6 +273,7 @@ Updater_CheckPublished:
         call Ui_SetAvailable
 
         ld a,(ProtoBuf+1)
+        ld (UpdaterRelation),a
         cp ONLINE_UPDATE_SAME
         ld hl,UiSameVersion
         jr z,.show
@@ -257,27 +293,74 @@ Updater_CheckPublished:
         scf
         ret
 
-; SYS_INFO не является причиной запрещать восстановительную переустановку:
-; если версия не читается, оставляем понятную заглушку и продолжаем.
+; SYS_INFO после аппаратного reset может потеряться на границе новой загрузки.
+; Делаем три самостоятельных запроса вместо прежней единственной короткой
+; попытки. Ошибка версии всё равно не запрещает безопасную переустановку.
 Updater_ReadVersion:
+        xor a
+        ld (UpdaterVersionValid),a
+        ld b,3
+.try:
+        push bc
+        xor a
+        ld (ProtoErr),a
         ld a,CMD_SYS_INFO
         call Proto_SendEmpty
+        jr c,.retry
         ld a,RESP_ACK
         ld de,UPDATER_WAIT
         call Proto_WaitCmd
-        ret c
+        jr c,.retry
         ld a,RESP_SYS_INFO
         ld de,UPDATER_WAIT
         call Proto_WaitCmd
-        ret c
+        jr nc,.got
+.retry:
+        pop bc
+        djnz .try
+        scf
+        ret
+.got:
+        pop bc
         ld hl,ProtoBuf
         ld bc,(ProtoRxLen)
         add hl,bc
         ld (hl),0
         call Updater_FindVersion
+        ret c
         call Ui_SetVersion
         call Ui_Draw
+        ld a,1
+        ld (UpdaterVersionValid),a
+        or a
         ret
+
+; После успешного CHECK поле Current не должно оставаться в состоянии
+; "detecting...". Сначала повторяем SYS_INFO уже на полностью устойчивой ESP.
+; Если и он потерян, relation=SAME является строгим доказательством равенства
+; строк версий на ESP, поэтому Current можно побайтно взять из Available.
+Updater_ResolveCurrent:
+        ld a,(UpdaterVersionValid)
+        or a
+        ret nz
+        call Updater_ReadVersion
+        ld a,(UpdaterVersionValid)
+        or a
+        ret nz
+        ld a,(UpdaterRelation)
+        cp ONLINE_UPDATE_SAME
+        jr nz,.unavailable
+        ld hl,UiAvailableField
+        ld de,UiVersionField
+        ld bc,UI_VERSION_WIDTH
+        ldir
+        ld a,1
+        ld (UpdaterVersionValid),a
+        jp Ui_Draw
+.unavailable:
+        ld hl,UiUnavailable
+        call Ui_SetVersion
+        jp Ui_Draw
 
 Updater_FindVersion:
         ld hl,ProtoBuf
@@ -296,12 +379,14 @@ Updater_FindVersion:
         cp ':'
         jr nz,.scan
         inc hl
+        or a
         ret
 .next:
         inc hl
         jr .scan
 .absent:
         ld hl,UiUnknown
+        scf
         ret
 
 ; Ожидание долгой сетевой операции. При CHECK/ONLINE_UPDATE одновременно
@@ -336,6 +421,9 @@ Updater_WaitResult:
         ld a,1
         ld (ProtoErr),a
         call Proto_SaveErr
+        ld a,(UpdaterKeepWaiting)
+        or a
+        jr nz,.alive
         scf
         ret
 .idle:
@@ -402,3 +490,6 @@ UpdaterError:       db 0
 UpdaterWanted:      db 0
 UpdaterSilence:     db 0
 UpdaterTicks:       dw 0
+UpdaterKeepWaiting: db 0
+UpdaterRelation:    db ONLINE_UPDATE_DIFFERENT
+UpdaterVersionValid: db 0

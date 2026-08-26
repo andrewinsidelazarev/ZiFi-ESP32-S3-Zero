@@ -11,6 +11,7 @@ startCode:
         DISP #8000
 mainStart:
         INCLUDE "updater.asm"
+        DEFINE CONFIG_FULL_INI
         INCLUDE "config.asm"
         INCLUDE "proto.asm"
         INCLUDE "zifi_uart.asm"

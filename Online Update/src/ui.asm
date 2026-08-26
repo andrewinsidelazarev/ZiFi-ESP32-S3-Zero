@@ -195,18 +195,20 @@ UiProgressBarField:
 UiProgressField:
         ds 3,' '
         db "%",#0D,#0D
-        db "ENTER - install or reinstall published firmware",#0D
+        db "ENTER - install newer / reinstall same version",#0D
         db "ESC   - cancel / return to Wild Commander",#0D,#0D
         db #0E,"Do not switch power off after confirmation.",0
 
 UiUnknown:          db "detecting...",0
+UiUnavailable:      db "unavailable",0
 UiReadingConfig:    db "Reading /zifi/zifi.ini",0
 UiDetecting:        db "Detecting ZiFi firmware",0
+UiResettingZiFi:    db "Restarting ZiFi before update",0
 UiConnecting:       db "Connecting to Wi-Fi",0
 UiChecking:         db "Checking published firmware",0
 UiSameVersion:      db "Same version. ENTER = reinstall",0
 UiNewerVersion:     db "New version available. ENTER = install",0
-UiOlderVersion:     db "Published version is older. ENTER = install",0
+UiOlderVersion:     db "Older version. DOWNGRADE BLOCKED",0
 UiDifferentVersion: db "Different build. ENTER = install",0
 UiManifest:         db "Reading version and SHA-256",0
 UiDownloading:      db "Downloading firmware.bin",0
@@ -218,6 +220,7 @@ UiCancelled:        db "Cancelled",0
 UiErrorSd:          db "ERROR: no readable SD volume",0
 UiErrorDir:         db "ERROR: /zifi directory missing",0
 UiErrorIni:         db "ERROR: /zifi/zifi.ini missing",0
+UiErrorIniLarge:    db "ERROR: zifi.ini exceeds 1024 bytes",0
 UiErrorNoZifi:      db "ERROR: ZiFi not detected",0
 UiErrorFirmware:    db "ERROR: incompatible ESP firmware",0
 UiErrorWifi:        db "ERROR: Wi-Fi connection failed",0
