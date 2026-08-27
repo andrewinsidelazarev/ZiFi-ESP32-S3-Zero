@@ -91,8 +91,11 @@ load_sw		ld a,0
 		cp save_file
 		jr c,do_after_load
 		call create_filename
+		call retry_online_unzip_if_bad
+		jr c,reject_downloaded_file
 		call validate_zip_body
 		jr nc,do_after_load
+reject_downloaded_file
 		xor a
 		ld (do_after_load+1),a
 do_after_load	ld a,0
@@ -348,83 +351,120 @@ create_filename_ext_ready
 		ld (ix+thread.full_len),hl	; hl - low 16bit lenght
 		ret
 
+; Если online-unzip вернул обычный распакованный файл, create_filename уже
+; снял четырёхбайтовый префикс .ext и заменил расширение имени. Если же ответ
+; остался .zip, но за префиксом нет ZIP-сигнатуры, один раз повторить загрузку
+; напрямую по исходной ссылке из каталога. Это сохраняет рабочий raw-ZIP путь
+; при очередной поломке серверного распаковщика и не создаёт цикл повторов.
+retry_online_unzip_if_bad
+		ld a,(online_unzip_attempt)
+		or a
+		ret z
+		xor a
+		ld (online_unzip_attempt),a
+		call zip_body_is_valid
+		ret nc
+		ld hl,net_unzip_fallback_msg
+		ld b,1
+		call zifi_log
+		ld hl,zip_url_buffer_data
+		call parse_url
+		call modem_load_file
+		ld a,(do_after_load+1)
+		cp save_file
+		jr nz,retry_online_unzip_failed
+		call create_filename
+		or a
+		ret
+retry_online_unzip_failed
+		scf
+		ret
+
 ; Если имя оканчивается на .zip, тело обязано начинаться с допустимой ZIP
 ; сигнатуры. Так PHP/HTML-ошибка или текст прокси никогда не запишется на SD
 ; под видом архива. Для остальных форматов эта проверка ничего не меняет.
 validate_zip_body
+		call zip_body_is_valid
+		ret nc
+		ld hl,net_bad_zip_msg
+		ld b,1
+		call zifi_log
+		scf
+		ret
+
+; Проверка без сообщения нужна для тихого решения online-unzip -> raw ZIP.
+; Выход: C=1 только для файла с расширением .zip и неверным телом.
+zip_body_is_valid
 		ld hl,(ix+thread.file_ext)
 		ld a,(hl)
 		or #20
 		cp "z"
-		jr nz,validate_zip_not_zip
+		jr nz,zip_body_not_zip
 		inc hl
 		ld a,(hl)
 		or #20
 		cp "i"
-		jr nz,validate_zip_not_zip
+		jr nz,zip_body_not_zip
 		inc hl
 		ld a,(hl)
 		or #20
 		cp "p"
-		jr nz,validate_zip_not_zip
+		jr nz,zip_body_not_zip
 		inc hl
 		ld a,(hl)
 		or a
-		jr nz,validate_zip_not_zip
+		jr nz,zip_body_not_zip
 
 		ld a,(ix+thread.full_len_high)
 		or a
-		jr nz,validate_zip_signature
+		jr nz,zip_body_signature
 		ld hl,(ix+thread.full_len)
 		ld de,4
 		or a
 		sbc hl,de
-		jr c,validate_zip_bad
+		jr c,zip_body_bad
 
-validate_zip_signature
+zip_body_signature
 		ld a,(ix+thread.page)
 		call set_page1
 		ld hl,(ix+thread.adress)
 		ld a,(hl)
 		cp "P"
-		jr nz,validate_zip_bad
+		jr nz,zip_body_bad
 		inc hl
 		ld a,(hl)
 		cp "K"
-		jr nz,validate_zip_bad
+		jr nz,zip_body_bad
 		inc hl
 		ld a,(hl)
 		inc hl
 		cp #03
-		jr z,validate_zip_local
+		jr z,zip_body_local
 		cp #05
-		jr z,validate_zip_empty
+		jr z,zip_body_empty
 		cp #07
-		jr nz,validate_zip_bad
+		jr nz,zip_body_bad
 		ld a,(hl)
 		cp #08
-		jr nz,validate_zip_bad
+		jr nz,zip_body_bad
 		or a
 		ret
-validate_zip_local
+zip_body_local
 		ld a,(hl)
 		cp #04
-		jr nz,validate_zip_bad
+		jr nz,zip_body_bad
 		or a
 		ret
-validate_zip_empty
+zip_body_empty
 		ld a,(hl)
 		cp #06
-		jr nz,validate_zip_bad
+		jr nz,zip_body_bad
 		or a
 		ret
-validate_zip_not_zip
+zip_body_not_zip
 		or a
 		ret
-validate_zip_bad
-		ld hl,net_bad_zip_msg
-		ld b,1
-		call zifi_log
+zip_body_bad
 		scf
 		ret
 
@@ -736,6 +776,7 @@ net_http_status_msg	db "HTTP status is not 2xx",0,0
 net_short_body_msg	db "HTTP body length mismatch",0,0
 net_too_large_msg	db "ZIP exceeds 640 KiB buffer",0,0
 net_bad_zip_msg		db "Rejected: .zip body is not ZIP",0,0
+net_unzip_fallback_msg	db "Online unzip failed, loading ZIP",0,0
 net_empty_body_msg	db "NET EOF: empty HTTP body",0,0
 net_diag_no_reply_msg	db "GET_STEP: no reply",0,0
 net_diag_empty_msg	db "GET_STEP: no error text",0,0
@@ -2685,8 +2726,42 @@ sum_list_lines	ld a,0
 		jr main_list_url		; paging for text files
 
 1		push hl
-		; Ссылка из каталога передаётся напрямую. Серверный unzipremote.php
-		; больше не участвует: HTTPS и сырой ZIP принимает ESP.
+		ld a,(do_after_link_list+1)
+		cp save_file
+		jr nz,selected_url_direct
+
+		; Как в оригинальном ZiFi SPG, загружаемые файлы сначала проходят через
+		; online-unzip. Оригинальный URL сохраняется после префикса и остаётся
+		; доступен для прямого повтора. Ограничение 236 символов не даёт
+		; составному пути переполнить 256-байтовый request_path.
+		ld de,zip_url_buffer_data
+		ld b,237
+copy_online_unzip_url
+		ld a,(hl)
+		cp #0d
+		jr z,selected_url_online_unzip
+		cp #0a
+		jr z,selected_url_online_unzip
+		ld (de),a
+		inc hl
+		inc de
+		djnz copy_online_unzip_url
+
+selected_url_direct
+		pop hl
+		push hl
+		xor a
+		ld (online_unzip_attempt),a
+		jr selected_url_parse
+
+selected_url_online_unzip
+		ld a,#0d
+		ld (de),a
+		ld a,1
+		ld (online_unzip_attempt),a
+		ld hl,zip_url_buffer
+
+selected_url_parse
 		call parse_url
 		pop hl
 		call scan_0d
@@ -3655,6 +3730,10 @@ readed_len_high		ds 1
 
 ; Заготовки строк запроса удалены: «GET … HTTP/1.0», Host, User-Agent и
 ; Connection собирает ESP в http_get. На Z80 этой склейки больше нет.
+
+zip_url_buffer	db "http://zifi.vtrd.in/unzipremote.php?f="
+zip_url_buffer_data	ds 237
+online_unzip_attempt	db 0
 
 list_search_db
 		db "Search:"

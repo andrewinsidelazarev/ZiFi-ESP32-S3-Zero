@@ -103,8 +103,9 @@ Wild Commander по 16 КиБ; каталожный кэш остаётся в �
 * **`ZiFi SPG` (`ZiFi SPG/build/zifi.spg`):**
   Полноценный браузер и загрузчик для ZX-Evolution (исходники на Z80 и сборка SPG в `ZiFi SPG/`).
   Работает через двоичные команды `NET_HTTP_GET`, `NET_RECV`, `NET_CLOSE`, `WIFI_INI` и `NET_NTP`.
-  HTTP/HTTPS-ссылки передаются ESP напрямую; ZIP сохраняется как сырой архив
-  без зависимости от серверного `unzipremote.php`.
+  ZIP-ссылки сначала проходят через серверный `unzipremote.php`: корректный
+  распакованный файл сохраняется сразу, а ложный `.zip` без сигнатуры `PK`
+  автоматически повторно загружается напрямую как исходный ZIP-архив.
 * **`SMB Server` (`SMB Server/build/ZIFISMB.WMF`):**
   Плагин для Wild Commander, поднимающий файловый сервер Windows SMB2/SMB3 с доступом к SD-карте по сети `\\ZX-Evo\SD`.
 * **`FTP Server` (`FTP Server/build/ZIFIFTP.WMF`):**
