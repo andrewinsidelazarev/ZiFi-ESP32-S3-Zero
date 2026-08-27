@@ -42,9 +42,10 @@ echo Compiling smb_reproduce_test.exe...
 if errorlevel 1 exit /b 1
 echo Compilation SUCCESS!
 '''
-    Path('build_host_test.bat').write_text(bat_content, encoding='utf-8')
+    build_script = out / 'build_host_test.bat'
+    build_script.write_text(bat_content, encoding='utf-8')
     print("Building MSVC binaries...")
-    r = subprocess.run(['cmd.exe', '/c', 'build_host_test.bat'], capture_output=True, text=True)
+    r = subprocess.run(['cmd.exe', '/c', str(build_script)], capture_output=True, text=True)
     print("Build STDOUT:", r.stdout[-1500:])
     if r.returncode != 0:
         print("Build STDERR:", r.stderr)
@@ -88,6 +89,63 @@ echo Compilation SUCCESS!
             encoding='utf-8', errors='replace')[-4000:]
         print("SERVER LOG TAIL:\n" + server_tail)
         raise RuntimeError("SMB regression failed")
+
+    # Сжатый тайм-аут воспроизводит дефект реального медленного FILEX без
+    # двухминутного ожидания: третий WRITE и ожидающие READ из TEST 8 должны
+    # пережить обычный PDU timeout, пока ими владеет очередь приложения.
+    timeout_port = 14446
+    timeout_env = os.environ.copy()
+    timeout_env['ZIFI_HOST_PDU_TIMEOUT_SECONDS'] = '1'
+    timeout_log_path = out / 'host_smb_timeout.log'
+    timeout_test = None
+    with timeout_log_path.open('w', encoding='utf-8') as timeout_log:
+        timeout_server = subprocess.Popen(
+            ['.test-build/host_smb/host_smb.exe', str(test_share),
+             str(timeout_port), '30000'],
+            stdout=timeout_log, stderr=subprocess.STDOUT, text=True,
+            env=timeout_env)
+        try:
+            time.sleep(1.5)
+            print('Running deferred-request timeout regression...')
+            timeout_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{timeout_port}', 'SD', 'test8'],
+                capture_output=True, text=True, timeout=120)
+            print("TIMEOUT TEST OUTPUT:\n" + timeout_test.stdout)
+        finally:
+            timeout_server.terminate()
+            try:
+                timeout_server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                timeout_server.kill()
+                timeout_server.wait(timeout=2)
+
+    if timeout_test is None or timeout_test.returncode != 0:
+        timeout_tail = timeout_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("TIMEOUT SERVER LOG TAIL:\n" + timeout_tail)
+        raise RuntimeError("Deferred SMB request expired in libsmb2 waitqueue")
+
+    server_text = server_log_path.read_text(encoding='utf-8', errors='replace')
+
+    def has_partial_progress(operation):
+        prefix = f'[COPYING] {operation} '
+        for line in server_text.splitlines():
+            if not line.startswith(prefix):
+                continue
+            values = line[len(prefix):].split('/', 1)
+            if len(values) == 2 and values[0] != values[1]:
+                return True
+        return False
+
+    missing_progress = [
+        operation for operation in ('READ', 'WRITE')
+        if not has_partial_progress(operation)
+    ]
+    if missing_progress:
+        raise RuntimeError(
+            'No partial Copying progress for: ' + ', '.join(missing_progress))
+    print("Copying progress: partial READ and WRITE events found")
     print("Test finished!")
 
 if __name__ == '__main__':

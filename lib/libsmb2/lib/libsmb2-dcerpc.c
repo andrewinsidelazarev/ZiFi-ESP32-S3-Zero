@@ -32,6 +32,21 @@
 
 #include <smb2/libsmb2-dcerpc-server.h>
 
+/* These generated helper coders are intentionally not part of the public
+ * minimal srvsvc header, but the server-side wrapper in this translation
+ * unit needs them to preserve NDR pointer presence. The prefix header above
+ * gives the declarations the same private libsmb2_ names as their objects. */
+int srvsvc_SHARE_ENUM_STRUCT_coder(char *name,
+                                   struct dcerpc_context *dce,
+                                   struct dcerpc_pdu *pdu,
+                                   struct smb2_iovec *iov, int *offset,
+                                   void *ptr);
+int srvsvc_SHARE_ENUM_STRUCT_struct_coder(char *name,
+                                          struct dcerpc_context *dce,
+                                          struct dcerpc_pdu *pdu,
+                                          struct smb2_iovec *iov, int *offset,
+                                          void *ptr);
+
 /* Реализация находится в диагностическом C++-модуле прошивки. Простое
  * C-связывание не заставляет изолированную библиотеку искать заголовки
  * верхнего проекта и сохраняет libsmb2 независимой от Arduino-классов.
@@ -174,6 +189,23 @@ struct zifi_rpc_server_get_info_response {
         uint32_t status;
 };
 
+/* The generated NetrShareEnum structures store only the ResumeHandle value,
+ * so decoding a NULL unique pointer and a pointer to zero produces the same
+ * C value.  The wire distinction is significant: MS-SRVS requires a NULL
+ * input ResumeHandle to remain NULL in the response. */
+struct zifi_rpc_share_enum_request {
+        char *server_name;
+        struct srvsvc_SHARE_ENUM_STRUCT ses;
+        uint32_t preferred_maximum_length;
+        uint32_t resume_handle;
+        int resume_handle_present;
+};
+
+struct zifi_rpc_share_enum_response {
+        struct srvsvc_NetrShareEnum_rep rep;
+        int resume_handle_present;
+};
+
 static char zifi_server_comment[] = "ZiFi ESP32-S3 SMB Server";
 
 static int
@@ -254,6 +286,74 @@ zifi_rpc_server_get_info_request_coder(char *name,
                              dcerpc_utf16z_coder) ||
             dcerpc_uint32_coder(name, dce, pdu, iov, offset,
                                 &request->level)) {
+                return -1;
+        }
+        return 0;
+}
+
+static int
+zifi_rpc_share_enum_resume_handle_coder(char *name,
+                                        struct dcerpc_context *dce,
+                                        struct dcerpc_pdu *pdu,
+                                        struct smb2_iovec *iov, int *offset,
+                                        void *ptr)
+{
+        struct zifi_rpc_share_enum_request *request = ptr;
+
+        request->resume_handle_present = 1;
+        return dcerpc_uint32_coder(name, dce, pdu, iov, offset,
+                                   &request->resume_handle);
+}
+
+static int
+zifi_rpc_share_enum_request_coder(char *name,
+                                  struct dcerpc_context *dce,
+                                  struct dcerpc_pdu *pdu,
+                                  struct smb2_iovec *iov, int *offset,
+                                  void *ptr)
+{
+        struct zifi_rpc_share_enum_request *request = ptr;
+
+        if (dcerpc_ptr_coder(name, dce, pdu, iov, offset,
+                             &request->server_name, PTR_UNIQUE,
+                             dcerpc_utf16z_coder) ||
+            dcerpc_ptr_coder(name, dce, pdu, iov, offset,
+                             &request->ses, PTR_REF,
+                             srvsvc_SHARE_ENUM_STRUCT_struct_coder) ||
+            dcerpc_ptr_coder(name, dce, pdu, iov,
+                             offset, &request->preferred_maximum_length,
+                             PTR_REF, dcerpc_uint32_coder) ||
+            dcerpc_ptr_coder(name, dce, pdu, iov, offset,
+                             request, PTR_UNIQUE,
+                             zifi_rpc_share_enum_resume_handle_coder)) {
+                return -1;
+        }
+        return 0;
+}
+
+static int
+zifi_rpc_share_enum_response_coder(char *name,
+                                   struct dcerpc_context *dce,
+                                   struct dcerpc_pdu *pdu,
+                                   struct smb2_iovec *iov, int *offset,
+                                   void *ptr)
+{
+        struct zifi_rpc_share_enum_response *reply = ptr;
+        void *resume_handle = reply->resume_handle_present
+                                      ? &reply->rep.resume_handle
+                                      : NULL;
+
+        if (dcerpc_ptr_coder(name, dce, pdu, iov, offset,
+                             &reply->rep.ses, PTR_REF,
+                             srvsvc_SHARE_ENUM_STRUCT_coder) ||
+            dcerpc_ptr_coder(name, dce, pdu, iov, offset,
+                             &reply->rep.total_entries, PTR_REF,
+                             dcerpc_uint32_coder) ||
+            dcerpc_ptr_coder(name, dce, pdu, iov, offset,
+                             resume_handle, PTR_UNIQUE,
+                             dcerpc_uint32_coder) ||
+            dcerpc_uint32_coder(name, dce, pdu, iov, offset,
+                                &reply->rep.status)) {
                 return -1;
         }
         return 0;
@@ -674,44 +774,30 @@ zifi_rpc_bind_ack(const uint8_t *request, uint16_t fragment_length,
 }
 
 static int
-zifi_rpc_decode_share_level(struct smb2_context *smb2,
-                            const uint8_t *request, uint16_t fragment_length,
-                            uint32_t *level)
+zifi_rpc_decode_share_enum_request(struct smb2_context *smb2,
+                                   const uint8_t *request,
+                                   uint16_t fragment_length, uint32_t *level,
+                                   int *resume_handle_present)
 {
         struct dcerpc_context dce;
-        struct dcerpc_pdu *pdu;
-        struct smb2_iovec iov;
-        struct srvsvc_NetrShareEnum_req share_request;
-        char request_name[] = "Request";
-        int offset = 24;
+        struct dcerpc_pdu *pdu = NULL;
+        struct zifi_rpc_share_enum_request share_request;
         int result;
 
-        memset(&dce, 0, sizeof(dce));
-        dce.smb2 = smb2;
-        dce.packed_drep[0] = 0x10;
-        dce.tctx_id = 0; /* Сервер принимает только NDR32. */
-        pdu = dcerpc_allocate_pdu(&dce, ENCODING_NDR, DCERPC_DECODE, 1);
-        if (pdu == NULL) {
-                return -ENOMEM;
-        }
-        /* dcerpc_allocate_pdu() создаёт пустой заголовок. Одного поля в
-         * контексте недостаточно: примитивные NDR-декодеры смотрят именно в
-         * pdu->hdr.packed_drep. Без копирования little-endian запрос Windows
-         * ошибочно разбирался как big-endian и завершался с -EINVAL. */
-        pdu->hdr.packed_drep[0] = dce.packed_drep[0];
         memset(&share_request, 0, sizeof(share_request));
-        iov.buf = discard_const(request);
-        iov.len = fragment_length;
-        iov.free = NULL;
-        pdu->top_level = 1;
-        result = srvsvc_NetrShareEnum_req_coder(request_name, &dce, pdu,
-                                                &iov, &offset,
-                                                &share_request);
+        result = zifi_rpc_decode_stub(smb2, request, fragment_length,
+                                      &share_request,
+                                      zifi_rpc_share_enum_request_coder,
+                                      &dce, &pdu);
         if (result == 0) {
                 *level = share_request.ses.Level;
+                *resume_handle_present =
+                        share_request.resume_handle_present;
         }
-        dcerpc_free_pdu(&dce, pdu);
-        return result == 0 ? 0 : -EINVAL;
+        if (pdu != NULL) {
+                dcerpc_free_pdu(&dce, pdu);
+        }
+        return result;
 }
 
 static int
@@ -726,17 +812,19 @@ zifi_rpc_share_enum_response(struct smb2_context *smb2,
         struct dcerpc_context dce;
         struct dcerpc_pdu *pdu;
         struct smb2_iovec iov;
-        struct srvsvc_NetrShareEnum_rep rep;
+        struct zifi_rpc_share_enum_response reply;
         struct srvsvc_SHARE_INFO_0 level0[2];
         struct srvsvc_SHARE_INFO_1 level1[2];
         struct srvsvc_SHARE_INFO_2 level2[2];
         uint32_t level;
+        int resume_handle_present;
         char response_name[] = "Response";
         int offset = 24;
         int result;
 
-        result = zifi_rpc_decode_share_level(smb2, request, fragment_length,
-                                             &level);
+        result = zifi_rpc_decode_share_enum_request(
+                smb2, request, fragment_length, &level,
+                &resume_handle_present);
         zifi_diagnostic_log_rpc_stage("enum-decoded", result,
                                       result == 0 ? (int32_t)level : -1);
         if (result == -ENOMEM) {
@@ -761,19 +849,20 @@ zifi_rpc_share_enum_response(struct smb2_context *smb2,
         /* Ответ обязан использовать тот же NDR32 little-endian порядок.
          * Кодировщики чисел читают этот признак из PDU, а не из контекста. */
         pdu->hdr.packed_drep[0] = dce.packed_drep[0];
-        memset(&rep, 0, sizeof(rep));
+        memset(&reply, 0, sizeof(reply));
         memset(level0, 0, sizeof(level0));
         memset(level1, 0, sizeof(level1));
         memset(level2, 0, sizeof(level2));
-        rep.ses.Level = level;
-        rep.total_entries = 2;
-        rep.status = 0;
+        reply.rep.ses.Level = level;
+        reply.rep.total_entries = 2;
+        reply.rep.status = 0;
+        reply.resume_handle_present = resume_handle_present;
 
         if (level == 0) {
                 level0[0].netname = discard_const(disk_share);
                 level0[1].netname = zifi_ipc_share;
-                rep.ses.ShareEnum.Level0.EntriesRead = 2;
-                rep.ses.ShareEnum.Level0.share_info_0 = level0;
+                reply.rep.ses.ShareEnum.Level0.EntriesRead = 2;
+                reply.rep.ses.ShareEnum.Level0.share_info_0 = level0;
         } else if (level == 1) {
                 level1[0].netname = discard_const(disk_share);
                 level1[0].type = SRVSVC_SHARE_TYPE_DISKTREE;
@@ -782,8 +871,8 @@ zifi_rpc_share_enum_response(struct smb2_context *smb2,
                 level1[1].type = SRVSVC_SHARE_TYPE_IPC |
                                  SRVSVC_SHARE_TYPE_HIDDEN;
                 level1[1].remark = zifi_ipc_remark;
-                rep.ses.ShareEnum.Level1.EntriesRead = 2;
-                rep.ses.ShareEnum.Level1.share_info_1 = level1;
+                reply.rep.ses.ShareEnum.Level1.EntriesRead = 2;
+                reply.rep.ses.ShareEnum.Level1.share_info_1 = level1;
         } else {
                 level2[0].netname = discard_const(disk_share);
                 level2[0].type = SRVSVC_SHARE_TYPE_DISKTREE;
@@ -798,8 +887,8 @@ zifi_rpc_share_enum_response(struct smb2_context *smb2,
                 level2[1].max_users = 0xffffffff;
                 level2[1].path = zifi_empty_string;
                 level2[1].passwd = zifi_empty_string;
-                rep.ses.ShareEnum.Level2.EntriesRead = 2;
-                rep.ses.ShareEnum.Level2.share_info_2 = level2;
+                reply.rep.ses.ShareEnum.Level2.EntriesRead = 2;
+                reply.rep.ses.ShareEnum.Level2.share_info_2 = level2;
         }
 
         iov.buf = pdu->payload;
@@ -808,8 +897,8 @@ zifi_rpc_share_enum_response(struct smb2_context *smb2,
         pdu->top_level = 1;
         zifi_diagnostic_log_rpc_stage("enum-encode-enter", (int32_t)level,
                                       (int32_t)response_capacity);
-        result = srvsvc_NetrShareEnum_rep_coder(response_name, &dce, pdu,
-                                                &iov, &offset, &rep);
+        result = zifi_rpc_share_enum_response_coder(
+                response_name, &dce, pdu, &iov, &offset, &reply);
         zifi_diagnostic_log_rpc_stage("enum-encode-exit", result, offset);
         if (result != 0 || offset > UINT16_MAX ||
             (size_t)offset > response_capacity) {

@@ -9,6 +9,7 @@ void zifi_diagnostic_log_rpc_stage(const char* stage, int a, int b) {
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-raw.h>
+#include <smb2/libsmb2-dcerpc-server.h>
 #include "libsmb2-private.h"
 
 struct async_read_state {
@@ -1384,6 +1385,7 @@ int main(int argc, char **argv) {
     if (strcmp(only_test, "test28") == 0) goto test_28;
     if (strcmp(only_test, "test29") == 0) goto test_29;
     if (strcmp(only_test, "test30") == 0) goto test_30;
+    if (strcmp(only_test, "test31") == 0) goto test_31;
   }
 
   /* TEST 1: Sequential & Multiple Reads check */
@@ -3903,6 +3905,83 @@ test_30:
     }
     printf("RESULT TEST 30: %s\n", test_ok ? "PASS" : "FAIL");
     failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_31:
+  /* Exact NetrShareEnum request from Windows Explorer. ResumeHandle is a
+   * NULL [unique] pointer. The response must preserve NULL; turning it into
+   * a pointer-to-zero makes Explorer reject the otherwise valid share list
+   * and enumerate srvsvc repeatedly. */
+  printf("\n--- TEST 31: NetrShareEnum preserves NULL ResumeHandle ---\n");
+  {
+    static const uint8_t windows_request_null[] = {
+      0x05, 0x00, 0x00, 0x03, 0x10, 0x00, 0x00, 0x00,
+      0x58, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+      0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x00,
+      0x00, 0x00, 0x02, 0x00, 0x09, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+      0x5c, 0x00, 0x5c, 0x00, 0x5a, 0x00, 0x58, 0x00,
+      0x2d, 0x00, 0x45, 0x00, 0x76, 0x00, 0x6f, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x02, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00
+    };
+    uint8_t windows_request_present[sizeof(windows_request_null) + 4];
+    uint8_t response[512];
+    struct smb2_dcerpc_request_info info;
+    uint16_t presentation_context = 0;
+    size_t response_length = 0;
+    int result;
+    int null_ok;
+    int present_ok;
+
+    memset(&info, 0, sizeof(info));
+    result = smb2_dcerpc_srvsvc_reply(
+        smb2, windows_request_null, sizeof(windows_request_null), "SD",
+        "ZX-Evo", &presentation_context, response, sizeof(response),
+        &response_length, &info);
+    null_ok = result == 0 && response_length == 208 && response[2] == 2 &&
+              test_read_le16(response + 8) == response_length &&
+              test_read_le32(response + 16) == response_length - 24 &&
+              test_read_le32(response + response_length - 12) == 2 &&
+              test_read_le32(response + response_length - 8) == 0 &&
+              test_read_le32(response + response_length - 4) == 0;
+
+    memcpy(windows_request_present, windows_request_null,
+           sizeof(windows_request_null));
+    memset(windows_request_present + sizeof(windows_request_null), 0, 4);
+    test_write_le16(windows_request_present + 8,
+                    (uint16_t)sizeof(windows_request_present));
+    test_write_le32(windows_request_present + 16,
+                    (uint32_t)sizeof(windows_request_present) - 24);
+    test_write_le32(windows_request_present + 84, 0x00020008);
+    presentation_context = 0;
+    response_length = 0;
+    memset(&info, 0, sizeof(info));
+    result = smb2_dcerpc_srvsvc_reply(
+        smb2, windows_request_present, sizeof(windows_request_present), "SD",
+        "ZX-Evo", &presentation_context, response, sizeof(response),
+        &response_length, &info);
+    present_ok = result == 0 && response_length == 212 && response[2] == 2 &&
+                 test_read_le32(response + response_length - 16) == 2 &&
+                 test_read_le32(response + response_length - 12) != 0 &&
+                 test_read_le32(response + response_length - 8) == 0 &&
+                 test_read_le32(response + response_length - 4) == 0;
+
+    printf("  NULL response=%lu bytes pointer=%08x; present response=%lu "
+           "bytes pointer=%08x\n",
+           (unsigned long)(null_ok ? 208 : response_length),
+           null_ok ? 0u : 0xffffffffu,
+           (unsigned long)response_length,
+           response_length >= 12
+               ? (unsigned)test_read_le32(response + response_length - 12)
+               : 0u);
+    printf("RESULT TEST 31: %s\n",
+           null_ok && present_ok ? "PASS" : "FAIL");
+    failures += !(null_ok && present_ok);
   }
 
 done:

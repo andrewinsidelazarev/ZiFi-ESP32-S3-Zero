@@ -1135,7 +1135,8 @@ struct SmbServer::Impl {
   void sendOperation(const char* operation, const char* path = nullptr);
   // Ход текущей передачи. force обязателен на завершении, иначе последнее
   // обновление может не пройти ограничение частоты и счётчик замрёт до конца.
-  void sendProgress(const Handle& handle, const char* operation, bool force);
+  void sendProgress(const Handle& handle, const char* operation,
+                    uint32_t position, bool force);
   void resetProgress();
   bool requestVfs(VfsOperation operation, const char* path, uint32_t value,
                   VfsResult& result, uint32_t timeoutMs);
@@ -1561,7 +1562,21 @@ void SmbServer::Impl::newClient(smb2_context* smb2, void* context) {
   // проверку диалекта и защищает все последующие запросы данного клиента.
   smb2_set_sign(smb2, 1);
   smb2_set_authentication(smb2, SMB2_SEC_NTLMSSP);
-  smb2_set_timeout(smb2, 120);
+  int requestTimeoutSeconds = 120;
+#ifdef ZIFI_HOST_BUILD
+  // Нативная регрессия может сжать обычный тайм-аут PDU до одной секунды и
+  // тем самым за несколько секунд проверить запросы, которые приложение
+  // удерживает во внутренней очереди дольше сетевого тайм-аута.
+  const char* const timeoutText = getenv("ZIFI_HOST_PDU_TIMEOUT_SECONDS");
+  if (timeoutText != nullptr && timeoutText[0] != 0) {
+    char* end = nullptr;
+    const long parsed = strtol(timeoutText, &end, 10);
+    if (end != timeoutText && *end == 0 && parsed > 0 && parsed <= 3600) {
+      requestTimeoutSeconds = static_cast<int>(parsed);
+    }
+  }
+#endif
+  smb2_set_timeout(smb2, requestTimeoutSeconds);
   smb2_register_error_callback(smb2, libraryError);
   self->sendClientEvent(1);
 }
@@ -2985,9 +3000,12 @@ static void formatTransferSize(uint32_t bytes, char* out, size_t capacity) {
   const uint32_t kMega = 1024UL * 1024UL;
   const uint32_t kKilo = 1024UL;
   if (bytes >= kMega) {
-    snprintf(out, capacity, "%lu.%luM",
+    // Десятая доля МиБ менялась лишь раз примерно на каждые 102 КиБ. При
+    // реальной скорости FILEX это выглядело как застывший счётчик, даже когда
+    // физические окна продолжали идти. Сотая доля различает каждый 16-КиБ шаг.
+    snprintf(out, capacity, "%lu.%02luM",
              static_cast<unsigned long>(bytes / kMega),
-             static_cast<unsigned long>(((bytes % kMega) * 10UL) / kMega));
+             static_cast<unsigned long>(((bytes % kMega) * 100UL) / kMega));
   } else if (bytes >= kKilo) {
     snprintf(out, capacity, "%lu.%luK",
              static_cast<unsigned long>(bytes / kKilo),
@@ -2998,7 +3016,7 @@ static void formatTransferSize(uint32_t bytes, char* out, size_t capacity) {
 }
 
 void SmbServer::Impl::sendProgress(const Handle& handle, const char* operation,
-                                   bool force) {
+                                   uint32_t position, bool force) {
   if (eventSink == nullptr || operation == nullptr || handle.directory) {
     return;
   }
@@ -3011,7 +3029,7 @@ void SmbServer::Impl::sendProgress(const Handle& handle, const char* operation,
   }
   char doneText[16] = {};
   char totalText[16] = {};
-  formatTransferSize(handle.position, doneText, sizeof(doneText));
+  formatTransferSize(position, doneText, sizeof(doneText));
   formatTransferSize(visibleSize(handle), totalText, sizeof(totalText));
   char shown[32] = {};
   const int written = snprintf(shown, sizeof(shown), "%s %s/%s", operation,
@@ -4870,6 +4888,9 @@ void SmbServer::Impl::pollAsyncRead() {
       current.filled += static_cast<uint32_t>(got);
       activeLogicalOffset += static_cast<uint32_t>(got);
       current.lastProgressMs = millis();
+      // SMB-ответ остаётся целым 64-КиБ запросом, но экрану не нужно ждать
+      // завершения всех четырёх физических окон FILEX.
+      sendProgress(*handle, "READ", current.offset + current.filled, false);
     }
 
     if (current.filled == current.length) {
@@ -5044,6 +5065,7 @@ void SmbServer::Impl::pollAsyncWrite() {
     completed.flushed += transferred;
     completed.inFlight = false;
     completed.windowLength = 0;
+    sendProgress(*handle, "WRITE", handle->position, false);
 
     const bool finished = completed.flushed == completed.length;
     // WRITE_THROUGH и запросы, удержанные обратным давлением, обязаны получить
@@ -6103,7 +6125,7 @@ int SmbServer::Impl::closeHandler(smb2_server* serverValue,
     // Итоговая строка обязана пройти без ограничения частоты, иначе счётчик
     // замрёт на предпоследнем блоке и файл будет выглядеть недокопированным.
     self->sendProgress(*handle, handle->deletePending ? "DELETE" : "DONE",
-                       true);
+                       handle->position, true);
   }
   self->sendOperation(handle->deletePending ? "DELETE" : "CLOSE",
                       handle->path);
@@ -6261,6 +6283,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     diagnosticLogEvent("SMB read-cached bytes=%lu off=%lu path=%s",
                        static_cast<unsigned long>(wanted),
                        static_cast<unsigned long>(offset), handle->path);
+    self->sendProgress(*handle, "READ", handle->position, false);
     self->sendOperation("READ", handle->path);
     return 0;
   }
@@ -6291,6 +6314,14 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     index = self->allocateAsyncRead();
   }
   if (index < 0) {
+    // Этот READ пока не получает STATUS_PENDING: так он удерживает SMB-credit
+    // и ограничивает окно Windows. Поэтому обычный 120-секундный таймер PDU
+    // обязан быть отключён явно. Иначе libsmb2 удаляет Request из waitqueue,
+    // а поздние interim/final ответы уже не с чем коррелировать — копирование
+    // навсегда остаётся ждать исчезнувший блок.
+    if (smb2_set_current_request_internal_async(smb2) != 0) {
+      return -1;
+    }
     if (!self->enqueueAsyncRead(smb2, messageId, slot, operationSequence,
                                 handle->generation, offset, wanted)) {
       return replyStatus(smb2, SMB2_READ,
@@ -6395,6 +6426,12 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
       return replyStatus(smb2, SMB2_WRITE,
                          SMB2_STATUS_INSUFFICIENT_RESOURCES);
     }
+    // WRITE_THROUGH и WRITE за пределами раннего окна подтверждаются только
+    // после физической записи. Их Request должен жить под watchdog приложения,
+    // а не исчезать из waitqueue по обычному тайм-ауту libsmb2.
+    if (smb2_set_current_request_internal_async(smb2) != 0) {
+      return -1;
+    }
     const int asyncIndex = self->allocateAsyncWrite();
     if (asyncIndex < 0) {
       return replyStatus(smb2, SMB2_WRITE,
@@ -6466,6 +6503,7 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
       handle->sizeReserved = false;
       handle->ownsSizeReservation = false;
     }
+    self->sendProgress(*handle, "WRITE", handle->position, false);
   }
   reply->count = request->length;
   reply->remaining = 0;
@@ -6984,6 +7022,12 @@ int SmbServer::Impl::queryDirectoryHandler(
   // после физического ответа EVO. Первый полный проход одновременно строит
   // снимок; второго, параллельного обхода каталога нет.
   const uint64_t messageId = smb2_get_last_request_message_id(smb2);
+  // На проводе QUERY_DIRECTORY остаётся синхронным и не получает interim-
+  // STATUS_PENDING. Время жизни Request всё равно принадлежит этой очереди и
+  // её отдельному watchdog, иначе медленный каталог исчезнет из waitqueue.
+  if (smb2_set_current_request_internal_async(smb2) != 0) {
+    return -1;
+  }
   if (!self->enqueueAsyncDirectory(smb2, messageId, slot,
                                    handle->generation, *request)) {
     return replyStatus(smb2, SMB2_QUERY_DIRECTORY,
