@@ -126,6 +126,130 @@ echo Compilation SUCCESS!
         print("TIMEOUT SERVER LOG TAIL:\n" + timeout_tail)
         raise RuntimeError("Deferred SMB request expired in libsmb2 waitqueue")
 
+    # Реальный SD->SD Copy создаёт каталог назначения с другого SMB-сеанса,
+    # пока исходный FINDNEXT ещё выполняется на единственном FILEX-мосте.
+    # Отдельная задержка делает окно гонки детерминированным: старая реализация
+    # немедленно отвечала ACCESS_DENIED, исправленная ждёт старший запрос FIFO.
+    mkdir_port = 14447
+    mkdir_share = Path('.test-build/test_share_mkdir')
+    if mkdir_share.exists():
+        shutil.rmtree(mkdir_share)
+    mkdir_share.mkdir(parents=True)
+    mkdir_log_path = out / 'host_smb_mkdir_fifo.log'
+    mkdir_test = None
+    with mkdir_log_path.open('w', encoding='utf-8') as mkdir_log:
+        mkdir_server = subprocess.Popen(
+            ['.test-build/host_smb/host_smb.exe', str(mkdir_share),
+             str(mkdir_port), '0', 'ZX-Evo', '250'],
+            stdout=mkdir_log, stderr=subprocess.STDOUT, text=True)
+        try:
+            time.sleep(1.5)
+            print('Running MKDIR/FINDNEXT FIFO regression...')
+            mkdir_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{mkdir_port}', 'SD', 'test32'],
+                capture_output=True, text=True, timeout=60)
+            print("MKDIR FIFO TEST OUTPUT:\n" + mkdir_test.stdout)
+        finally:
+            mkdir_server.terminate()
+            try:
+                mkdir_server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                mkdir_server.kill()
+                mkdir_server.wait(timeout=2)
+
+    if mkdir_test is None or mkdir_test.returncode != 0:
+        mkdir_tail = mkdir_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("MKDIR FIFO SERVER LOG TAIL:\n" + mkdir_tail)
+        raise RuntimeError("Deferred MKDIR failed behind active FINDNEXT")
+
+    # WRITE второго Open уже подтверждён клиенту, но при медленном физическом
+    # канале остаётся в очереди FILEX. CLOSE первого Open обязан занять своё
+    # место в общей FIFO и дождаться этой записи без IO_DEVICE_ERROR.
+    close_port = 14448
+    close_share = Path('.test-build/test_share_close_fifo')
+    if close_share.exists():
+        shutil.rmtree(close_share)
+    close_share.mkdir(parents=True)
+    close_log_path = out / 'host_smb_close_fifo.log'
+    close_test = None
+    with close_log_path.open('w', encoding='utf-8') as close_log:
+        close_server = subprocess.Popen(
+            ['.test-build/host_smb/host_smb.exe', str(close_share),
+             str(close_port), '6000'],
+            stdout=close_log, stderr=subprocess.STDOUT, text=True)
+        try:
+            time.sleep(1.5)
+            print('Running CLOSE/WRITE FIFO regression...')
+            close_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{close_port}', 'SD', 'test33'],
+                capture_output=True, text=True, timeout=90)
+            print("CLOSE FIFO TEST OUTPUT:\n" + close_test.stdout)
+        finally:
+            close_server.terminate()
+            try:
+                close_server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                close_server.kill()
+                close_server.wait(timeout=2)
+
+    if close_test is None or close_test.returncode != 0:
+        close_tail = close_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("CLOSE FIFO SERVER LOG TAIL:\n" + close_tail)
+        raise RuntimeError("Deferred CLOSE failed behind physical WRITE")
+
+    # Windows перед CLOSE присылает BASIC_INFORMATION. SMB с первого WRITE
+    # использует FILEX mode=3, поэтому данные и SET_METADATA остаются в одном
+    # физическом контексте без отложенного последовательного APPEND. Тесты
+    # используют точные размеры clock.wmf из 0.6.79 и plasmatw.wmf из 0.6.80.
+    metadata_test = None
+    sequential_close_test = None
+    metadata_log_path = out / 'host_smb_metadata_close.log'
+    with metadata_log_path.open('w', encoding='utf-8') as metadata_log:
+        metadata_server = subprocess.Popen(
+            ['.test-build/host_smb/host_smb.exe', str(close_share),
+             str(close_port + 1)],
+            stdout=metadata_log, stderr=subprocess.STDOUT, text=True)
+        try:
+            time.sleep(1.5)
+            print('Running random WRITE/metadata CLOSE regression...')
+            metadata_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{close_port + 1}', 'SD', 'test34'],
+                capture_output=True, text=True, timeout=90)
+            print("METADATA CLOSE TEST OUTPUT:\n" + metadata_test.stdout)
+            print('Running deferred sequential CLOSE rejection regression...')
+            sequential_close_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{close_port + 1}', 'SD', 'test35'],
+                capture_output=True, text=True, timeout=90)
+            print("SEQUENTIAL CLOSE TEST OUTPUT:\n" +
+                  sequential_close_test.stdout)
+        finally:
+            metadata_server.terminate()
+            try:
+                metadata_server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                metadata_server.kill()
+                metadata_server.wait(timeout=2)
+
+    if metadata_test is None or metadata_test.returncode != 0:
+        metadata_tail = metadata_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("METADATA CLOSE SERVER LOG TAIL:\n" + metadata_tail)
+        raise RuntimeError(
+            "Random WRITE metadata CLOSE did not preserve the file")
+    if (sequential_close_test is None or
+            sequential_close_test.returncode != 0):
+        metadata_tail = metadata_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("SEQUENTIAL CLOSE SERVER LOG TAIL:\n" + metadata_tail)
+        raise RuntimeError(
+            "New SMB file still depended on deferred sequential CLOSE")
+
     server_text = server_log_path.read_text(encoding='utf-8', errors='replace')
 
     def has_partial_progress(operation):

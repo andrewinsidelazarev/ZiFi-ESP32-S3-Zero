@@ -89,6 +89,7 @@ class Z80Simulator {
   bool openValid_ = false;
   uint8_t openMode_ = 0;
   uint32_t offset_ = 0;
+  bool sequentialWriteSeen_ = false;
 
   // Приём окна записи: кадры собираются в буфер и сбрасываются на диск целиком
   // после проверки CRC — ровно так же, как это делает плагин.

@@ -142,6 +142,14 @@ constexpr size_t kDirectoryStreamingEntriesPerReply = 1;
 // вне callback SMB. Глубина совпадает с кредитным окном: память фиксирована, а
 // второй QUERY_DIRECTORY из Windows compound всегда помещается в очередь.
 constexpr size_t kAsyncDirectoryQueueDepth = kAsyncIoQueueDepth;
+// CREATE каталога остаётся синхронным на проводе, но при занятом FILEX
+// переводится в ту же ограниченную очередь физических операций. Глубины
+// кредитного окна достаточно: каждый ожидающий CREATE удерживает свой credit.
+constexpr size_t kAsyncCreateQueueDepth = kAsyncIoQueueDepth;
+// CLOSE удерживает один из восьми handle и потому не может накопиться глубже
+// таблицы handle. Отдельная очередь нужна даже после отправленного WRITE
+// SUCCESS: физическая запись в этот момент ещё может владеть FILEX.
+constexpr size_t kAsyncCloseQueueDepth = kHandleCount;
 // CHANGE_NOTIFY не занимает UART/PSRAM: это только ожидающий SMB Request и
 // короткое имя. Глубина совпадает с числом одновременно учитываемых клиентов.
 constexpr size_t kChangeNotifyDepth = kClientCount;
@@ -790,6 +798,49 @@ struct SmbServer::Impl {
     char name[kMaxPath + 1] = {};
   };
 
+  enum class AsyncCreatePhase : uint8_t {
+    kStat,
+    kPrepare,
+    kCloseCommit,
+    kCloseAbort,
+    kMkdir,
+  };
+
+  // Новый каталог нельзя создавать прямо из SMB callback, если единственный
+  // FILEX-канал занят FINDNEXT/READ/WRITE. Сохраняем только поля, необходимые
+  // для финального CREATE Response; имя из входного PDU сюда копируется.
+  struct AsyncCreate {
+    bool used = false;
+    bool inFlight = false;
+    bool cancelRequested = false;
+    smb2_context* context = nullptr;
+    smb2_context* owner = nullptr;
+    uint64_t messageId = 0;
+    uint64_t sequence = 0;
+    uint64_t volumeId = 0;
+    uint32_t treeId = 0;
+    uint32_t desiredAccess = 0;
+    uint32_t createOptions = 0;
+    uint32_t lastProgressMs = 0;
+    int previousSlot = -1;
+    ActiveMode previousMode = ActiveMode::kNone;
+    RequestedCreateContexts requestedContexts{};
+    AsyncCreatePhase phase = AsyncCreatePhase::kPrepare;
+    char path[kMaxPath + 1] = {};
+  };
+
+  struct AsyncClose {
+    bool used = false;
+    bool cancelRequested = false;
+    smb2_context* context = nullptr;
+    smb2_context* owner = nullptr;
+    uint64_t messageId = 0;
+    uint64_t sequence = 0;
+    uint32_t generation = 0;
+    uint16_t flags = 0;
+    int slot = -1;
+  };
+
   // Один ожидающий CHANGE_NOTIFY закреплён за открытым каталогом. После
   // STATUS_PENDING исходный Request PDU остаётся в waitqueue libsmb2, поэтому
   // для финала достаточно сохранить MessageId и проверить поколение handle.
@@ -833,6 +884,7 @@ struct SmbServer::Impl {
         activeMode(ActiveMode::kNone),
         activeLogicalOffset(0),
         activeVfsOffset(0),
+        activeRandomWrite(false),
         asyncReads{},
         asyncWrites{},
         asyncIoBuffers{},
@@ -846,6 +898,12 @@ struct SmbServer::Impl {
         asyncDirectories{},
         activeAsyncDirectory(-1),
         asyncDirectoryCount(0),
+        asyncCreates{},
+        activeAsyncCreate(-1),
+        asyncCreateCount(0),
+        asyncCloses{},
+        activeAsyncClose(-1),
+        asyncCloseCount(0),
         asyncVfsSequence(0),
         pendingNotifies{},
         portValue(kDefaultPort),
@@ -965,6 +1023,10 @@ struct SmbServer::Impl {
   ActiveMode activeMode;
   uint32_t activeLogicalOffset;
   uint32_t activeVfsOffset;
+  // SET_METADATA работает только поверх FILEX random mode=3. Этот флаг
+  // защищает контракт активного WRITE-контекста от случайного возврата к
+  // последовательному mode=1 с отложенным последним окном.
+  bool activeRandomWrite;
   AsyncRead asyncReads[kAsyncIoQueueDepth];
   AsyncWrite asyncWrites[kAsyncIoQueueDepth];
   uint8_t* asyncIoBuffers[kAsyncIoQueueDepth];
@@ -978,6 +1040,12 @@ struct SmbServer::Impl {
   AsyncDirectory asyncDirectories[kAsyncDirectoryQueueDepth];
   int activeAsyncDirectory;
   size_t asyncDirectoryCount;
+  AsyncCreate asyncCreates[kAsyncCreateQueueDepth];
+  int activeAsyncCreate;
+  size_t asyncCreateCount;
+  AsyncClose asyncCloses[kAsyncCloseQueueDepth];
+  int activeAsyncClose;
+  size_t asyncCloseCount;
   // Общая очередь физических операций. Разные SMB-сеансы могут прислать
   // READ и QUERY_DIRECTORY почти одновременно, но единственный FILEX-канал
   // обязан обслужить их в порядке поступления.
@@ -1085,6 +1153,8 @@ struct SmbServer::Impl {
   uint64_t oldestAsyncReadSequence() const;
   uint64_t oldestAsyncWriteSequence() const;
   uint64_t oldestAsyncDirectorySequence() const;
+  uint64_t oldestAsyncCreateSequence() const;
+  uint64_t oldestAsyncCloseSequence() const;
   int allocateAsyncRead();
   int allocateAsyncWrite();
   bool enqueueAsyncRead(smb2_context* context, uint64_t messageId, int slot,
@@ -1189,6 +1259,8 @@ struct SmbServer::Impl {
   bool commitReservedSize(int slot);
   void deferMetadata(Handle& handle, const VfsMetadata& metadata);
   bool applyPendingMetadata(int slot);
+  uint32_t finalizeClose(int slot, uint32_t generation, uint16_t flags,
+                         smb2_close_reply& reply);
   bool activateDirectory(int slot);
   void pollAsyncRead();
   void pollAsyncWrite();
@@ -1205,6 +1277,27 @@ struct SmbServer::Impl {
   void failAsyncDirectories(uint32_t status);
   void dropAsyncDirectoriesForOwner(smb2_context* owner);
   bool cancelAsyncDirectory(smb2_context* owner, uint64_t messageId);
+  int allocateAsyncCreate() const;
+  bool enqueueAsyncCreate(smb2_context* context, uint64_t messageId,
+                          uint32_t treeId, uint32_t desiredAccess,
+                          uint32_t createOptions,
+                          const RequestedCreateContexts& requestedContexts,
+                          uint64_t volumeId, bool statRequired,
+                          const char* path);
+  bool queueAsyncCreateReply(AsyncCreate& pending);
+  void completeAsyncCreate(int index, uint32_t status);
+  void pollAsyncCreate();
+  void failAsyncCreates(uint32_t status);
+  void dropAsyncCreatesForOwner(smb2_context* owner);
+  bool cancelAsyncCreate(smb2_context* owner, uint64_t messageId);
+  int allocateAsyncClose() const;
+  bool enqueueAsyncClose(smb2_context* context, uint64_t messageId, int slot,
+                         uint32_t generation, uint16_t flags);
+  void completeAsyncClose(int index, uint32_t status,
+                          const smb2_close_reply* reply = nullptr);
+  void pollAsyncClose();
+  void dropAsyncClosesForOwner(smb2_context* owner);
+  bool cancelAsyncClose(smb2_context* owner, uint64_t messageId);
   bool queueBufferedWriteReplies();
   bool queueAsyncStatus(smb2_context* smb2, uint8_t command,
                         uint32_t status, uint64_t messageId);
@@ -1496,12 +1589,16 @@ void SmbServer::Impl::taskLoop() {
     // пока core 1 вернёт кольцо, и только затем освобождаем handle/VFS.
     const uint32_t drainStarted = millis();
     while ((activeAsyncRead >= 0 || activeAsyncWrite >= 0 ||
-            activeAsyncDirectory >= 0 || asyncDirectoryCount != 0) &&
+            activeAsyncDirectory >= 0 || asyncDirectoryCount != 0 ||
+            activeAsyncCreate >= 0 || asyncCreateCount != 0 ||
+            activeAsyncClose >= 0 || asyncCloseCount != 0) &&
            static_cast<uint32_t>(millis() - drainStarted) <
                kMutateVfsTimeoutMs) {
       pollAsyncRead();
       pollAsyncWrite();
       pollAsyncDirectory();
+      pollAsyncCreate();
+      pollAsyncClose();
       vTaskDelay(pdMS_TO_TICKS(1));
     }
     if (server.stop_requested == 0) {
@@ -1643,6 +1740,7 @@ void SmbServer::Impl::resetHandles() {
   activeMode = ActiveMode::kNone;
   activeLogicalOffset = 0;
   activeVfsOffset = 0;
+  activeRandomWrite = false;
 }
 
 void SmbServer::Impl::dropNotifiesForOwner(smb2_context* owner) {
@@ -1997,12 +2095,18 @@ void SmbServer::Impl::resetAsyncIo() {
   memset(asyncReads, 0, sizeof(asyncReads));
   memset(asyncWrites, 0, sizeof(asyncWrites));
   memset(asyncDirectories, 0, sizeof(asyncDirectories));
+  memset(asyncCreates, 0, sizeof(asyncCreates));
+  memset(asyncCloses, 0, sizeof(asyncCloses));
   activeAsyncRead = -1;
   activeAsyncWrite = -1;
   activeAsyncDirectory = -1;
+  activeAsyncCreate = -1;
+  activeAsyncClose = -1;
   asyncReadCount = 0;
   asyncWriteCount = 0;
   asyncDirectoryCount = 0;
+  asyncCreateCount = 0;
+  asyncCloseCount = 0;
   asyncVfsSequence = 0;
 }
 
@@ -2058,6 +2162,28 @@ uint64_t SmbServer::Impl::oldestAsyncWriteSequence() const {
 uint64_t SmbServer::Impl::oldestAsyncDirectorySequence() const {
   uint64_t oldest = UINT64_MAX;
   for (const AsyncDirectory& pending : asyncDirectories) {
+    if (pending.used && !pending.cancelRequested && pending.sequence != 0 &&
+        pending.sequence < oldest) {
+      oldest = pending.sequence;
+    }
+  }
+  return oldest;
+}
+
+uint64_t SmbServer::Impl::oldestAsyncCreateSequence() const {
+  uint64_t oldest = UINT64_MAX;
+  for (const AsyncCreate& pending : asyncCreates) {
+    if (pending.used && !pending.cancelRequested && pending.sequence != 0 &&
+        pending.sequence < oldest) {
+      oldest = pending.sequence;
+    }
+  }
+  return oldest;
+}
+
+uint64_t SmbServer::Impl::oldestAsyncCloseSequence() const {
+  uint64_t oldest = UINT64_MAX;
+  for (const AsyncClose& pending : asyncCloses) {
     if (pending.used && !pending.cancelRequested && pending.sequence != 0 &&
         pending.sequence < oldest) {
       oldest = pending.sequence;
@@ -2296,7 +2422,7 @@ bool SmbServer::Impl::cancelQueuedRead(smb2_context* owner,
 }
 
 int SmbServer::Impl::findReadyAsyncRead() const {
-  if (activeAsyncRead >= 0 || activeAsyncWrite >= 0) {
+  if (activeAsyncRead >= 0 || activeAsyncWrite >= 0 || activeAsyncClose >= 0) {
     return -1;
   }
 
@@ -2322,7 +2448,7 @@ int SmbServer::Impl::findReadyAsyncRead() const {
 }
 
 int SmbServer::Impl::findReadyAsyncWrite() const {
-  if (activeAsyncWrite >= 0 || activeAsyncRead >= 0) {
+  if (activeAsyncWrite >= 0 || activeAsyncRead >= 0 || activeAsyncClose >= 0) {
     return -1;
   }
 
@@ -2372,6 +2498,16 @@ bool SmbServer::Impl::hasAsyncIoForOwner(smb2_context* owner) const {
   for (const QueuedRead* pending = queuedReadHead; pending != nullptr;
        pending = pending->next) {
     if (pending->context == owner) {
+      return true;
+    }
+  }
+  for (const AsyncCreate& pending : asyncCreates) {
+    if (pending.used && pending.owner == owner) {
+      return true;
+    }
+  }
+  for (const AsyncClose& pending : asyncCloses) {
+    if (pending.used && pending.owner == owner) {
       return true;
     }
   }
@@ -2703,8 +2839,10 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
   // их исходные PDU всё равно освобождает libsmb2.
   dropQueuedReadsForOwner(smb2);
   dropAsyncDirectoriesForOwner(smb2);
+  dropAsyncCreatesForOwner(smb2);
+  dropAsyncClosesForOwner(smb2);
   dropNotifiesForOwner(smb2);
-  bool hadAsyncIo = false;
+  bool hadAsyncIo = hasAsyncIoForOwner(smb2);
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     AsyncRead& pending = asyncReads[index];
     if (!pending.used || pending.context != smb2) {
@@ -2802,6 +2940,7 @@ void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
       activeMode = ActiveMode::kNone;
       activeLogicalOffset = 0;
       activeVfsOffset = 0;
+      activeRandomWrite = false;
     }
   }
   for (size_t index = 0; index < kTreeCount; ++index) {
@@ -2815,7 +2954,10 @@ void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
       memset(&tree, 0, sizeof(tree));
     }
   }
-  if (activeAsyncRead < 0 && activeAsyncWrite < 0 && clientCount() == 0) {
+  if (activeAsyncRead < 0 && activeAsyncWrite < 0 &&
+      activeAsyncDirectory < 0 && activeAsyncCreate < 0 &&
+      activeAsyncClose < 0 &&
+      clientCount() == 0) {
     resetAsyncIo();
   }
 }
@@ -3480,6 +3622,7 @@ bool SmbServer::Impl::closeActive(bool commit) {
   activeMode = ActiveMode::kNone;
   activeLogicalOffset = 0;
   activeVfsOffset = 0;
+  activeRandomWrite = false;
   if (mode == ActiveMode::kDirectory) {
     return true;
   }
@@ -4551,6 +4694,7 @@ bool SmbServer::Impl::activateRead(int slot, uint32_t offset) {
   }
   activeSlot = slot;
   activeMode = ActiveMode::kRead;
+  activeRandomWrite = false;
   activeRandomRead = random;
   activeLogicalOffset = offset;
   activeVfsOffset = offset;
@@ -4563,22 +4707,28 @@ bool SmbServer::Impl::activateWrite(int slot, uint32_t offset) {
   dropFileCache();
   Handle& handle = handles[slot];
   if (activeSlot == slot && activeMode == ActiveMode::kWrite &&
-      activeLogicalOffset == offset) {
+      activeLogicalOffset == offset && activeRandomWrite) {
     return true;
   }
   if (!closeActive(true) || !resetBuffers()) {
     return false;
   }
   VfsResult result;
-  const bool useSequential =
-      handle.createdNew && offset == 0 && handle.physicalSize == 0;
-  const VfsOperation op =
-      useSequential ? VfsOperation::kOpenWrite : VfsOperation::kOpenRandom;
-  if (!requestVfs(op, handle.path, 0, result, kMutateVfsTimeoutMs)) {
+  // Последовательный FILEX mode=1 подтверждает неполное последнее окно до
+  // фактического APPEND и переносит его ошибку на CLOSE. В реальной SD->SD
+  // серии 0.6.80 WRITE 44032 и SET_BASIC_INFORMATION были успешны, но этот
+  // финальный APPEND отказал, CLOSE вернул STATUS_IO_DEVICE_ERROR и новый файл
+  // пришлось удалить. SMB использует только mode=3: каждое WRITE_AT-окно
+  // физически завершено до ответа WRITE, а SET_METADATA работает в том же
+  // открытом контексте. Mode=1 остаётся внутри createEmptyFile только для
+  // материализации пустого уже закрытого файла, где отложенных данных нет.
+  if (!requestVfs(VfsOperation::kOpenRandom, handle.path, 0, result,
+                  kMutateVfsTimeoutMs)) {
     return false;
   }
   activeSlot = slot;
   activeMode = ActiveMode::kWrite;
+  activeRandomWrite = true;
   activeLogicalOffset = offset;
   activeVfsOffset = offset;
   return true;
@@ -4666,7 +4816,8 @@ bool SmbServer::Impl::applyPendingMetadata(int slot) {
   }
   VfsResult result = {};
   bool applied = false;
-  if (activeSlot == slot && activeMode == ActiveMode::kWrite) {
+  if (activeSlot == slot && activeMode == ActiveMode::kWrite &&
+      activeRandomWrite) {
     applied = requestMetadata(handle.pendingMetadata, result);
   } else if (activateWrite(slot, handle.position)) {
     applied = requestMetadata(handle.pendingMetadata, result);
@@ -4698,6 +4849,7 @@ bool SmbServer::Impl::activateDirectory(int slot) {
   }
   activeSlot = slot;
   activeMode = ActiveMode::kDirectory;
+  activeRandomWrite = false;
   activeLogicalOffset = 0;
   activeVfsOffset = 0;
 
@@ -4981,7 +5133,10 @@ void SmbServer::Impl::pollAsyncRead() {
   AsyncRead& next = asyncReads[nextIndex];
   const uint64_t writeSequence = oldestAsyncWriteSequence();
   const uint64_t directorySequence = oldestAsyncDirectorySequence();
-  if (writeSequence < next.sequence || directorySequence < next.sequence) {
+  const uint64_t createSequence = oldestAsyncCreateSequence();
+  const uint64_t closeSequence = oldestAsyncCloseSequence();
+  if (writeSequence < next.sequence || directorySequence < next.sequence ||
+      createSequence < next.sequence || closeSequence < next.sequence) {
     return;
   }
   if (bridge.requestPending()) {
@@ -5128,7 +5283,10 @@ void SmbServer::Impl::pollAsyncWrite() {
   AsyncWrite& next = asyncWrites[nextIndex];
   const uint64_t readSequence = oldestAsyncReadSequence();
   const uint64_t directorySequence = oldestAsyncDirectorySequence();
-  if (readSequence < next.sequence || directorySequence < next.sequence) {
+  const uint64_t createSequence = oldestAsyncCreateSequence();
+  const uint64_t closeSequence = oldestAsyncCloseSequence();
+  if (readSequence < next.sequence || directorySequence < next.sequence ||
+      createSequence < next.sequence || closeSequence < next.sequence) {
     return;
   }
   const uint32_t remaining = next.length - next.flushed;
@@ -5324,12 +5482,556 @@ bool SmbServer::Impl::cancelAsyncDirectory(smb2_context* owner,
   return false;
 }
 
+int SmbServer::Impl::allocateAsyncCreate() const {
+  if (asyncCreateCount >= kAsyncCreateQueueDepth) {
+    return -1;
+  }
+  for (size_t index = 0; index < kAsyncCreateQueueDepth; ++index) {
+    if (!asyncCreates[index].used) {
+      return static_cast<int>(index);
+    }
+  }
+  return -1;
+}
+
+bool SmbServer::Impl::enqueueAsyncCreate(
+    smb2_context* context, uint64_t messageId, uint32_t treeId,
+    uint32_t desiredAccess, uint32_t createOptions,
+    const RequestedCreateContexts& requestedContexts, uint64_t volumeId,
+    bool statRequired, const char* path) {
+  const int index = allocateAsyncCreate();
+  if (index < 0 || context == nullptr || messageId == 0 || treeId == 0 ||
+      path == nullptr || path[0] == 0) {
+    return false;
+  }
+  AsyncCreate& pending = asyncCreates[index];
+  pending = {};
+  pending.used = true;
+  pending.context = context;
+  pending.owner = context;
+  pending.messageId = messageId;
+  pending.sequence = nextAsyncVfsSequence();
+  pending.volumeId = volumeId;
+  pending.treeId = treeId;
+  pending.desiredAccess = desiredAccess;
+  pending.createOptions = createOptions;
+  pending.requestedContexts = requestedContexts;
+  pending.phase = statRequired ? AsyncCreatePhase::kStat
+                               : AsyncCreatePhase::kPrepare;
+  pending.lastProgressMs = millis();
+  snprintf(pending.path, sizeof(pending.path), "%s", path);
+  ++asyncCreateCount;
+  diagnosticLogEvent("SMB mkdir-deferred mid=%llu waiting=%u path=%s",
+                     static_cast<unsigned long long>(messageId),
+                     static_cast<unsigned>(asyncCreateCount), path);
+  return true;
+}
+
+bool SmbServer::Impl::queueAsyncCreateReply(AsyncCreate& pending) {
+  if (pending.context == nullptr || pending.messageId == 0) {
+    return false;
+  }
+  const Tree* tree = findTree(pending.treeId);
+  if (tree == nullptr || tree->owner != pending.context) {
+    return false;
+  }
+  const int slot = allocateHandle(pending.context, pending.treeId);
+  if (slot < 0) {
+    return queueAsyncStatus(pending.context, SMB2_CREATE,
+                            SMB2_STATUS_INSUFFICIENT_RESOURCES,
+                            pending.messageId);
+  }
+
+  Handle& handle = handles[slot];
+  handle.directory = true;
+  handle.writable =
+      (pending.desiredAccess &
+       (SMB2_FILE_WRITE_DATA | SMB2_FILE_APPEND_DATA | SMB2_GENERIC_WRITE |
+        SMB2_DELETE | SMB2_FILE_WRITE_ATTRIBUTES | SMB2_FILE_WRITE_EA)) != 0;
+  handle.deletePending =
+      (pending.createOptions & SMB2_FILE_DELETE_ON_CLOSE) != 0;
+  handle.createdNew = true;
+  handle.physicalSize = 0;
+  handle.openedSize = 0;
+  handle.reservedSize = 0;
+  snprintf(handle.path, sizeof(handle.path), "%s", pending.path);
+
+  smb2_create_reply reply = {};
+  memcpy(reply.file_id, handle.fileId, SMB2_FD_SIZE);
+  const ReportedMetadata metadata = reportedMetadata(handle.path, true);
+  reply.creation_time = metadata.creationTime;
+  reply.last_access_time = metadata.lastAccessTime;
+  reply.last_write_time = metadata.lastWriteTime;
+  reply.change_time = metadata.changeTime;
+  reply.oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+  reply.create_action = kCreateCreated;
+  reply.allocation_size = 0;
+  reply.end_of_file = 0;
+  reply.file_attributes = metadata.attributes;
+  fillCreateContextReply(pending.requestedContexts,
+                         directoryFileId(handle.path), pending.volumeId,
+                         reply.change_time, 0x001F01FFUL, reply);
+
+  smb2_pdu* pdu =
+      smb2_cmd_create_reply_async(pending.context, &reply, nullptr, nullptr);
+  if (pdu == nullptr) {
+    releaseHandle(slot);
+    return false;
+  }
+  smb2_set_pdu_message_id(pending.context, pdu, pending.messageId);
+  smb2_queue_pdu(pending.context, pdu);
+  diagnosticLogEvent("SMB mkdir-ok slot=%d path=%s", slot, pending.path);
+  sendOperation("OPEN", pending.path);
+  notifyChange(pending.path, SMB2_NOTIFY_CHANGE_FILE_ACTION_ADDED,
+               SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_DIR_NAME);
+  return true;
+}
+
+void SmbServer::Impl::completeAsyncCreate(int index, uint32_t status) {
+  if (index < 0 || static_cast<size_t>(index) >= kAsyncCreateQueueDepth ||
+      !asyncCreates[index].used) {
+    return;
+  }
+  AsyncCreate& pending = asyncCreates[index];
+  smb2_context* const context = pending.context;
+  smb2_context* const owner = pending.owner;
+  const uint64_t messageId = pending.messageId;
+  const bool detached = context == nullptr;
+  pending = {};
+  if (asyncCreateCount != 0) {
+    --asyncCreateCount;
+  }
+  if (activeAsyncCreate == index) {
+    activeAsyncCreate = -1;
+  }
+  const bool queued = context == nullptr ||
+                      queueAsyncStatus(context, SMB2_CREATE, status, messageId);
+  if (!queued && context != nullptr) {
+    smb2_close_context(context);
+  }
+  if (detached) {
+    releaseDetachedOwnerIfIdle(owner);
+  }
+}
+
+void SmbServer::Impl::failAsyncCreates(uint32_t status) {
+  for (size_t index = 0; index < kAsyncCreateQueueDepth; ++index) {
+    AsyncCreate& pending = asyncCreates[index];
+    if (!pending.used) {
+      continue;
+    }
+    smb2_context* const context = pending.context;
+    if (context != nullptr &&
+        !queueAsyncStatus(context, SMB2_CREATE, status, pending.messageId)) {
+      smb2_close_context(context);
+    }
+    if (static_cast<int>(index) == activeAsyncCreate && pending.inFlight) {
+      pending.context = nullptr;
+      pending.cancelRequested = true;
+      continue;
+    }
+    pending = {};
+    if (asyncCreateCount != 0) {
+      --asyncCreateCount;
+    }
+    if (activeAsyncCreate == static_cast<int>(index)) {
+      activeAsyncCreate = -1;
+    }
+  }
+}
+
+void SmbServer::Impl::dropAsyncCreatesForOwner(smb2_context* owner) {
+  if (owner == nullptr) {
+    return;
+  }
+  for (size_t index = 0; index < kAsyncCreateQueueDepth; ++index) {
+    AsyncCreate& pending = asyncCreates[index];
+    if (!pending.used || pending.context != owner) {
+      continue;
+    }
+    if (static_cast<int>(index) == activeAsyncCreate && pending.inFlight) {
+      pending.context = nullptr;
+      pending.cancelRequested = true;
+      continue;
+    }
+    pending = {};
+    if (asyncCreateCount != 0) {
+      --asyncCreateCount;
+    }
+    if (activeAsyncCreate == static_cast<int>(index)) {
+      activeAsyncCreate = -1;
+    }
+  }
+}
+
+bool SmbServer::Impl::cancelAsyncCreate(smb2_context* owner,
+                                        uint64_t messageId) {
+  for (AsyncCreate& pending : asyncCreates) {
+    if (pending.used && pending.context == owner &&
+        pending.messageId == messageId) {
+      pending.cancelRequested = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+void SmbServer::Impl::pollAsyncCreate() {
+  if (activeAsyncCreate < 0) {
+    if (activeAsyncRead >= 0 || activeAsyncWrite >= 0 ||
+        activeAsyncDirectory >= 0 || activeAsyncClose >= 0 ||
+        bridge.requestPending()) {
+      return;
+    }
+    uint64_t firstSequence = UINT64_MAX;
+    int firstIndex = -1;
+    for (size_t index = 0; index < kAsyncCreateQueueDepth; ++index) {
+      if (asyncCreates[index].used &&
+          asyncCreates[index].sequence < firstSequence) {
+        firstSequence = asyncCreates[index].sequence;
+        firstIndex = static_cast<int>(index);
+      }
+    }
+    if (firstIndex < 0 || oldestAsyncReadSequence() < firstSequence ||
+        oldestAsyncWriteSequence() < firstSequence ||
+        oldestAsyncDirectorySequence() < firstSequence ||
+        oldestAsyncCloseSequence() < firstSequence) {
+      return;
+    }
+    activeAsyncCreate = firstIndex;
+  }
+
+  const int index = activeAsyncCreate;
+  AsyncCreate& pending = asyncCreates[index];
+  auto clearPhysical = [&]() {
+    activeSlot = -1;
+    activeMode = ActiveMode::kNone;
+    activeLogicalOffset = 0;
+    activeVfsOffset = 0;
+  };
+  auto discardDetached = [&]() {
+    smb2_context* const owner = pending.owner;
+    pending = {};
+    if (asyncCreateCount != 0) {
+      --asyncCreateCount;
+    }
+    activeAsyncCreate = -1;
+    releaseDetachedOwnerIfIdle(owner);
+  };
+  auto submit = [&](VfsOperation operation, const char* path) -> bool {
+    if (bridge.requestPending()) {
+      return false;
+    }
+    if (!bridge.submit(operation, path, 0)) {
+      completeAsyncCreate(index, SMB2_STATUS_IO_DEVICE_ERROR);
+      return false;
+    }
+    pending.inFlight = true;
+    pending.lastProgressMs = millis();
+    return true;
+  };
+
+  if (pending.inFlight) {
+    if (pending.context != nullptr &&
+        static_cast<uint32_t>(millis() - pending.lastProgressMs) >=
+            kMutateVfsTimeoutMs) {
+      smb2_context* const context = pending.context;
+      if (!queueAsyncStatus(context, SMB2_CREATE, SMB2_STATUS_IO_TIMEOUT,
+                            pending.messageId)) {
+        smb2_close_context(context);
+      }
+      pending.context = nullptr;
+      pending.cancelRequested = true;
+    }
+    VfsResult result = {};
+    if (!bridge.takeResult(result)) {
+      return;
+    }
+    pending.inFlight = false;
+    pending.lastProgressMs = millis();
+
+    if (pending.phase == AsyncCreatePhase::kStat) {
+      // Эта ветка ставится в очередь до синхронного statPath(): FILE_CREATE
+      // существующего каталога обязан вернуть COLLISION, а любой неуспешный
+      // STAT трактуется так же, как в обычном createHandler — имени нет и
+      // можно переходить к MKDIR.
+      pending.phase = AsyncCreatePhase::kPrepare;
+      if (result.success) {
+        completeAsyncCreate(index, SMB2_STATUS_OBJECT_NAME_COLLISION);
+        return;
+      }
+    }
+
+    if (pending.phase == AsyncCreatePhase::kMkdir) {
+      if (!result.success) {
+        const uint32_t status = result.status != 0
+                                    ? smbStatusFromFilex(result.status)
+                                    : SMB2_STATUS_ACCESS_DENIED;
+        completeAsyncCreate(index, status);
+        return;
+      }
+      invalidateFsInfo();
+      invalidateParent(pending.path);
+      if (pending.context == nullptr) {
+        discardDetached();
+        return;
+      }
+      const bool queued = queueAsyncCreateReply(pending);
+      smb2_context* const context = pending.context;
+      pending = {};
+      if (asyncCreateCount != 0) {
+        --asyncCreateCount;
+      }
+      activeAsyncCreate = -1;
+      if (!queued) {
+        smb2_close_context(context);
+      }
+      return;
+    }
+
+    if (pending.phase == AsyncCreatePhase::kCloseCommit) {
+      if (!result.success) {
+        pending.phase = AsyncCreatePhase::kCloseAbort;
+        if (!submit(VfsOperation::kCloseAbort, nullptr)) {
+          return;
+        }
+        return;
+      }
+      clearPhysical();
+      if (pending.context == nullptr) {
+        discardDetached();
+        return;
+      }
+      pending.phase = AsyncCreatePhase::kMkdir;
+    } else if (pending.phase == AsyncCreatePhase::kCloseAbort) {
+      if (pending.previousMode == ActiveMode::kWrite &&
+          pending.previousSlot >= 0 &&
+          static_cast<size_t>(pending.previousSlot) < kHandleCount &&
+          handles[pending.previousSlot].used) {
+        handles[pending.previousSlot].failed = true;
+      }
+      clearPhysical();
+      if (pending.context == nullptr) {
+        discardDetached();
+      } else {
+        completeAsyncCreate(index, SMB2_STATUS_IO_DEVICE_ERROR);
+      }
+      return;
+    }
+  }
+
+  if (pending.context == nullptr) {
+    discardDetached();
+    return;
+  }
+  if (pending.cancelRequested) {
+    completeAsyncCreate(index, SMB2_STATUS_CANCELLED);
+    return;
+  }
+  const Tree* tree = findTree(pending.treeId);
+  if (tree == nullptr || tree->owner != pending.context) {
+    completeAsyncCreate(index, SMB2_STATUS_NETWORK_NAME_DELETED);
+    return;
+  }
+  if (bridge.requestPending()) {
+    return;
+  }
+
+  if (pending.phase == AsyncCreatePhase::kStat) {
+    submit(VfsOperation::kStat, pending.path);
+    return;
+  }
+
+  if (pending.phase == AsyncCreatePhase::kPrepare) {
+    if (activeSlot >= 0 && activeMode != ActiveMode::kNone) {
+      pending.previousSlot = activeSlot;
+      pending.previousMode = activeMode;
+      if (activeMode != ActiveMode::kDirectory) {
+        pending.phase = AsyncCreatePhase::kCloseCommit;
+        submit(VfsOperation::kCloseCommit, nullptr);
+        return;
+      }
+      clearPhysical();
+    }
+    pending.phase = AsyncCreatePhase::kMkdir;
+  }
+  submit(VfsOperation::kMkdir, pending.path);
+}
+
+int SmbServer::Impl::allocateAsyncClose() const {
+  if (asyncCloseCount >= kAsyncCloseQueueDepth) {
+    return -1;
+  }
+  for (size_t index = 0; index < kAsyncCloseQueueDepth; ++index) {
+    if (!asyncCloses[index].used) {
+      return static_cast<int>(index);
+    }
+  }
+  return -1;
+}
+
+bool SmbServer::Impl::enqueueAsyncClose(smb2_context* context,
+                                        uint64_t messageId, int slot,
+                                        uint32_t generation, uint16_t flags) {
+  const int index = allocateAsyncClose();
+  if (index < 0 || context == nullptr || messageId == 0 || slot < 0 ||
+      static_cast<size_t>(slot) >= kHandleCount || !handles[slot].used ||
+      handles[slot].generation != generation) {
+    return false;
+  }
+  AsyncClose& pending = asyncCloses[index];
+  pending = {};
+  pending.used = true;
+  pending.context = context;
+  pending.owner = context;
+  pending.messageId = messageId;
+  pending.sequence = nextAsyncVfsSequence();
+  pending.generation = generation;
+  pending.flags = flags;
+  pending.slot = slot;
+  ++asyncCloseCount;
+  diagnosticLogEvent("SMB close-deferred mid=%llu slot=%d waiting=%u path=%s",
+                     static_cast<unsigned long long>(messageId), slot,
+                     static_cast<unsigned>(asyncCloseCount),
+                     handles[slot].path);
+  return true;
+}
+
+void SmbServer::Impl::completeAsyncClose(int index, uint32_t status,
+                                         const smb2_close_reply* reply) {
+  if (index < 0 || static_cast<size_t>(index) >= kAsyncCloseQueueDepth ||
+      !asyncCloses[index].used) {
+    return;
+  }
+  AsyncClose& pending = asyncCloses[index];
+  smb2_context* const context = pending.context;
+  smb2_context* const owner = pending.owner;
+  const uint64_t messageId = pending.messageId;
+  const bool detached = context == nullptr;
+  pending = {};
+  if (asyncCloseCount != 0) {
+    --asyncCloseCount;
+  }
+  if (activeAsyncClose == index) {
+    activeAsyncClose = -1;
+  }
+
+  bool queued = context == nullptr;
+  if (context != nullptr && status == SMB2_STATUS_SUCCESS && reply != nullptr) {
+    smb2_close_reply encoded = *reply;
+    smb2_pdu* pdu =
+        smb2_cmd_close_reply_async(context, &encoded, nullptr, nullptr);
+    if (pdu != nullptr) {
+      smb2_set_pdu_message_id(context, pdu, messageId);
+      smb2_queue_pdu(context, pdu);
+      queued = true;
+    }
+  } else if (context != nullptr) {
+    queued = queueAsyncStatus(context, SMB2_CLOSE, status, messageId);
+  }
+  if (!queued && context != nullptr) {
+    smb2_close_context(context);
+  }
+  if (detached) {
+    releaseDetachedOwnerIfIdle(owner);
+  }
+}
+
+void SmbServer::Impl::dropAsyncClosesForOwner(smb2_context* owner) {
+  if (owner == nullptr) {
+    return;
+  }
+  for (size_t index = 0; index < kAsyncCloseQueueDepth; ++index) {
+    AsyncClose& pending = asyncCloses[index];
+    if (!pending.used || pending.owner != owner) {
+      continue;
+    }
+    pending = {};
+    if (asyncCloseCount != 0) {
+      --asyncCloseCount;
+    }
+    if (activeAsyncClose == static_cast<int>(index)) {
+      activeAsyncClose = -1;
+    }
+  }
+}
+
+bool SmbServer::Impl::cancelAsyncClose(smb2_context* owner,
+                                       uint64_t messageId) {
+  for (AsyncClose& pending : asyncCloses) {
+    if (pending.used && pending.owner == owner &&
+        pending.messageId == messageId) {
+      pending.cancelRequested = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+void SmbServer::Impl::pollAsyncClose() {
+  if (activeAsyncClose < 0) {
+    for (size_t index = 0; index < kAsyncCloseQueueDepth; ++index) {
+      if (asyncCloses[index].used && asyncCloses[index].cancelRequested) {
+        completeAsyncClose(static_cast<int>(index), SMB2_STATUS_CANCELLED);
+        return;
+      }
+    }
+    if (activeAsyncRead >= 0 || activeAsyncWrite >= 0 ||
+        activeAsyncDirectory >= 0 || activeAsyncCreate >= 0 ||
+        bridge.requestPending()) {
+      return;
+    }
+    uint64_t firstSequence = UINT64_MAX;
+    int firstIndex = -1;
+    for (size_t index = 0; index < kAsyncCloseQueueDepth; ++index) {
+      if (asyncCloses[index].used &&
+          asyncCloses[index].sequence < firstSequence) {
+        firstSequence = asyncCloses[index].sequence;
+        firstIndex = static_cast<int>(index);
+      }
+    }
+    if (firstIndex < 0 || oldestAsyncReadSequence() < firstSequence ||
+        oldestAsyncWriteSequence() < firstSequence ||
+        oldestAsyncDirectorySequence() < firstSequence ||
+        oldestAsyncCreateSequence() < firstSequence) {
+      return;
+    }
+    activeAsyncClose = firstIndex;
+  }
+
+  const int index = activeAsyncClose;
+  AsyncClose& pending = asyncCloses[index];
+  if (pending.context == nullptr) {
+    completeAsyncClose(index, SMB2_STATUS_CANCELLED);
+    return;
+  }
+  if (pending.cancelRequested) {
+    completeAsyncClose(index, SMB2_STATUS_CANCELLED);
+    return;
+  }
+  if (pending.slot < 0 ||
+      static_cast<size_t>(pending.slot) >= kHandleCount ||
+      !handles[pending.slot].used ||
+      handles[pending.slot].generation != pending.generation ||
+      handles[pending.slot].owner != pending.owner) {
+    completeAsyncClose(index, SMB2_STATUS_FILE_CLOSED);
+    return;
+  }
+
+  smb2_close_reply reply = {};
+  const uint32_t status = finalizeClose(
+      pending.slot, pending.generation, pending.flags, reply);
+  completeAsyncClose(index, status,
+                     status == SMB2_STATUS_SUCCESS ? &reply : nullptr);
+}
+
 void SmbServer::Impl::pollAsyncDirectory() {
   if (activeAsyncDirectory < 0) {
     // Наличие READ/WRITE в очереди само по себе не запрещает каталог. Выбираем
     // старейшую физическую операцию; именно прежний запрет по asyncReadCount
     // позволял более позднему чтению EXE заморозить QUERY_DIRECTORY навсегда.
     if (activeAsyncRead >= 0 || activeAsyncWrite >= 0 ||
+        activeAsyncClose >= 0 ||
         bridge.requestPending()) {
       return;
     }
@@ -5347,7 +6049,10 @@ void SmbServer::Impl::pollAsyncDirectory() {
     }
     const uint64_t readSequence = oldestAsyncReadSequence();
     const uint64_t writeSequence = oldestAsyncWriteSequence();
-    if (readSequence < firstSequence || writeSequence < firstSequence) {
+    const uint64_t createSequence = oldestAsyncCreateSequence();
+    const uint64_t closeSequence = oldestAsyncCloseSequence();
+    if (readSequence < firstSequence || writeSequence < firstSequence ||
+        createSequence < firstSequence || closeSequence < firstSequence) {
       return;
     }
     activeAsyncDirectory = firstIndex;
@@ -5695,6 +6400,8 @@ int SmbServer::Impl::serviceHandler(smb2_server* serverValue) {
     self->pollAsyncRead();
     self->pollAsyncWrite();
     self->pollAsyncDirectory();
+    self->pollAsyncCreate();
+    self->pollAsyncClose();
   }
   return 0;
 }
@@ -5857,6 +6564,10 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
       request->create_disposition > SMB2_FILE_OVERWRITE_IF) {
     return createStatus(smb2, request, SMB2_STATUS_OBJECT_NAME_INVALID);
   }
+  const bool explicitDirectory =
+      (request->create_options & SMB2_FILE_DIRECTORY_FILE) != 0;
+  const bool explicitFile =
+      (request->create_options & SMB2_FILE_NON_DIRECTORY_FILE) != 0;
 
   // AllocationSize во всех последующих ответах обязан быть кратен размеру
   // кластера, который этот же сервер сообщает через FileFsSizeInformation.
@@ -5872,6 +6583,32 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
       requestedContexts.queryOnDiskId && !requestedContexts.durableReconnect
           ? self->cachedFsInfo.serial
           : 0;
+  const bool physicalQueueBusy =
+      self->activeAsyncRead >= 0 || self->activeAsyncWrite >= 0 ||
+      self->activeAsyncDirectory >= 0 || self->activeAsyncCreate >= 0 ||
+      self->activeAsyncClose >= 0 ||
+      self->asyncReadCount != 0 || self->queuedReadCount != 0 ||
+      self->asyncWriteCount != 0 || self->asyncDirectoryCount != 0 ||
+      self->asyncCreateCount != 0 || self->asyncCloseCount != 0 ||
+      self->bridge.requestPending();
+  if (explicitDirectory &&
+      request->create_disposition == SMB2_FILE_CREATE && physicalQueueBusy) {
+    // Для нового каталога откладываем и проверку существования: statPath тоже
+    // использует единственный FILEX-мост и раньше возвращал IO_TIMEOUT ещё до
+    // того, как CREATE доходил до отложенного MKDIR.
+    const uint64_t messageId = smb2_get_last_request_message_id(smb2);
+    if (smb2_set_current_request_internal_async(smb2) != 0) {
+      return -1;
+    }
+    if (!self->enqueueAsyncCreate(
+            smb2, messageId, treeId, request->desired_access,
+            request->create_options, requestedContexts, volumeId, true, path)) {
+      return createStatus(smb2, request,
+                          SMB2_STATUS_INSUFFICIENT_RESOURCES);
+    }
+    self->pollAsyncCreate();
+    return 1;
+  }
   VfsResult statResult;
   const bool exists = self->statPath(path, statResult);
   diagnosticLogEvent(
@@ -5887,10 +6624,6 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
     diagnosticLogEvent("SMB create-busy path=%s", path);
     return createStatus(smb2, request, SMB2_STATUS_IO_TIMEOUT);
   }
-  const bool explicitDirectory =
-      (request->create_options & SMB2_FILE_DIRECTORY_FILE) != 0;
-  const bool explicitFile =
-      (request->create_options & SMB2_FILE_NON_DIRECTORY_FILE) != 0;
   bool directory = exists ? statResult.isDirectory : explicitDirectory;
   if (strcmp(path, "/") == 0) {
     directory = true;
@@ -5966,6 +6699,33 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
       return createStatus(smb2, request, SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
     }
     if (directory) {
+      const bool mkdirQueueBusy =
+          self->activeAsyncRead >= 0 || self->activeAsyncWrite >= 0 ||
+          self->activeAsyncDirectory >= 0 || self->activeAsyncCreate >= 0 ||
+          self->activeAsyncClose >= 0 ||
+          self->asyncReadCount != 0 || self->queuedReadCount != 0 ||
+          self->asyncWriteCount != 0 || self->asyncDirectoryCount != 0 ||
+          self->asyncCreateCount != 0 || self->asyncCloseCount != 0 ||
+          self->bridge.requestPending();
+      if (mkdirQueueBusy) {
+        // Проводник создаёт каталог назначения, пока следующий FINDNEXT
+        // исходного каталога ещё находится на core 1. Немедленный closeActive
+        // раньше превращал bridge-busy в STATUS_ACCESS_DENIED. Оставляем
+        // CREATE синхронным на проводе, но исполняем MKDIR по общей FIFO.
+        const uint64_t messageId = smb2_get_last_request_message_id(smb2);
+        if (smb2_set_current_request_internal_async(smb2) != 0) {
+          return -1;
+        }
+        if (!self->enqueueAsyncCreate(
+                smb2, messageId, treeId, request->desired_access,
+                request->create_options, requestedContexts, volumeId, false,
+                path)) {
+          return createStatus(smb2, request,
+                              SMB2_STATUS_INSUFFICIENT_RESOURCES);
+        }
+        self->pollAsyncCreate();
+        return 1;
+      }
       VfsResult result;
       const bool created =
           self->closeActive(true) &&
@@ -6062,80 +6822,119 @@ int SmbServer::Impl::closeHandler(smb2_server* serverValue,
   if (handle == nullptr) {
     return replyStatus(smb2, SMB2_CLOSE, SMB2_STATUS_FILE_CLOSED);
   }
-  if (!self->drainAsyncWritesForHandle(slot, handle->generation)) {
-    handle->failed = true;
+
+  const bool physicalQueueBusy =
+      self->activeAsyncRead >= 0 || self->activeAsyncWrite >= 0 ||
+      self->activeAsyncDirectory >= 0 || self->activeAsyncCreate >= 0 ||
+      self->activeAsyncClose >= 0 || self->asyncReadCount != 0 ||
+      self->queuedReadCount != 0 || self->asyncWriteCount != 0 ||
+      self->asyncDirectoryCount != 0 || self->asyncCreateCount != 0 ||
+      self->asyncCloseCount != 0 || self->bridge.requestPending();
+  if (physicalQueueBusy) {
+    const uint64_t messageId = smb2_get_last_request_message_id(smb2);
+    const uint32_t generation = handle->generation;
+    if (messageId == 0) {
+      return replyStatus(smb2, SMB2_CLOSE,
+                         SMB2_STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if (smb2_set_current_request_internal_async(smb2) != 0) {
+      return -1;
+    }
+    if (!self->enqueueAsyncClose(smb2, messageId, slot, generation,
+                                 request->flags)) {
+      return replyStatus(smb2, SMB2_CLOSE,
+                         SMB2_STATUS_INSUFFICIENT_RESOURCES);
+    }
+    self->pollAsyncClose();
+    return 1;
+  }
+
+  const uint32_t status =
+      self->finalizeClose(slot, handle->generation, request->flags, *reply);
+  return status == SMB2_STATUS_SUCCESS
+             ? 0
+             : replyStatus(smb2, SMB2_CLOSE, status);
+}
+
+uint32_t SmbServer::Impl::finalizeClose(int slot, uint32_t generation,
+                                        uint16_t flags,
+                                        smb2_close_reply& reply) {
+  if (slot < 0 || static_cast<size_t>(slot) >= kHandleCount ||
+      !handles[slot].used || handles[slot].generation != generation) {
+    return SMB2_STATUS_FILE_CLOSED;
+  }
+  Handle& handle = handles[slot];
+  if (!drainAsyncWritesForHandle(slot, generation)) {
+    handle.failed = true;
   }
   bool resizeFailed = false;
-  if (!handle->failed && handle->sizeReserved &&
-      handle->ownsSizeReservation &&
-      !self->commitReservedSize(slot)) {
+  if (!handle.failed && handle.sizeReserved && handle.ownsSizeReservation &&
+      !commitReservedSize(slot)) {
     // Не оставляем в ответах логический размер, который не удалось записать на
     // SD. Исходный файл при этом не удаляем: ошибка EXTEND не равна сбою
     // создания нового файла.
-    handle->sizeReserved = false;
-    handle->ownsSizeReservation = false;
+    handle.sizeReserved = false;
+    handle.ownsSizeReservation = false;
     resizeFailed = true;
   }
   bool metadataFailed = false;
-  if (!handle->failed && handle->metadataPending &&
-      !self->applyPendingMetadata(slot)) {
+  if (!handle.failed && handle.metadataPending && !applyPendingMetadata(slot)) {
     // Ошибка времени/атрибутов не должна удалять уже полностью записанный файл.
     // CLOSE всё равно закрывает VFS, но сообщает Windows о сбое метаданных.
-    handle->metadataPending = false;
+    handle.metadataPending = false;
     metadataFailed = true;
   }
-  const bool wasActive = self->activeSlot == slot;
+  const bool wasActive = activeSlot == slot;
   // Обычный файл материализуется ещё в CREATE, поэтому CLOSE не должен снова
   // открывать его с усечением. Это особенно важно, когда второй handle уже
   // записал данные в тот же новый файл.
-  if (wasActive && handle->writable && !self->closeActive(!handle->failed)) {
-    handle->failed = true;
-  } else if (wasActive && !handle->writable) {
-    self->closeActive(true);
+  if (wasActive && handle.writable && !closeActive(!handle.failed)) {
+    handle.failed = true;
+  } else if (wasActive && !handle.writable) {
+    closeActive(true);
   }
 
-  memset(reply, 0, sizeof(*reply));
-  if ((request->flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB) != 0) {
+  memset(&reply, 0, sizeof(reply));
+  if ((flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB) != 0) {
     const ReportedMetadata metadata =
-        self->reportedMetadata(handle->path, handle->directory);
-    reply->flags = SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB;
-    reply->creation_time = metadata.creationTime;
-    reply->last_access_time = metadata.lastAccessTime;
-    reply->last_write_time = metadata.lastWriteTime;
-    reply->change_time = metadata.changeTime;
-    reply->allocation_size = self->reportedAllocationSize(
-        handle->physicalSize, handle->directory);
-    reply->end_of_file = handle->physicalSize;
-    reply->file_attributes = metadata.attributes;
+        reportedMetadata(handle.path, handle.directory);
+    reply.flags = SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB;
+    reply.creation_time = metadata.creationTime;
+    reply.last_access_time = metadata.lastAccessTime;
+    reply.last_write_time = metadata.lastWriteTime;
+    reply.change_time = metadata.changeTime;
+    reply.allocation_size =
+        reportedAllocationSize(handle.physicalSize, handle.directory);
+    reply.end_of_file = handle.physicalSize;
+    reply.file_attributes = metadata.attributes;
   }
 
-  const bool writeFailed = handle->failed;
+  const bool writeFailed = handle.failed;
   bool removed = true;
-  const bool shouldDelete = handle->deletePending ||
-                            (handle->failed && handle->createdNew);
-  if (shouldDelete && strcmp(handle->path, "/") != 0) {
-    removed = self->removePath(handle->path);
-  } else if (handle->metadataDirty) {
+  const bool shouldDelete =
+      handle.deletePending || (handle.failed && handle.createdNew);
+  if (shouldDelete && strcmp(handle.path, "/") != 0) {
+    removed = removePath(handle.path);
+  } else if (handle.metadataDirty) {
     // Снимок родителя во время записи обновлялся точечно, но окончательную
     // длину и занятое место подтверждает только CLOSE. Здесь же — то самое
     // единственное уведомление о суммарном изменении длины файла.
-    self->invalidateParent(handle->path);
+    invalidateParent(handle.path);
   }
-  if (!handle->directory && handle->position != 0) {
+  if (!handle.directory && handle.position != 0) {
     // Итоговая строка обязана пройти без ограничения частоты, иначе счётчик
     // замрёт на предпоследнем блоке и файл будет выглядеть недокопированным.
-    self->sendProgress(*handle, handle->deletePending ? "DELETE" : "DONE",
-                       handle->position, true);
+    sendProgress(handle, handle.deletePending ? "DELETE" : "DONE",
+                 handle.position, true);
   }
-  self->sendOperation(handle->deletePending ? "DELETE" : "CLOSE",
-                      handle->path);
-  self->releaseHandle(slot);
+  sendOperation(handle.deletePending ? "DELETE" : "CLOSE", handle.path);
+  releaseHandle(slot);
   if (!removed) {
-    return replyStatus(smb2, SMB2_CLOSE, SMB2_STATUS_ACCESS_DENIED);
+    return SMB2_STATUS_ACCESS_DENIED;
   }
   return resizeFailed || metadataFailed || writeFailed
-             ? replyStatus(smb2, SMB2_CLOSE, SMB2_STATUS_IO_DEVICE_ERROR)
-             : 0;
+             ? SMB2_STATUS_IO_DEVICE_ERROR
+             : SMB2_STATUS_SUCCESS;
 }
 
 int SmbServer::Impl::flushHandler(smb2_server* serverValue,
@@ -6417,8 +7216,10 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
   const bool needsAsync =
       request->length > window || self->asyncReadCount != 0 ||
       self->queuedReadCount != 0 || self->asyncWriteCount != 0 ||
-      self->asyncDirectoryCount != 0 || self->activeAsyncRead >= 0 ||
+      self->asyncDirectoryCount != 0 || self->asyncCreateCount != 0 ||
+      self->asyncCloseCount != 0 || self->activeAsyncRead >= 0 ||
       self->activeAsyncWrite >= 0 || self->activeAsyncDirectory >= 0 ||
+      self->activeAsyncCreate >= 0 || self->activeAsyncClose >= 0 ||
       self->bridge.requestPending();
   if (needsAsync) {
     const uint64_t messageId = smb2_get_last_request_message_id(smb2);
@@ -6779,6 +7580,12 @@ int SmbServer::Impl::cancelHandler(smb2_server* serverValue,
     return 0;
   }
   if (self->cancelAsyncDirectory(smb2, messageId)) {
+    return 0;
+  }
+  if (self->cancelAsyncCreate(smb2, messageId)) {
+    return 0;
+  }
+  if (self->cancelAsyncClose(smb2, messageId)) {
     return 0;
   }
   if (self->cancelQueuedRead(smb2, messageId)) {

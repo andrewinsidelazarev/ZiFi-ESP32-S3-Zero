@@ -144,6 +144,12 @@ struct raw_command_state {
   uint32_t tree_id;
 };
 
+struct raw_create_state {
+  int done;
+  int status;
+  smb2_file_id file_id;
+};
+
 static uint16_t test_read_le16(const uint8_t *data) {
   return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
@@ -415,6 +421,90 @@ static int wait_raw_command(struct smb2_context *smb2,
     }
   }
   return 0;
+}
+
+static void raw_create_cb(struct smb2_context *smb2, int status,
+                          void *command_data, void *private_data) {
+  struct raw_create_state *state =
+      (struct raw_create_state*)private_data;
+  (void)smb2;
+  state->status = status;
+  if ((uint32_t)status == SMB2_STATUS_SUCCESS && command_data != NULL) {
+    const struct smb2_create_reply *reply =
+        (const struct smb2_create_reply*)command_data;
+    memcpy(state->file_id, reply->file_id, sizeof(state->file_id));
+  }
+  state->done = 1;
+}
+
+/* Точный CREATE каталога из захвата Проводника: DesiredAccess=0x00100081,
+ * FileAttributes=NORMAL, ShareAccess=READ|WRITE, FILE_CREATE и
+ * DIRECTORY_FILE|SYNCHRONOUS_IO_NONALERT|OPEN_REPARSE_POINT. */
+static int raw_windows_create_directory(struct smb2_context *smb2,
+                                        const char *path,
+                                        struct raw_create_state *state) {
+  struct smb2_create_request request;
+  struct smb2_pdu *pdu;
+  int old_passthrough = 0;
+
+  memset(state, 0, sizeof(*state));
+  state->status = -1;
+  memset(&request, 0, sizeof(request));
+  request.requested_oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+  request.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
+  request.desired_access = SMB2_FILE_READ_DATA |
+                           SMB2_FILE_READ_ATTRIBUTES |
+                           SMB2_SYNCHRONIZE;
+  request.file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
+  request.share_access = SMB2_FILE_SHARE_READ | SMB2_FILE_SHARE_WRITE;
+  request.create_disposition = SMB2_FILE_CREATE;
+  request.create_options = SMB2_FILE_DIRECTORY_FILE |
+                           SMB2_FILE_SYNCHRONOUS_IO_NONALERT |
+                           SMB2_FILE_OPEN_REPARSE_POINT;
+  request.name = path;
+
+  smb2_get_passthrough(smb2, &old_passthrough);
+  smb2_set_passthrough(smb2, 1);
+  pdu = smb2_cmd_create_async(smb2, &request, raw_create_cb, state);
+  if (pdu == NULL) {
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  smb2_queue_pdu(smb2, pdu);
+  {
+    const int result = wait_for_count(smb2, &state->done, 1, 10000);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return result;
+  }
+}
+
+static int raw_set_basic_info(struct smb2_context *smb2, struct smb2fh *fh) {
+  struct probe_fh_mirror *mirror = (struct probe_fh_mirror*)fh;
+  struct smb2_file_basic_info info;
+  struct smb2_set_info_request request;
+  struct raw_command_state state;
+  struct smb2_pdu *pdu;
+
+  memset(&info, 0, sizeof(info));
+  info.last_write_time.tv_sec = (time_t)1700000000;
+  info.file_attributes = SMB2_FILE_ATTRIBUTE_ARCHIVE;
+  memset(&request, 0, sizeof(request));
+  request.info_type = SMB2_0_INFO_FILE;
+  request.file_info_class = SMB2_FILE_BASIC_INFORMATION;
+  request.input_data = &info;
+  memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
+  memset(&state, 0, sizeof(state));
+  state.status = -1;
+
+  pdu = smb2_cmd_set_info_async(smb2, &request, raw_command_cb, &state);
+  if (pdu == NULL) {
+    return -1;
+  }
+  smb2_queue_pdu(smb2, pdu);
+  return wait_raw_command(smb2, &state) == 0 &&
+                 (uint32_t)state.status == SMB2_STATUS_SUCCESS
+             ? 0
+             : -1;
 }
 
 static int raw_tree_disconnect(struct smb2_context *smb2,
@@ -1247,7 +1337,7 @@ int main(int argc, char **argv) {
   }
 
   if (argc < 3) {
-    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8|test9|test10|test11|test12|test13|test14|test15|test16|test17|test18|test19|test20|test21|test22|test23|test24|test25|test26|test27|test28|test29|test30] [test-directory]\n");
+    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8|test9|test10|test11|test12|test13|test14|test15|test16|test17|test18|test19|test20|test21|test22|test23|test24|test25|test26|test27|test28|test29|test30|test31|test32|test33] [test-directory]\n");
     return 1;
   }
   const char *server = argv[1];
@@ -1386,6 +1476,10 @@ int main(int argc, char **argv) {
     if (strcmp(only_test, "test29") == 0) goto test_29;
     if (strcmp(only_test, "test30") == 0) goto test_30;
     if (strcmp(only_test, "test31") == 0) goto test_31;
+    if (strcmp(only_test, "test32") == 0) goto test_32;
+    if (strcmp(only_test, "test33") == 0) goto test_33;
+    if (strcmp(only_test, "test34") == 0) goto test_34;
+    if (strcmp(only_test, "test35") == 0) goto test_35;
   }
 
   /* TEST 1: Sequential & Multiple Reads check */
@@ -3982,6 +4076,361 @@ test_31:
     printf("RESULT TEST 31: %s\n",
            null_ok && present_ok ? "PASS" : "FAIL");
     failures += !(null_ok && present_ok);
+  }
+
+  if (only_test == NULL) goto done;
+
+test_32:
+  /* ТЕСТ 32 воспроизводит SD->SD Copy из фактического packet capture. Пока
+   * FINDNEXT исходного каталога владеет единственным FILEX-мостом, другой
+   * сеанс Проводника создаёт каталог назначения. CREATE должен дождаться
+   * старшего QUERY_DIRECTORY в общей FIFO, а не получить ACCESS_DENIED. Сервер
+   * этого отдельного теста запускается с directory-delay=250 мс. */
+  printf("\n--- TEST 32: MKDIR waits behind active FINDNEXT ---\n");
+  {
+    enum { seed_count = 12 };
+    const char *directory = test_directory[0] == '\0' ? "" : test_directory;
+    char created_path[512];
+    struct windows_compound_state opened;
+    struct raw_directory_state current;
+    struct raw_directory_state next;
+    struct raw_create_state created;
+    struct smb2_context *peer = NULL;
+    struct smb2fh *seed = NULL;
+    struct smb2fh *created_handle = NULL;
+    struct smb2fh *directory_handle = NULL;
+    int found = 0;
+    int queued = 0;
+    int next_completed = 0;
+    DWORD create_elapsed_ms = 0;
+    int test_ok = 1;
+    int index;
+
+    memset(&opened, 0, sizeof(opened));
+    memset(&current, 0, sizeof(current));
+    memset(&next, 0, sizeof(next));
+    memset(&created, 0, sizeof(created));
+    snprintf(created_path, sizeof(created_path), "%s",
+             test_path("zz_overlap_mkdir_target"));
+    (void)smb2_rmdir(smb2, created_path);
+
+    for (index = 0; test_ok && index < seed_count; ++index) {
+      char name[64];
+      snprintf(name, sizeof(name), "zz_mkdir_seed_%02d.tmp", index);
+      seed = smb2_open(smb2, test_path(name), O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = seed != NULL;
+      if (seed != NULL) {
+        test_ok = smb2_close(smb2, seed) == 0 && test_ok;
+        seed = NULL;
+      }
+    }
+
+    if (test_ok) {
+      peer = connect_context(server, share);
+      test_ok = peer != NULL;
+    }
+    if (test_ok) {
+      test_ok = run_windows_directory_compound(
+                    smb2, directory, &opened, NULL, NULL) == 0 &&
+                (uint32_t)opened.status[0] == SMB2_STATUS_SUCCESS;
+    }
+
+    /* Находим одну из тестовых записей, затем запускаем следующий физический
+     * FINDNEXT и оставляем его активным на 25 мс перед точным CREATE. */
+    while (test_ok && !found) {
+      if (raw_query_directory_entries(smb2, opened.file_id, 0, &current) != 0 ||
+          (uint32_t)current.status != SMB2_STATUS_SUCCESS ||
+          !current.payload_valid) {
+        test_ok = 0;
+        break;
+      }
+      found = strncmp(current.first_name, "zz_mkdir_seed_", 14) == 0;
+    }
+    test_ok = test_ok && found;
+    if (test_ok) {
+      queued = queue_raw_query_directory_entries(
+                   smb2, opened.file_id, 0, &next) == 0;
+      test_ok = queued;
+    }
+    if (test_ok) {
+      test_ok = service_for(smb2, 25) == 0;
+    }
+    if (test_ok) {
+      const DWORD create_started = GetTickCount();
+      test_ok = raw_windows_create_directory(peer, created_path, &created) == 0;
+      create_elapsed_ms = GetTickCount() - create_started;
+      test_ok = test_ok &&
+                (uint32_t)created.status == SMB2_STATUS_SUCCESS &&
+                create_elapsed_ms >= 150 && create_elapsed_ms < 5000;
+    }
+    if (queued) {
+      next_completed = wait_for_count(smb2, &next.done, 1, 10000) == 0;
+      test_ok = next_completed && test_ok;
+    }
+
+    printf("  CREATE status=%08x elapsed=%lu ms next-QD=%s status=%08x\n",
+           (unsigned)created.status, (unsigned long)create_elapsed_ms,
+           next_completed ? "completed" : "failed", (unsigned)next.status);
+
+    if ((uint32_t)created.status == SMB2_STATUS_SUCCESS) {
+      created_handle = smb2_fh_from_file_id(peer, &created.file_id);
+      if (created_handle != NULL) {
+        test_ok = smb2_close(peer, created_handle) == 0 && test_ok;
+        created_handle = NULL;
+      } else {
+        test_ok = 0;
+      }
+    }
+    if ((uint32_t)opened.status[0] == SMB2_STATUS_SUCCESS) {
+      directory_handle = smb2_fh_from_file_id(smb2, &opened.file_id);
+      if (directory_handle != NULL) {
+        test_ok = smb2_close(smb2, directory_handle) == 0 && test_ok;
+        directory_handle = NULL;
+      }
+    }
+    if ((uint32_t)created.status == SMB2_STATUS_SUCCESS) {
+      test_ok = smb2_rmdir(peer, created_path) == 0 && test_ok;
+    }
+    if (peer != NULL) {
+      smb2_disconnect_share(peer);
+      smb2_destroy_context(peer);
+    }
+    for (index = 0; index < seed_count; ++index) {
+      char name[64];
+      snprintf(name, sizeof(name), "zz_mkdir_seed_%02d.tmp", index);
+      (void)smb2_unlink(smb2, test_path(name));
+    }
+    printf("RESULT TEST 32: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_33:
+  /* ТЕСТ 33 воспроизводит скрытую очередь из чистой SD->SD трассы. Сервер уже
+   * ответил SUCCESS на буферизованный WRITE второго Open, поэтому на проводе
+   * нет незавершённых SMB-команд, но физический FILEX ещё пишет. Финальный
+   * CLOSE первого файла с отложенными BASIC_INFORMATION не имеет права
+   * превращать внутренний bridge-busy в IO_DEVICE_ERROR. Отдельный сервер
+   * этого теста запускается с медленным каналом. */
+  printf("\n--- TEST 33: CLOSE waits behind early-replied physical WRITE ---\n");
+  {
+    enum { file_size = 32768 };
+    struct smb2fh *closing = NULL;
+    struct smb2fh *background = NULL;
+    struct smb2fh *verify = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint8_t *readback = (uint8_t*)calloc(file_size, 1);
+    int close_result = -1;
+    int read_result = -1;
+    int test_ok = payload != NULL && readback != NULL;
+    int index;
+
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index);
+    }
+    (void)smb2_unlink(smb2, test_path("close_fifo_target.bin"));
+    (void)smb2_unlink(smb2, test_path("close_fifo_background.bin"));
+
+    if (test_ok) {
+      closing = smb2_open(smb2, test_path("close_fifo_target.bin"),
+                          O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = closing != NULL;
+    }
+    if (test_ok) {
+      test_ok = smb2_ftruncate(smb2, closing, file_size) == 0 &&
+                smb2_write(smb2, closing, payload, file_size) == file_size &&
+                /* Первый Open должен остаться логически открытым, но уже не
+                 * владеть физическим FILEX. Иначе медленный WRITE блокирует
+                 * сам CREATE фонового файла, и тест не достигает нужной
+                 * последовательности WRITE(second) -> CLOSE(first). */
+                smb2_fsync(smb2, closing) == 0 &&
+                raw_set_basic_info(smb2, closing) == 0;
+    }
+    if (test_ok) {
+      background = smb2_open(smb2, test_path("close_fifo_background.bin"),
+                             O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = background != NULL;
+    }
+    if (test_ok) {
+      /* Обычный WRITE получает ранний SUCCESS после копирования payload в
+       * PSRAM. При throttle=6000 физическая запись гарантированно остаётся
+       * активной, когда сразу следом приходит CLOSE другого Open. */
+      test_ok = smb2_write(smb2, background, payload, file_size) == file_size;
+    }
+    if (closing != NULL) {
+      close_result = smb2_close(smb2, closing);
+      closing = NULL;
+      test_ok = close_result == 0 && test_ok;
+    }
+    if (background != NULL) {
+      test_ok = smb2_close(smb2, background) == 0 && test_ok;
+      background = NULL;
+    }
+    if (test_ok) {
+      verify = smb2_open(smb2, test_path("close_fifo_target.bin"), O_RDONLY);
+      test_ok = verify != NULL;
+    }
+    if (verify != NULL) {
+      read_result = smb2_read(smb2, verify, readback, file_size);
+      test_ok = read_result == file_size &&
+                memcmp(payload, readback, file_size) == 0 && test_ok;
+      test_ok = smb2_close(smb2, verify) == 0 && test_ok;
+      verify = NULL;
+    }
+
+    printf("  target CLOSE=%d readback=%d error=%s\n", close_result,
+           read_result, smb2_get_error(smb2));
+    (void)smb2_unlink(smb2, test_path("close_fifo_target.bin"));
+    (void)smb2_unlink(smb2, test_path("close_fifo_background.bin"));
+    free(readback);
+    free(payload);
+    printf("RESULT TEST 33: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_34:
+  /* ТЕСТ 34 повторяет финал одного файла из Windows SD->SD Copy:
+   * CREATE нового файла -> SET_EOF -> WRITE -> SET_BASIC_INFORMATION ->
+   * CLOSE. SMB обязан с первого WRITE использовать FILEX random mode=3 и
+   * сохранить данные с метаданными без отдельного последовательного commit.
+   * Размер и граница WRITE взяты из пропавшего clock.wmf трассы 0.6.79. */
+  printf("\n--- TEST 34: random WRITE and metadata share one FILEX context ---\n");
+  {
+    enum { file_size = 75009, first_write = 65536 };
+    struct smb2fh *created = NULL;
+    struct smb2fh *verify = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint8_t *readback = (uint8_t*)calloc(file_size, 1);
+    int close_result = -1;
+    int read_result = -1;
+    int test_ok = payload != NULL && readback != NULL;
+    int index;
+
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index);
+    }
+    (void)smb2_unlink(smb2, test_path("sequential_metadata_close.bin"));
+
+    if (test_ok) {
+      created = smb2_open(smb2, test_path("sequential_metadata_close.bin"),
+                          O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = created != NULL;
+    }
+    if (test_ok) {
+      test_ok =
+          smb2_ftruncate(smb2, created, file_size) == 0 &&
+          smb2_write(smb2, created, payload, first_write) == first_write &&
+          smb2_write(smb2, created, payload + first_write,
+                     file_size - first_write) == file_size - first_write &&
+          raw_set_basic_info(smb2, created) == 0;
+    }
+    if (created != NULL) {
+      close_result = smb2_close(smb2, created);
+      created = NULL;
+      test_ok = close_result == 0 && test_ok;
+    }
+    if (test_ok) {
+      verify = smb2_open(smb2, test_path("sequential_metadata_close.bin"),
+                         O_RDONLY);
+      test_ok = verify != NULL;
+    }
+    if (verify != NULL) {
+      int total = 0;
+      while (total < file_size) {
+        const int part = smb2_read(smb2, verify, readback + total,
+                                   file_size - total > first_write
+                                       ? first_write
+                                       : file_size - total);
+        if (part <= 0) break;
+        total += part;
+      }
+      read_result = total;
+      test_ok = total == file_size &&
+                memcmp(payload, readback, file_size) == 0 && test_ok;
+      test_ok = smb2_close(smb2, verify) == 0 && test_ok;
+      verify = NULL;
+    }
+
+    printf("  random CLOSE=%d readback=%d error=%s\n", close_result,
+           read_result, smb2_get_error(smb2));
+    (void)smb2_unlink(smb2, test_path("sequential_metadata_close.bin"));
+    free(readback);
+    free(payload);
+    printf("RESULT TEST 34: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_35:
+  /* ТЕСТ 35 повторяет единственный пропавший файл аппаратной SD->SD копии
+   * 0.6.80: SET_EOF 44032 -> WRITE 44032 -> SET_BASIC_INFORMATION -> CLOSE.
+   * Z80-симулятор намеренно отклоняет CLOSE, если сервер выбрал для этого
+   * имени последовательный mode=1. Надёжный путь обязан с первого WRITE
+   * открыть FILEX mode=3, физически подтвердить все окна и сохранить файл. */
+  printf("\n--- TEST 35: new SMB file avoids deferred sequential CLOSE ---\n");
+  {
+    enum { file_size = 44032 };
+    struct smb2fh *created = NULL;
+    struct smb2fh *verify = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint8_t *readback = (uint8_t*)calloc(file_size, 1);
+    int close_result = -1;
+    int read_result = -1;
+    int test_ok = payload != NULL && readback != NULL;
+    int index;
+
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x680ULL);
+    }
+    (void)smb2_unlink(smb2, test_path("sequential_close_failure.bin"));
+
+    if (test_ok) {
+      created = smb2_open(smb2, test_path("sequential_close_failure.bin"),
+                          O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = created != NULL;
+    }
+    if (test_ok) {
+      test_ok =
+          smb2_ftruncate(smb2, created, file_size) == 0 &&
+          smb2_write(smb2, created, payload, file_size) == file_size &&
+          raw_set_basic_info(smb2, created) == 0;
+    }
+    if (created != NULL) {
+      close_result = smb2_close(smb2, created);
+      created = NULL;
+      test_ok = close_result == 0 && test_ok;
+    }
+    if (test_ok) {
+      verify = smb2_open(smb2, test_path("sequential_close_failure.bin"),
+                         O_RDONLY);
+      test_ok = verify != NULL;
+    }
+    if (verify != NULL) {
+      int total = 0;
+      while (total < file_size) {
+        const int part = smb2_read(smb2, verify, readback + total,
+                                   file_size - total);
+        if (part <= 0) break;
+        total += part;
+      }
+      read_result = total;
+      test_ok = total == file_size &&
+                memcmp(payload, readback, file_size) == 0 && test_ok;
+      test_ok = smb2_close(smb2, verify) == 0 && test_ok;
+      verify = NULL;
+    }
+
+    printf("  random WRITE CLOSE=%d readback=%d error=%s\n", close_result,
+           read_result, smb2_get_error(smb2));
+    (void)smb2_unlink(smb2, test_path("sequential_close_failure.bin"));
+    free(readback);
+    free(payload);
+    printf("RESULT TEST 35: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
   }
 
 done:

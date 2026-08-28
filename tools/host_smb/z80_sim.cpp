@@ -319,6 +319,7 @@ void Z80Simulator::handleOpen(const std::vector<uint8_t>& payload) {
   openValid_ = false;
   openMode_ = mode;
   offset_ = 0;
+  sequentialWriteSeen_ = false;
   windowActive_ = false;
   windowData_.clear();
 
@@ -482,6 +483,9 @@ void Z80Simulator::handleWriteWindow(const std::vector<uint8_t>& payload) {
       std::fseek(file, static_cast<long>(offset_), SEEK_SET);
       std::fwrite(windowData_.data(), 1, windowData_.size(), file);
       std::fclose(file);
+      if (openMode_ == 1 && !windowData_.empty()) {
+        sequentialWriteSeen_ = true;
+      }
       offset_ += static_cast<uint32_t>(windowData_.size());
       writeLe16(answer + 2, static_cast<uint16_t>(windowData_.size()));
     } else {
@@ -605,10 +609,22 @@ void Z80Simulator::handleSetMetadata(
 }
 
 void Z80Simulator::handleClose() {
+  // Аппаратная SD->SD трасса 0.6.80 поймала редкий отказ финального APPEND:
+  // последовательный WRITE уже был подтверждён Windows, но CLOSE mode=1
+  // вернул ошибку и новый файл пришлось удалить. Специальное имя позволяет
+  // детерминированно доказать, что SMB больше не выбирает этот режим: FILEX
+  // mode=3 подтверждает каждое позиционное окно до ответа WRITE и сюда с
+  // openMode_ == 1 для такого файла приходить не должен.
+  const bool rejectSequentialCommit =
+      openValid_ && openMode_ == 1 && sequentialWriteSeen_ &&
+      openPath_.filename() == "sequential_close_failure.bin";
   openValid_ = false;
+  openMode_ = 0;
+  sequentialWriteSeen_ = false;
   windowActive_ = false;
   windowData_.clear();
-  replyStatus(kVfsClose, kStatusOk);
+  replyStatus(kVfsClose,
+              rejectSequentialCommit ? kStatusFail : kStatusOk);
 }
 
 void Z80Simulator::handleOpenDir(const std::vector<uint8_t>& payload) {
