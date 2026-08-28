@@ -191,7 +191,7 @@ UiStageWifiSync:   db "Waiting for ESP (READY)",0
 UiStageWifiJoin:   db "Connecting to Wi-Fi",0
 UiStageDhcp:       db "Waiting for IP address",0
 UiStageFtp:        db "Starting FTP listener",0
-UiStageListening:  db "Listening",0
+UiWifiWaiting:     db "Wi-Fi [................]   0%",0
 UiStageStopping:   db "Stopping",0
 UiErrorSd:         db "ERROR: no readable SD volume",0
 UiErrorDir:        db "ERROR: /zifi directory missing",0

@@ -492,10 +492,11 @@ void Application::networkTaskLoop() {
       ftp_.poll();
     }
     // RSSI читается локально на сетевом ядре и уходит отдельным индикаторным
-    // событием. Никаких SYS_INFO/FILEX/SMB-команд для шкалы не создаётся.
-    const bool smbRunning = smb_.running();
+    // событием, пока работает FTP или SMB. Никаких SYS_INFO/FILEX-команд для
+    // шкалы не создаётся.
+    const bool fileServerRunning = smb_.running() || ftp_.running();
     const uint32_t signalNow = millis();
-    if (smbRunning &&
+    if (fileServerRunning &&
         (!wifiSignalActive ||
          static_cast<uint32_t>(signalNow - lastWifiSignalMs) >=
              kWifiSignalIntervalMs)) {
@@ -510,7 +511,7 @@ void Application::networkTaskLoop() {
       }
       lastWifiSignalMs = signalNow;
       wifiSignalActive = true;
-    } else if (!smbRunning) {
+    } else if (!fileServerRunning) {
       wifiSignalActive = false;
     }
 #if ZIFI_DIAGNOSTIC_LOG
