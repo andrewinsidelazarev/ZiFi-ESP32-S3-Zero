@@ -49,6 +49,7 @@ EVT_SMB_CLIENT  equ #62
 EVT_SMB_COMMAND equ #63
 EVT_SMB_PROGRESS equ #64               ; готовая строка хода передачи файла
 EVT_ONLINE_UPDATE_PROGRESS equ #65     ; [этап][проценты]
+EVT_WIFI_SIGNAL equ #66                ; готовая ASCII-шкала для Status
 
 RESP_SYS_INFO   equ #82
 RESP_WIFI_INI   equ #83

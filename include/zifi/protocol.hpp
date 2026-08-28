@@ -66,6 +66,9 @@ enum Command : uint8_t {
   kEventSmbProgress = 0x64,
   // [этап][проценты] автономной загрузки firmware.bin с GitHub.
   kEventOnlineUpdateProgress = 0x65,
+  // Готовая ASCII-шкала уровня Wi-Fi для поля Status SMB-плагина. Отдельное
+  // событие не вызывает SYS_INFO и не смешивается с его диагностическим текстом.
+  kEventWifiSignal = 0x66,
 
   kRespSysInfo = 0x82,
   kRespWifiConnect = 0x81,

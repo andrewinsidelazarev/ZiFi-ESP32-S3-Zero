@@ -101,21 +101,21 @@ constexpr uint32_t kSmbAdvertisedIoSize = 64 * 1024;
 // 640 КиБ — это ровно образ TRD, самое частое, что копируют с карты ZX.
 constexpr uint32_t kFileCacheLimit = 640 * 1024;
 constexpr size_t kFileCachePsramFloor = 320 * 1024;
-// После STATUS_PENDING READ больше не подчиняется обычному PDU timeout;
-// watchdog контролирует отсутствие физического прогресса самостоятельно.
+// Медленный READ остаётся внутренне асинхронным и больше не подчиняется
+// обычному PDU timeout; watchdog контролирует отсутствие физического прогресса
+// самостоятельно.
 // WRITE_THROUGH удерживает свой SMB-кредит до физического завершения.
 constexpr uint32_t kAsyncIoProgressTimeoutMs = 90 * 1000;
 // Windows CopyFile держит несколько READ/WRITE одновременно и вправе присылать
 // их не по порядку файловых смещений. Шестнадцать слотов — физический пул
 // 64-КиБ буферов для READ/WRITE, но физический FILEX-канал к SD всё равно один.
 constexpr size_t kAsyncIoQueueDepth = 16;
-// В async переводим только тот READ, который реально может обслуживаться
-// сейчас. Остальные запросы сохраняются маленькими QueuedRead без interim-
-// ответа и поэтому продолжают удерживать свои SMB credits. После финала окно
-// сдвигается ровно на один READ: клиент не может выгрузить на сервер очередь,
-// растущую вместе с размером файла, а каждый promoted READ получает PENDING
-// непосредственно перед физической работой. Это flow control, а не предел
-// размера файла; физический backend сериализован, поэтому глубина сервиса 1.
+// Физически обслуживаем только один READ. Все принятые запросы остаются
+// синхронными на проводе и удерживают свои SMB credits до финального ответа.
+// Нельзя выдавать STATUS_PENDING: его interim credit позволял Windows сразу
+// присылать замену и после нажатия «Отмена» бесконечно самопополнял очередь.
+// Внутри ESP запросы всё равно асинхронны, поэтому сеть и CANCEL обслуживаются.
+// Это flow control, а не предел размера файла; backend FILEX сериализован.
 constexpr size_t kAsyncReadServiceDepth = 1;
 // Размер реестра соединений. Это НЕ предел: соединение сверх реестра всё
 // равно обслуживается, просто не попадает в учёт. Один Dolphin поднимает три
@@ -1162,7 +1162,7 @@ struct SmbServer::Impl {
                         uint32_t length);
   bool beginAsyncRead(smb2_context* context, uint64_t messageId, int slot,
                       uint64_t sequence, uint32_t generation, uint32_t offset,
-                      uint32_t length, int index, bool sendPending);
+                      uint32_t length, int index);
   void promoteQueuedReads();
   void failQueuedReads(uint32_t status);
   void dropQueuedReadsForOwner(smb2_context* owner);
@@ -2263,7 +2263,7 @@ bool SmbServer::Impl::beginAsyncRead(smb2_context* context,
                                      uint64_t messageId, int slot,
                                      uint64_t sequence, uint32_t generation,
                                      uint32_t offset, uint32_t length,
-                                     int index, bool sendPending) {
+                                     int index) {
   if (context == nullptr || messageId == 0 || index < 0 ||
       static_cast<size_t>(index) >= kAsyncIoQueueDepth ||
       asyncIoBuffers[index] == nullptr || asyncReads[index].used ||
@@ -2284,15 +2284,6 @@ bool SmbServer::Impl::beginAsyncRead(smb2_context* context,
   pending.length = length;
   pending.lastProgressMs = millis();
   ++asyncReadCount;
-
-  if (sendPending &&
-      !queueAsyncStatus(context, SMB2_READ, SMB2_STATUS_PENDING, messageId)) {
-    pending = {};
-    if (asyncReadCount != 0) {
-      --asyncReadCount;
-    }
-    return false;
-  }
   return true;
 }
 
@@ -2333,7 +2324,7 @@ void SmbServer::Impl::promoteQueuedReads() {
     const bool started = beginAsyncRead(
         queued->context, queued->messageId, queued->slot,
         queued->sequence, queued->generation, queued->offset,
-        queued->length, index, true);
+        queued->length, index);
     smb2_context* const context = queued->context;
     const uint32_t offset = queued->offset;
     heap_caps_free(queued);
@@ -6393,9 +6384,8 @@ int SmbServer::Impl::serviceHandler(smb2_server* serverValue) {
       return 0;
     }
     self->pollAsyncRead();
-    // После финала сдвигаем кредитное окно ровно на один запрос. Старейший
-    // deferred READ только сейчас получает STATUS_PENDING и становится async;
-    // выданный interim credit позволяет Windows прислать ровно одну замену.
+    // После финала запускаем старейший уже принятый READ. На проводе он остаётся
+    // синхронным и не возвращает credit до собственного финального ответа.
     self->promoteQueuedReads();
     self->pollAsyncRead();
     self->pollAsyncWrite();
@@ -7106,18 +7096,18 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   const uint64_t operationSequence = self->nextAsyncVfsSequence();
   int index = -1;
   // Не обгоняем уже поставленные в очередь READ. Пока единственный физический
-  // FILEX-сервис занят, сохраняем только метаданные и НЕ возвращаем interim-
-  // credit. Клиентское окно остаётся постоянным и не превращает весь файл в
-  // десятки многоминутных async-запросов.
+  // FILEX-сервис занят, сохраняем только метаданные. Все READ остаются
+  // синхронными на проводе и не возвращают credit до финального ответа: после
+  // отмены Windows не может поддерживать бесконечную очередь заменами на каждый
+  // STATUS_PENDING.
   if (self->queuedReadHead == nullptr) {
     index = self->allocateAsyncRead();
   }
   if (index < 0) {
-    // Этот READ пока не получает STATUS_PENDING: так он удерживает SMB-credit
-    // и ограничивает окно Windows. Поэтому обычный 120-секундный таймер PDU
-    // обязан быть отключён явно. Иначе libsmb2 удаляет Request из waitqueue,
-    // а поздние interim/final ответы уже не с чем коррелировать — копирование
-    // навсегда остаётся ждать исчезнувший блок.
+    // Запрос удерживает SMB-credit и ограничивает окно Windows. Обычный
+    // 120-секундный таймер PDU обязан быть отключён явно. Иначе libsmb2 удаляет
+    // Request из waitqueue, а поздний финальный ответ уже не с чем
+    // коррелировать — копирование навсегда остаётся ждать исчезнувший блок.
     if (smb2_set_current_request_internal_async(smb2) != 0) {
       return -1;
     }
@@ -7129,8 +7119,14 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     return 1;
   }
 
+  // Активный READ тоже остаётся синхронным на проводе. internal_async только
+  // передаёт его время жизни watchdog приложения и не создаёт AsyncId/interim
+  // credit.
+  if (smb2_set_current_request_internal_async(smb2) != 0) {
+    return -1;
+  }
   if (!self->beginAsyncRead(smb2, messageId, slot, operationSequence,
-                            handle->generation, offset, wanted, index, true)) {
+                            handle->generation, offset, wanted, index)) {
     return -1;
   }
 

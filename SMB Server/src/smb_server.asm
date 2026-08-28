@@ -29,7 +29,7 @@ PLUGIN:
         call Link_Start                  ; ZiFi + готовность ESP + Wi-Fi + SMB
         jr c,.network_error
 
-        ld hl,UiStageListening
+        ld hl,UiWifiWaiting
         call Ui_SetStatus
         call Ui_BuildIp
         call Ui_Draw
@@ -380,6 +380,8 @@ Vfs_Serve:
         jr z,SmbEvent_Command
         cp EVT_SMB_PROGRESS
         jr z,SmbEvent_Progress
+        cp EVT_WIFI_SIGNAL
+        jr z,SmbEvent_WifiSignal
         call Vfs_Dispatch
         jr Vfs_Serve
 
@@ -442,6 +444,21 @@ SmbEvent_Progress:
         call Ui_SetProgress
         call Ui_Draw
         jr Vfs_Serve
+
+; Уровень Wi-Fi приходит отдельной готовой ASCII-строкой. Поле Status
+; заменяет Listening; SYS_INFO для этого не вызывается и его текст не меняется.
+SmbEvent_WifiSignal:
+        ld hl,(ProtoRxLen)
+        ld a,h
+        or l
+        jp z,Vfs_Serve
+        ld de,ProtoBuf
+        add hl,de
+        ld (hl),0
+        ld hl,ProtoBuf
+        call Ui_SetStatus
+        call Ui_Draw
+        jp Vfs_Serve
 
 ; --- данные ------------------------------------------------------------------
 

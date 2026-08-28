@@ -25,7 +25,7 @@
         dd 0                          ; инструмент меню, не привязанный к выбранному файлу
 
 .plugin_name
-        db "ZiFi SMB Server v0.5.7"
+        db "ZiFi SMB Server v0.5.8"
         ds 32-($-.plugin_name),' '
         db #03                        ; запуск из меню плагинов
         ds 6

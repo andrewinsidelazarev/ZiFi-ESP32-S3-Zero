@@ -44,6 +44,39 @@ constexpr uint32_t kWifiTimeoutMs = 10000;
 constexpr uint32_t kNetworkStackBytes = 16384;
 constexpr UBaseType_t kNetworkPriority = 2;
 constexpr BaseType_t kNetworkCore = 0;
+constexpr uint32_t kWifiSignalIntervalMs = 2000;
+constexpr size_t kWifiSignalBarWidth = 16;
+
+uint8_t wifiSignalPercent(int32_t rssi) {
+  if (rssi <= -90) {
+    return 0;
+  }
+  if (rssi >= -50) {
+    return 100;
+  }
+  return static_cast<uint8_t>((rssi + 90) * 100 / 40);
+}
+
+size_t formatWifiSignal(char* output, size_t capacity, bool connected,
+                        int32_t rssi) {
+  if (output == nullptr || capacity < 30) {
+    return 0;
+  }
+  const uint8_t percent = connected ? wifiSignalPercent(rssi) : 0;
+  const size_t filled =
+      (static_cast<size_t>(percent) * kWifiSignalBarWidth + 50) / 100;
+  size_t length = static_cast<size_t>(snprintf(output, capacity, "Wi-Fi ["));
+  for (size_t index = 0; index < kWifiSignalBarWidth; ++index) {
+    output[length++] = index < filled ? '#' : '.';
+  }
+  const int suffix = snprintf(output + length, capacity - length,
+                              "] %3u%%", static_cast<unsigned>(percent));
+  if (suffix < 0 || static_cast<size_t>(suffix) >= capacity - length) {
+    output[0] = 0;
+    return 0;
+  }
+  return length + static_cast<size_t>(suffix);
+}
 
 bool runningFirmwareIsPending() {
   const esp_partition_t* running = esp_ota_get_running_partition();
@@ -443,6 +476,8 @@ void Application::networkTaskLoop() {
 
   uint8_t token = 0;
   uint32_t lastDiagnosticFlushMs = 0;
+  uint32_t lastWifiSignalMs = 0;
+  bool wifiSignalActive = false;
   for (;;) {
     if (xQueueReceive(requestQueue_, &token, pdMS_TO_TICKS(2)) == pdTRUE) {
       processNetworkRequest();
@@ -455,6 +490,28 @@ void Application::networkTaskLoop() {
       ota_.poll();
     } else if (!smb_.running()) {
       ftp_.poll();
+    }
+    // RSSI читается локально на сетевом ядре и уходит отдельным индикаторным
+    // событием. Никаких SYS_INFO/FILEX/SMB-команд для шкалы не создаётся.
+    const bool smbRunning = smb_.running();
+    const uint32_t signalNow = millis();
+    if (smbRunning &&
+        (!wifiSignalActive ||
+         static_cast<uint32_t>(signalNow - lastWifiSignalMs) >=
+             kWifiSignalIntervalMs)) {
+      char signal[31] = {};
+      const bool connected = WiFi.status() == WL_CONNECTED;
+      const size_t length = formatWifiSignal(
+          signal, sizeof(signal), connected, connected ? WiFi.RSSI() : -127);
+      if (length != 0) {
+        enqueueNetworkEvent(kEventWifiSignal,
+                            reinterpret_cast<const uint8_t*>(signal),
+                            static_cast<uint16_t>(length));
+      }
+      lastWifiSignalMs = signalNow;
+      wifiSignalActive = true;
+    } else if (!smbRunning) {
+      wifiSignalActive = false;
     }
 #if ZIFI_DIAGNOSTIC_LOG
     // LittleFS блокирует flash cache. Сохранять журнал можно только когда ни

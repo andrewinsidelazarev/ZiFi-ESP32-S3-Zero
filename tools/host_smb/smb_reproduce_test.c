@@ -2712,11 +2712,10 @@ test_19:
 
 test_20:
   /* TEST 20: клиент ставит 64 READ, но сервер физически обслуживает один.
-   * STATUS_PENDING должен сдвигаться вместе с единственным сервисным окном:
-   * следующий READ становится async только после финала предыдущего. Поэтому
-   * число ожидающих на сервере определяется постоянным SMB credit window, а
-   * не числом блоков в файле. */
-  printf("\n--- TEST 20: bounded sliding READ credit window ---\n");
+   * Ни активный, ни ожидающий READ не должен получать STATUS_PENDING: каждый
+   * удерживает свой credit до синхронного финала. Поэтому клиентская очередь не
+   * превращается в самопополняющийся конвейер, который игнорирует отмену. */
+  printf("\n--- TEST 20: bounded synchronous READ credit window ---\n");
   {
     const uint32_t chunk_size = 65536;
     const int read_count = 64;
@@ -2809,65 +2808,48 @@ test_20:
 
     for (index = 0; index < read_count; ++index) {
       const struct raw_async_read_state *state = &states[index];
-      int unique_async_id = 1;
-      int peer;
-      for (peer = 0; peer < index; ++peer) {
-        if (state->pending_async_id != 0 &&
-            state->pending_async_id == states[peer].pending_async_id) {
-          unique_async_id = 0;
-        }
-      }
-      if (!state->completed || state->pending_count != 1 ||
+      if (!state->completed || state->pending_count != 0 ||
           state->final_count != 1 ||
           (uint32_t)state->final_status != SMB2_STATUS_SUCCESS ||
           state->corrupted != 0 ||
-          state->pending_command != SMB2_READ ||
           state->final_command != SMB2_READ ||
-          (state->pending_flags & (SMB2_FLAGS_SERVER_TO_REDIR |
-                                   SMB2_FLAGS_ASYNC_COMMAND)) !=
-              (SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND) ||
-          (state->pending_flags & SMB2_FLAGS_SIGNED) != 0 ||
-          (state->final_flags & (SMB2_FLAGS_SERVER_TO_REDIR |
-                                 SMB2_FLAGS_ASYNC_COMMAND)) !=
-              (SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND) ||
-          state->pending_next_command != 0 || state->final_next_command != 0 ||
-          state->pending_credit == 0 || state->final_credit != 0 ||
-          state->pending_message_id != state->final_message_id ||
-          state->pending_async_id == 0 ||
-          state->pending_async_id != state->final_async_id ||
-          !unique_async_id) {
+          (state->final_flags & SMB2_FLAGS_SERVER_TO_REDIR) == 0 ||
+          (state->final_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 ||
+          state->final_next_command != 0 || state->final_credit == 0) {
+        printf("  READ %d contract violation: completed=%d callbacks=%d/%d "
+               "status=%08x command=%u flags=%08x next=%lu credit=%u\n",
+               index, state->completed, state->pending_count,
+               state->final_count, (unsigned)state->final_status,
+               (unsigned)state->final_command, (unsigned)state->final_flags,
+               (unsigned long)state->final_next_command,
+               (unsigned)state->final_credit);
         test_ok = 0;
       }
-      printf("  READ %d off=%llu pending=%d async=0x%016llx credit=%u "
-             "final=%08x/0x%016llx credit=%u bytes=%lu bad=%d order=%d/%d\n",
+      printf("  READ %d off=%llu pending=%d final=%08x mid=0x%016llx "
+             "credit=%u bytes=%lu bad=%d order=%d\n",
              index, (unsigned long long)state->offset, state->pending_count,
-             (unsigned long long)state->pending_async_id,
-             (unsigned)state->pending_credit, (unsigned)state->final_status,
-             (unsigned long long)state->final_async_id,
+             (unsigned)state->final_status,
+             (unsigned long long)state->final_message_id,
              (unsigned)state->final_credit,
              (unsigned long)state->expected_length, state->corrupted,
-             state->pending_order, state->final_order);
+             state->final_order);
       free(states[index].buffer);
     }
-    /* При глубине физического сервиса 1 порядок обязан быть строго
-     * PENDING(i), FINAL(i), PENDING(i+1). Если все PENDING пришли заранее,
-     * сервер снова превратил размер файла в глубину многоминутной очереди. */
+    /* При глубине физического сервиса 1 финалы обязаны идти по смещениям, а
+     * промежуточных ответов, возвращающих credit до финала, быть не должно. */
     {
-      int sliding_window_ok = states[0].pending_order > 0 &&
-                              states[0].pending_order < states[0].final_order;
+      int bounded_window_ok = states[0].final_order > 0;
       for (index = 1; index < read_count; ++index) {
-        sliding_window_ok = sliding_window_ok &&
-                            states[index].pending_order >
-                                states[index - 1].final_order &&
-                            states[index].pending_order <
-                                states[index].final_order;
+        bounded_window_ok = bounded_window_ok &&
+                            states[index].pending_count == 0 &&
+                            states[index].final_order >
+                                states[index - 1].final_order;
       }
-      printf("  Sliding window: %s (READ0 %d/%d, READ%d %d/%d)\n",
-             sliding_window_ok ? "PASS" : "FAIL",
-             states[0].pending_order, states[0].final_order,
-             read_count - 1, states[read_count - 1].pending_order,
-             states[read_count - 1].final_order);
-      test_ok = test_ok && sliding_window_ok;
+      printf("  Synchronous bounded window: %s (READ0 final=%d, "
+             "READ%d final=%d)\n",
+             bounded_window_ok ? "PASS" : "FAIL", states[0].final_order,
+             read_count - 1, states[read_count - 1].final_order);
+      test_ok = test_ok && bounded_window_ok;
     }
     if (read_handle != NULL) {
       test_ok = smb2_close(smb2, read_handle) == 0 && test_ok;
@@ -3156,9 +3138,10 @@ test_23:
   if (only_test != NULL) goto done;
 
 test_24:
-  /* ТЕСТ 24: async CANCEL адресуется по AsyncId, не расходует credit или
-   * MessageId и завершает только исходный READ ответом STATUS_CANCELLED. */
-  printf("\n--- TEST 24: exact asynchronous CANCEL contract ---\n");
+  /* ТЕСТ 24: медленный READ остаётся синхронным на проводе. CANCEL адресуется
+   * по MessageId, не расходует credit/номер последовательности и завершает
+   * только исходный запрос ответом STATUS_CANCELLED без interim PENDING. */
+  printf("\n--- TEST 24: exact synchronous READ CANCEL contract ---\n");
   {
     const uint32_t length = 8192;
     struct smb2fh *writer = NULL;
@@ -3173,6 +3156,7 @@ test_24:
     int old_passthrough = 0;
     uint64_t sequence_before_cancel = 0;
     uint64_t sequence_after_cancel = 0;
+    uint64_t target_message_id = 0;
     int credits_before_cancel = 0;
     int credits_after_cancel = 0;
     int echo_ok = 0;
@@ -3212,18 +3196,16 @@ test_24:
       memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
       smb2_get_passthrough(smb2, &old_passthrough);
       smb2_set_passthrough(smb2, 1);
+      target_message_id = smb2->message_id;
       pdu = smb2_cmd_read_async(smb2, &request, raw_async_read_cb, &state);
       test_ok = pdu != NULL;
     }
     if (test_ok) {
       smb2_queue_pdu(smb2, pdu);
-      test_ok = wait_for_count(smb2, &state.pending_count, 1, 10000) == 0;
-    }
-    if (test_ok) {
       sequence_before_cancel = smb2->message_id;
       credits_before_cancel = smb2->credits;
-      /* Windows при наличии AsyncId ставит MessageId отмены в ноль. */
-      pdu = smb2_cmd_cancel_async(smb2, 0, state.pending_async_id);
+      /* Без interim AsyncId нет: Windows адресует CANCEL по исходному MID. */
+      pdu = smb2_cmd_cancel_async(smb2, target_message_id, 0);
       test_ok = pdu != NULL;
       if (pdu != NULL) smb2_queue_pdu(smb2, pdu);
     }
@@ -3232,22 +3214,25 @@ test_24:
     }
     sequence_after_cancel = smb2->message_id;
     credits_after_cancel = smb2->credits;
-    test_ok = test_ok && state.pending_count == 1 &&
+    test_ok = test_ok && state.pending_count == 0 &&
               state.final_count == 1 &&
               (uint32_t)state.final_status == SMB2_STATUS_CANCELLED &&
-              state.pending_async_id != 0 &&
-              state.pending_async_id == state.final_async_id &&
-              state.pending_message_id == state.final_message_id &&
+              state.corrupted == -1 &&
+              state.final_message_id == target_message_id &&
+              (state.final_flags & SMB2_FLAGS_SERVER_TO_REDIR) != 0 &&
+              (state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) == 0 &&
+              state.final_credit != 0 &&
               sequence_after_cancel == sequence_before_cancel &&
-              credits_after_cancel == credits_before_cancel;
+              credits_after_cancel == credits_before_cancel + 1;
     echo_ok = smb2_echo(smb2) == 0;
     test_ok = test_ok && echo_ok;
     smb2_set_passthrough(smb2, old_passthrough);
-    printf("  pending mid=0x%016llx async=0x%016llx final=%08x "
-           "sequence=%llu/%llu credits=%d/%d\n",
-           (unsigned long long)state.pending_message_id,
-           (unsigned long long)state.pending_async_id,
+    printf("  pending=%d target-mid=0x%016llx final=%08x/0x%016llx "
+           "credit=%u sequence=%llu/%llu credits=%d/%d\n",
+           state.pending_count, (unsigned long long)target_message_id,
            (unsigned)state.final_status,
+           (unsigned long long)state.final_message_id,
+           (unsigned)state.final_credit,
            (unsigned long long)sequence_before_cancel,
            (unsigned long long)sequence_after_cancel,
            credits_before_cancel, credits_after_cancel);
@@ -3740,7 +3725,7 @@ test_28:
               first.entry_count == 1 && second.entry_count == 1 &&
               first.first_index == opened.directory_first_index[1] + 1 &&
               second.first_index == first.first_index + 1 &&
-              read_state.pending_count == 1 && read_state.final_count == 1 &&
+              read_state.pending_count == 0 && read_state.final_count == 1 &&
               (uint32_t)read_state.final_status == SMB2_STATUS_SUCCESS &&
               read_state.corrupted == 0 && first.final_order > 0 &&
               first.final_order < second.final_order &&
