@@ -130,7 +130,9 @@ enum smb2_recv_state {
 #define smb2_tree_id(smb2) (((smb2)->tree_id_cur >= 0)?smb2->tree_id[(smb2)->tree_id_cur]:0xdeadbeef)
 
 #define MAX_CREDITS 1024
-#define SMB2_SERVER_CREDIT_TARGET 4
+/* One 512 KiB multi-credit WRITE consumes 8 credits. Smaller requests can use
+ * the same fixed window without forcing every PSRAM slot to grow to 512 KiB. */
+#define SMB2_SERVER_CREDIT_TARGET 8
 #define SMB2_SALT_SIZE 32
 
 /*
@@ -243,6 +245,7 @@ struct smb2_context {
         uint32_t server_compound_active_serial;
         uint16_t server_compound_request_count;
         uint16_t server_credit_window;
+        uint16_t server_credit_target;
         uint8_t server_compound_active;
         uint8_t server_compound_broken;
 

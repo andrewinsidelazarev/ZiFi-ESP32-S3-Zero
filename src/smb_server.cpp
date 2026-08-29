@@ -88,7 +88,15 @@ constexpr uint32_t kSmbListenerRetryMs = 250;
 // до 16 КиБ. READ и WRITE обязаны подтвердить полный сетевой запрос: реальный
 // Windows CopyFile не повторяет остаток короткого успешного ответа. Физические
 // окна остаются только внутренними этапами одного асинхронного SMB-запроса.
-constexpr uint32_t kSmbAdvertisedIoSize = 64 * 1024;
+constexpr uint32_t kSmbAdvertisedTransactSize = 64 * 1024;
+constexpr uint32_t kSmbAdvertisedReadSize = 64 * 1024;
+// CopyFileEx / IFileOperation передают запись Windows порциями по 512 КиБ.
+// Если MaxWrite меньше, MS-SMB2 разрешает redirector дробить одну такую порцию
+// и отправлять части в любом порядке. При старом MaxWrite=64 КиБ это реально
+// давало порядок 0, 512K..4M, 64K..512K: клиентский callback стоял на 0%, а
+// затем прыгал сразу на десятки процентов. Принимаем порцию целиком, а внутри
+// всё равно пишем её через короткие окна FILEX.
+constexpr uint32_t kSmbAdvertisedWriteSize = 512 * 1024;
 // ЗАПРЕЩЕНО уменьшать: по MS-SMB2 3.2.5.2 клиент обязан разорвать соединение,
 // если для диалекта 0x0210 и выше сервер объявил MaxRead/MaxWrite/MaxTransact
 // меньше 65536. Windows делает это буквально — Проводник показывает «Параметр
@@ -106,29 +114,29 @@ constexpr size_t kFileCachePsramFloor = 320 * 1024;
 // самостоятельно.
 // WRITE_THROUGH удерживает свой SMB-кредит до физического завершения.
 constexpr uint32_t kAsyncIoProgressTimeoutMs = 90 * 1000;
-// Windows CopyFile держит несколько READ/WRITE одновременно и вправе присылать
-// их не по порядку файловых смещений. Шестнадцать слотов — физический пул
-// 64-КиБ буферов для READ/WRITE, но физический FILEX-канал к SD всё равно один.
-constexpr size_t kAsyncIoQueueDepth = 16;
-// Физически обслуживаем только один READ. Все принятые запросы остаются
-// синхронными на проводе и удерживают свои SMB credits до финального ответа.
-// Нельзя выдавать STATUS_PENDING: его interim credit позволял Windows сразу
-// присылать замену и после нажатия «Отмена» бесконечно самопополнял очередь.
-// Внутри ESP запросы всё равно асинхронны, поэтому сеть и CANCEL обслуживаются.
+// До этой границы Windows успевает получить штатный промежуточный ответ раньше
+// своего обычного 60-секундного тайм-аута файлового запроса. STATUS_PENDING не
+// подтверждает данные: окончательный SUCCESS по-прежнему приходит только после
+// физического FILEX I/O.
+constexpr uint32_t kLongIoInterimPendingMs = 30 * 1000;
+// Восемь слотов соответствуют восьми SMB credits. Слоты стартуют по 64 КиБ и
+// растут до фактической длины WRITE только по мере необходимости: база занимает
+// 512 КиБ PSRAM, а не прежний 1 МиБ, оставляя место входному 512-КиБ PDU.
+constexpr size_t kAsyncIoQueueDepth = SMB2_SERVER_CREDIT_TARGET;
+// Физически обслуживаем только один READ. Быстрые запросы удерживают credit до
+// финала; запрос старше 30 секунд получает STATUS_PENDING, но сервер перед этим
+// снижает credit target соединения до одного. Поэтому Windows продлевает
+// тайм-аут, а прежняя бесконечно самопополняющаяся очередь не возвращается.
 // Это flow control, а не предел размера файла; backend FILEX сериализован.
 constexpr size_t kAsyncReadServiceDepth = 1;
 // Размер реестра соединений. Это НЕ предел: соединение сверх реестра всё
 // равно обслуживается, просто не попадает в учёт. Один Dolphin поднимает три
 // рабочих процесса разом, Проводник — свои, плюс соседние машины.
 constexpr size_t kClientCount = 8;
-constexpr size_t kAsyncIoSlotSize = kSmbAdvertisedIoSize;
-// Сервер имеет один физически сериализованный FILEX-backend, поэтому окно SMB
-// ограничено четырьмя кредитами. Обычные WRITE подтверждаются после сохранения
-// полного payload в PSRAM, но не более двух уже подтверждённых WRITE могут
-// оставаться физически не записанными. При большей глубине Windows успевала
-// послать FLUSH, а затем разрывала соединение по тайм-ауту до завершения SD/UART.
-// Два блока сохраняют конвейер и ограничивают durable-хвост 128 КиБ.
-constexpr size_t kAsyncWriteEarlyReplyDepth = 2;
+constexpr size_t kAsyncIoBaseSlotSize = kSmbAdvertisedReadSize;
+// 512-КиБ WRITE подтверждается только после физического завершения. Это не
+// оставляет многоминутный write-back хвост перед FLUSH/CLOSE и связывает шаг
+// стандартного клиентского индикатора с реально завершённой порцией Windows.
 // Готовый PSRAM-снимок можно сериализовать пакетом: физических обращений к
 // Z80 здесь нет. Холодный каталог принципиально другой — каждая запись требует
 // отдельного WC_FINDNEXT через UART. Связанный запрос Проводника содержит два
@@ -138,17 +146,33 @@ constexpr size_t kAsyncWriteEarlyReplyDepth = 2;
 // тем же курсором в следующем запросе.
 constexpr size_t kDirectoryBatchCapacity = 16;
 constexpr size_t kDirectoryStreamingEntriesPerReply = 1;
+
+uint32_t longIoInterimPendingMs() {
+#ifdef ZIFI_HOST_BUILD
+  // Отдельная host-регрессия сжимает 30 секунд до миллисекунд, не меняя
+  // производственный контракт прошивки.
+  const char* const text = getenv("ZIFI_HOST_INTERIM_PENDING_MS");
+  if (text != nullptr && text[0] != 0) {
+    char* end = nullptr;
+    const unsigned long parsed = strtoul(text, &end, 10);
+    if (end != text && *end == 0 && parsed > 0 && parsed <= 60000) {
+      return static_cast<uint32_t>(parsed);
+    }
+  }
+#endif
+  return kLongIoInterimPendingMs;
+}
 // QUERY_DIRECTORY остаётся синхронным на проводе, но медленный FILEX исполняет
 // вне callback SMB. Глубина совпадает с кредитным окном: память фиксирована, а
 // второй QUERY_DIRECTORY из Windows compound всегда помещается в очередь.
-constexpr size_t kAsyncDirectoryQueueDepth = kAsyncIoQueueDepth;
+constexpr size_t kAsyncDirectoryQueueDepth = 16;
 // CREATE каталога остаётся синхронным на проводе, но при занятом FILEX
 // переводится в ту же ограниченную очередь физических операций. Глубины
 // кредитного окна достаточно: каждый ожидающий CREATE удерживает свой credit.
-constexpr size_t kAsyncCreateQueueDepth = kAsyncIoQueueDepth;
+constexpr size_t kAsyncCreateQueueDepth = 16;
 // CLOSE удерживает один из восьми handle и потому не может накопиться глубже
-// таблицы handle. Отдельная очередь нужна даже после отправленного WRITE
-// SUCCESS: физическая запись в этот момент ещё может владеть FILEX.
+// таблицы handle. Отдельная очередь сохраняет общий порядок с WRITE, который
+// в этот момент ещё может владеть FILEX.
 constexpr size_t kAsyncCloseQueueDepth = kHandleCount;
 // CHANGE_NOTIFY не занимает UART/PSRAM: это только ожидающий SMB Request и
 // короткое имя. Глубина совпадает с числом одновременно учитываемых клиентов.
@@ -607,6 +631,12 @@ struct SmbServer::Impl {
   enum class ActiveMode : uint8_t { kNone, kRead, kWrite, kDirectory };
   enum class CacheLoadResult : uint8_t { kReady, kUnavailable, kIoError };
   enum class DirectoryContents : uint8_t { kEmpty, kNotEmpty, kIoError };
+  enum class TransferProgressMode : uint8_t { kNone, kRead, kWrite };
+
+  struct TransferRange {
+    uint32_t start = 0;
+    uint32_t end = 0;
+  };
 
   struct Handle {
     bool used = false;
@@ -639,6 +669,14 @@ struct SmbServer::Impl {
     uint32_t openedSize = 0;
     uint32_t reservedSize = 0;
     uint32_t position = 0;
+    // SMB-клиент вправе присылать READ/WRITE не по порядку смещений. position
+    // остаётся файловой позицией последнего запроса, а индикатор отдельно
+    // хранит объединение уже переданных диапазонов и потому не откатывается.
+    TransferProgressMode progressMode = TransferProgressMode::kNone;
+    uint32_t progressBytes = 0;
+    size_t progressRangeCount = 0;
+    size_t progressRangeCapacity = 0;
+    TransferRange* progressRanges = nullptr;
     uint32_t directoryIndex = 0;
     bool directoryEnded = false;
     bool directoryCacheUnavailable = false;
@@ -712,6 +750,7 @@ struct SmbServer::Impl {
     bool inFlight = false;
     bool cancelRequested = false;
     bool replied = false;
+    bool pendingSent = false;
     bool writeThrough = false;
     smb2_context* context = nullptr;
     // Стабильный идентификатор владельца нужен после разрушения context. Сам
@@ -725,6 +764,7 @@ struct SmbServer::Impl {
     uint32_t length = 0;
     uint32_t flushed = 0;
     uint32_t windowLength = 0;
+    uint32_t requestStartedMs = 0;
     uint32_t lastProgressMs = 0;
   };
 
@@ -734,6 +774,7 @@ struct SmbServer::Impl {
     bool used = false;
     bool inFlight = false;
     bool cancelRequested = false;
+    bool pendingSent = false;
     smb2_context* context = nullptr;
     smb2_context* owner = nullptr;
     uint64_t messageId = 0;
@@ -744,23 +785,25 @@ struct SmbServer::Impl {
     uint32_t length = 0;
     uint32_t filled = 0;
     uint32_t windowLength = 0;
+    uint32_t requestStartedMs = 0;
     uint32_t lastProgressMs = 0;
   };
 
-  // Запрос сохранён внутри сервера, но ещё НЕ получил STATUS_PENDING. Исходный
-  // PDU остаётся синхронным и удерживает credit клиента. Когда предыдущий READ
-  // завершится, запрос получает рабочий буфер и только тогда становится async.
-  // Поэтому число таких дескрипторов ограничивается кредитным окном клиента,
-  // а не числом блоков в файле.
+  // Запрос сохранён внутри сервера без рабочего буфера. До 30 секунд исходный
+  // PDU удерживает credit; затем может получить ровно один STATUS_PENDING и
+  // AsyncId. Когда предыдущий READ завершится, запрос получает рабочий буфер.
+  // Число дескрипторов жёстко ограничено кредитным окном, а не размером файла.
   struct QueuedRead {
     QueuedRead* next = nullptr;
     smb2_context* context = nullptr;
+    bool pendingSent = false;
     uint64_t messageId = 0;
     uint64_t sequence = 0;
     int slot = -1;
     uint32_t generation = 0;
     uint32_t offset = 0;
     uint32_t length = 0;
+    uint32_t requestStartedMs = 0;
   };
 
   enum class AsyncDirectoryPhase : uint8_t {
@@ -888,6 +931,7 @@ struct SmbServer::Impl {
         asyncReads{},
         asyncWrites{},
         asyncIoBuffers{},
+        asyncIoBufferCapacities{},
         activeAsyncRead(-1),
         activeAsyncWrite(-1),
         asyncReadCount(0),
@@ -985,6 +1029,9 @@ struct SmbServer::Impl {
   }
 
   ~Impl() {
+    for (size_t index = 0; index < kHandleCount; ++index) {
+      clearTransferProgress(handles[index], true);
+    }
     releaseDirectoryBatch();
     releaseAsyncIoStorage();
   }
@@ -1030,6 +1077,7 @@ struct SmbServer::Impl {
   AsyncRead asyncReads[kAsyncIoQueueDepth];
   AsyncWrite asyncWrites[kAsyncIoQueueDepth];
   uint8_t* asyncIoBuffers[kAsyncIoQueueDepth];
+  size_t asyncIoBufferCapacities[kAsyncIoQueueDepth];
   int activeAsyncRead;
   int activeAsyncWrite;
   size_t asyncReadCount;
@@ -1156,13 +1204,14 @@ struct SmbServer::Impl {
   uint64_t oldestAsyncCreateSequence() const;
   uint64_t oldestAsyncCloseSequence() const;
   int allocateAsyncRead();
-  int allocateAsyncWrite();
+  int allocateAsyncWrite(size_t requiredCapacity);
   bool enqueueAsyncRead(smb2_context* context, uint64_t messageId, int slot,
                         uint64_t sequence, uint32_t generation, uint32_t offset,
                         uint32_t length);
   bool beginAsyncRead(smb2_context* context, uint64_t messageId, int slot,
                       uint64_t sequence, uint32_t generation, uint32_t offset,
-                      uint32_t length, int index);
+                      uint32_t length, uint32_t requestStartedMs,
+                      bool pendingSent, int index);
   void promoteQueuedReads();
   void failQueuedReads(uint32_t status);
   void dropQueuedReadsForOwner(smb2_context* owner);
@@ -1203,6 +1252,10 @@ struct SmbServer::Impl {
                     uint32_t filter);
   void sendClientEvent(uint8_t state);
   void sendOperation(const char* operation, const char* path = nullptr);
+  bool noteTransferProgress(Handle& handle, TransferProgressMode mode,
+                            uint32_t offset, uint32_t length);
+  void clipTransferProgress(Handle& handle, uint32_t size);
+  void clearTransferProgress(Handle& handle, bool releaseMemory);
   // Ход текущей передачи. force обязателен на завершении, иначе последнее
   // обновление может не пройти ограничение частоты и счётчик замрёт до конца.
   void sendProgress(const Handle& handle, const char* operation,
@@ -1264,6 +1317,10 @@ struct SmbServer::Impl {
   bool activateDirectory(int slot);
   void pollAsyncRead();
   void pollAsyncWrite();
+  void pollIoInterimPending();
+  bool queueIoInterimPending(smb2_context* context, uint8_t command,
+                             uint64_t messageId, bool& pendingSent);
+  void restoreServerCreditsIfIoIdle(smb2_context* context);
   void pollAsyncDirectory();
   int allocateAsyncDirectory() const;
   bool enqueueAsyncDirectory(smb2_context* context, uint64_t messageId,
@@ -1298,7 +1355,6 @@ struct SmbServer::Impl {
   void pollAsyncClose();
   void dropAsyncClosesForOwner(smb2_context* owner);
   bool cancelAsyncClose(smb2_context* owner, uint64_t messageId);
-  bool queueBufferedWriteReplies();
   bool queueAsyncStatus(smb2_context* smb2, uint8_t command,
                         uint32_t status, uint64_t messageId);
   bool queueAsyncWriteReply(smb2_context* smb2, uint64_t messageId,
@@ -1483,11 +1539,17 @@ bool SmbServer::Impl::start(const uint8_t* payload, uint16_t length,
   server.port = portValue;
   server.handlers = &handlers;
   server.auth_data = this;
+  // По MS-SMB2 сервер обязан объявлять SIGNING_ENABLED даже при необязательной
+  // подписи. В первом тестовом образе 0.6.86 здесь был ноль: сырой probe
+  // принимал ответ, но Windows отклонял NEGOTIATE с системной ошибкой 8.
+  // Объявляем поддержку signing, а
+  // ниже не ставим SIGNING_REQUIRED: политика клиента решает, подписывать ли
+  // сеанс, без изменения настроек Windows/FAR.
   server.signing_enabled = 1;
   server.allow_anonymous = 0;
-  server.max_transact_size = kSmbAdvertisedIoSize;
-  server.max_read_size = kSmbAdvertisedIoSize;
-  server.max_write_size = kSmbAdvertisedIoSize;
+  server.max_transact_size = kSmbAdvertisedTransactSize;
+  server.max_read_size = kSmbAdvertisedReadSize;
+  server.max_write_size = kSmbAdvertisedWriteSize;
   snprintf(server.hostname, sizeof(server.hostname), "%s", hostname);
   snprintf(server.domain, sizeof(server.domain), "%s", workgroup);
 
@@ -1651,13 +1713,10 @@ void SmbServer::Impl::newClient(smb2_context* smb2, void* context) {
   // 3.0 и 3.0.2 проверены теми же zx/zx и работают. Поэтому до отдельного
   // исправления 3.1.1 объявляем максимальным современный диалект SMB 3.0.2.
   smb2_set_version(smb2, SMB2_VERSION_0302);
-  // Windows проверяет, что ответ FSCTL_VALIDATE_NEGOTIATE_INFO подписан, даже
-  // когда в NEGOTIATE клиент только разрешил подпись, но не потребовал её.
-  // Серверный код libsmb2 6.1.0 иначе оставляет этот ответ неподписанным, и
-  // Проводник завершает уже успешно авторизованный сеанс с ошибкой 1208.
-  // Обязательная подпись через штатный API библиотеки одновременно исправляет
-  // проверку диалекта и защищает все последующие запросы данного клиента.
-  smb2_set_sign(smb2, 1);
+  // До 0.6.85 этот вызов принудительно ставил SIGNING_REQUIRED. В исправленном 0.6.86
+  // server.signing_enabled оставляет обязательный по протоколу ENABLED, а
+  // ноль здесь не добавляет REQUIRED. Ожидаемый SecurityMode ответа — 0x0001.
+  smb2_set_sign(smb2, 0);
   smb2_set_authentication(smb2, SMB2_SEC_NTLMSSP);
   int requestTimeoutSeconds = 120;
 #ifdef ZIFI_HOST_BUILD
@@ -2072,11 +2131,12 @@ bool SmbServer::Impl::allocateAsyncIoStorage() {
   releaseAsyncIoStorage();
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     asyncIoBuffers[index] = static_cast<uint8_t*>(heap_caps_malloc(
-        kAsyncIoSlotSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        kAsyncIoBaseSlotSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (asyncIoBuffers[index] == nullptr) {
       releaseAsyncIoStorage();
       return false;
     }
+    asyncIoBufferCapacities[index] = kAsyncIoBaseSlotSize;
   }
   resetAsyncIo();
   return true;
@@ -2087,6 +2147,7 @@ void SmbServer::Impl::releaseAsyncIoStorage() {
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     heap_caps_free(asyncIoBuffers[index]);
     asyncIoBuffers[index] = nullptr;
+    asyncIoBufferCapacities[index] = 0;
   }
 }
 
@@ -2208,13 +2269,27 @@ int SmbServer::Impl::allocateAsyncRead() {
   return -1;
 }
 
-int SmbServer::Impl::allocateAsyncWrite() {
+int SmbServer::Impl::allocateAsyncWrite(size_t requiredCapacity) {
   if (asyncReadCount + asyncWriteCount >= kAsyncIoQueueDepth) {
     return -1;
   }
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     if (!asyncReads[index].used && !asyncWrites[index].used &&
         asyncIoBuffers[index] != nullptr) {
+      if (asyncIoBufferCapacities[index] < requiredCapacity) {
+        // Полный кэш ранее прочитанного файла полезен только для повторного
+        // READ. Перед большим WRITE он не должен отнять место одновременно у
+        // входного PDU libsmb2 и независимого буфера физической записи.
+        dropFileCache();
+        uint8_t* grown = static_cast<uint8_t*>(heap_caps_malloc(
+            requiredCapacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (grown == nullptr) {
+          continue;
+        }
+        heap_caps_free(asyncIoBuffers[index]);
+        asyncIoBuffers[index] = grown;
+        asyncIoBufferCapacities[index] = requiredCapacity;
+      }
       return static_cast<int>(index);
     }
   }
@@ -2227,6 +2302,12 @@ bool SmbServer::Impl::enqueueAsyncRead(smb2_context* context,
                                        uint32_t generation, uint32_t offset,
                                        uint32_t length) {
   if (context == nullptr || messageId == 0 || slot < 0 || length == 0) {
+    return false;
+  }
+  // STATUS_PENDING временно возвращает жизнь запросу Windows. Даже если
+  // клиент ведёт себя агрессивно, описатели не должны расти без границы.
+  if (queuedReadCount + asyncReadCount + asyncWriteCount >=
+      kAsyncIoQueueDepth) {
     return false;
   }
   QueuedRead* pending = static_cast<QueuedRead*>(heap_caps_calloc(
@@ -2245,6 +2326,7 @@ bool SmbServer::Impl::enqueueAsyncRead(smb2_context* context,
   pending->generation = generation;
   pending->offset = offset;
   pending->length = length;
+  pending->requestStartedMs = millis();
   if (queuedReadTail == nullptr) {
     queuedReadHead = pending;
   } else {
@@ -2263,7 +2345,8 @@ bool SmbServer::Impl::beginAsyncRead(smb2_context* context,
                                      uint64_t messageId, int slot,
                                      uint64_t sequence, uint32_t generation,
                                      uint32_t offset, uint32_t length,
-                                     int index) {
+                                     uint32_t requestStartedMs,
+                                     bool pendingSent, int index) {
   if (context == nullptr || messageId == 0 || index < 0 ||
       static_cast<size_t>(index) >= kAsyncIoQueueDepth ||
       asyncIoBuffers[index] == nullptr || asyncReads[index].used ||
@@ -2282,6 +2365,8 @@ bool SmbServer::Impl::beginAsyncRead(smb2_context* context,
   pending.generation = generation;
   pending.offset = offset;
   pending.length = length;
+  pending.requestStartedMs = requestStartedMs;
+  pending.pendingSent = pendingSent;
   pending.lastProgressMs = millis();
   ++asyncReadCount;
   return true;
@@ -2315,6 +2400,7 @@ void SmbServer::Impl::promoteQueuedReads() {
           queued->messageId);
       smb2_context* const context = queued->context;
       heap_caps_free(queued);
+      restoreServerCreditsIfIoIdle(context);
       if (!replyQueued) {
         smb2_close_context(context);
       }
@@ -2324,7 +2410,7 @@ void SmbServer::Impl::promoteQueuedReads() {
     const bool started = beginAsyncRead(
         queued->context, queued->messageId, queued->slot,
         queued->sequence, queued->generation, queued->offset,
-        queued->length, index);
+        queued->length, queued->requestStartedMs, queued->pendingSent, index);
     smb2_context* const context = queued->context;
     const uint32_t offset = queued->offset;
     heap_caps_free(queued);
@@ -2343,9 +2429,14 @@ void SmbServer::Impl::failQueuedReads(uint32_t status) {
     QueuedRead* const queued = queuedReadHead;
     queuedReadHead = queued->next;
     smb2_context* const context = queued->context;
-    const bool replyQueued =
-        queueAsyncStatus(context, SMB2_READ, status, queued->messageId);
+    const uint64_t messageId = queued->messageId;
     heap_caps_free(queued);
+    if (queuedReadCount != 0) {
+      --queuedReadCount;
+    }
+    restoreServerCreditsIfIoIdle(context);
+    const bool replyQueued =
+        queueAsyncStatus(context, SMB2_READ, status, messageId);
     if (!replyQueued) {
       smb2_close_context(context);
     }
@@ -2398,12 +2489,14 @@ bool SmbServer::Impl::cancelQueuedRead(smb2_context* owner,
     if (queuedReadTail == current) {
       queuedReadTail = previous;
     }
-    const bool queued = queueAsyncStatus(
-        owner, SMB2_READ, SMB2_STATUS_CANCELLED, current->messageId);
+    const uint64_t targetMessageId = current->messageId;
     heap_caps_free(current);
     if (queuedReadCount != 0) {
       --queuedReadCount;
     }
+    restoreServerCreditsIfIoIdle(owner);
+    const bool queued = queueAsyncStatus(
+        owner, SMB2_READ, SMB2_STATUS_CANCELLED, targetMessageId);
     if (!queued) {
       smb2_close_context(owner);
     }
@@ -2580,7 +2673,7 @@ void SmbServer::Impl::discardAsyncReadData(int index) {
   }
   while (bridge.vfsToNetworkAvailable() != 0) {
     const size_t part = minimum(bridge.vfsToNetworkAvailable(),
-                                static_cast<size_t>(kAsyncIoSlotSize));
+                                asyncIoBufferCapacities[index]);
     if (bridge.readForNetwork(asyncIoBuffers[index], part) == 0) {
       break;
     }
@@ -2610,6 +2703,7 @@ void SmbServer::Impl::completeAsyncReadWithStatus(int index, uint32_t status,
   if (closePhysical) {
     closeActive(false);
   }
+  restoreServerCreditsIfIoIdle(context);
   const bool replyQueued =
       context == nullptr || queueAsyncStatus(context, SMB2_READ, status,
                                              messageId);
@@ -2645,12 +2739,10 @@ void SmbServer::Impl::completeCancelledAsyncWrite(int index,
     // SMB-команды, а физический поток закрывается в согласованном состоянии.
     closeActive(true);
   }
+  restoreServerCreditsIfIoIdle(context);
   if (needsReply &&
       !queueAsyncStatus(context, SMB2_WRITE, SMB2_STATUS_CANCELLED,
                         messageId)) {
-    smb2_close_context(context);
-  }
-  if (!queueBufferedWriteReplies() && context != nullptr) {
     smb2_close_context(context);
   }
   if (detached) {
@@ -2685,12 +2777,14 @@ void SmbServer::Impl::failAsyncReads(uint32_t status) {
     if (!pending.used) {
       continue;
     }
-    if (pending.context != nullptr &&
-        !queueAsyncStatus(pending.context, SMB2_READ, status,
-                          pending.messageId)) {
-      contextToClose = pending.context;
-    }
+    smb2_context* const context = pending.context;
+    const uint64_t messageId = pending.messageId;
     pending = {};
+    restoreServerCreditsIfIoIdle(context);
+    if (context != nullptr &&
+        !queueAsyncStatus(context, SMB2_READ, status, messageId)) {
+      contextToClose = context;
+    }
   }
   activeAsyncRead = -1;
   asyncReadCount = 0;
@@ -2727,12 +2821,15 @@ void SmbServer::Impl::failAsyncWrites(uint32_t status) {
         handles[pending.slot].generation == pending.generation) {
       handles[pending.slot].failed = true;
     }
-    if (pending.context != nullptr && !pending.replied &&
-        !queueAsyncStatus(pending.context, SMB2_WRITE, status,
-                          pending.messageId)) {
-      contextToClose = pending.context;
-    }
+    smb2_context* const context = pending.context;
+    const uint64_t messageId = pending.messageId;
+    const bool needsReply = context != nullptr && !pending.replied;
     pending = {};
+    restoreServerCreditsIfIoIdle(context);
+    if (needsReply &&
+        !queueAsyncStatus(context, SMB2_WRITE, status, messageId)) {
+      contextToClose = context;
+    }
   }
   activeAsyncWrite = -1;
   asyncWriteCount = 0;
@@ -2863,8 +2960,8 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
     }
     hadAsyncIo = true;
     // Все уже принятые payload находятся в независимых PSRAM-слотах. После
-    // разрыва соединения дописываем их на SD даже без возможности отправить
-    // SMB-ответ: ранее подтверждённый write-back нельзя молча потерять.
+    // разрыва соединения дописываем их на SD до согласованной границы окна,
+    // хотя отправить финальный SMB-ответ уже невозможно.
     pending.context = nullptr;
     pending.replied = true;
     pending.cancelRequested = false;
@@ -2925,6 +3022,7 @@ void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
     }
     releaseByteRangeLocksForHandle(static_cast<int>(index),
                                    handle.generation);
+    clearTransferProgress(handle, true);
     memset(&handle, 0, sizeof(handle));
     if (activeSlot == static_cast<int>(index)) {
       activeSlot = -1;
@@ -2993,7 +3091,9 @@ bool SmbServer::Impl::releaseTreeHandles(smb2_context* owner,
     const bool replyQueued = queueAsyncStatus(
         current->context, SMB2_READ, SMB2_STATUS_CANCELLED,
         current->messageId);
+    smb2_context* const context = current->context;
     heap_caps_free(current);
+    restoreServerCreditsIfIoIdle(context);
     if (!replyQueued) {
       return false;
     }
@@ -3044,9 +3144,8 @@ bool SmbServer::Impl::releaseTreeHandles(smb2_context* owner,
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 
-  // WRITE уже мог быть подтверждён до физической записи. Перед закрытием
-  // открытого объекта дописываем принятые данные и применяем ту же финализацию,
-  // что на CLOSE.
+  // Перед закрытием дерева завершаем принятые WRITE и применяем ту же
+  // финализацию открытого объекта, что на CLOSE.
   for (size_t index = 0; index < kHandleCount; ++index) {
     Handle& handle = handles[index];
     if (!handle.used || handle.owner != owner || handle.treeId != treeId) {
@@ -3087,6 +3186,7 @@ bool SmbServer::Impl::releaseTreeHandles(smb2_context* owner,
     cancelNotifiesForHandle(handle.owner, slot, handle.generation,
                             SMB2_STATUS_CANCELLED);
     releaseByteRangeLocksForHandle(slot, handle.generation);
+    clearTransferProgress(handle, true);
     memset(&handle, 0, sizeof(handle));
   }
   return true;
@@ -3125,6 +3225,122 @@ void SmbServer::Impl::sendOperation(const char* operation, const char* path) {
   eventSink(eventContext, kEventSmbCommand,
             reinterpret_cast<const uint8_t*>(shown),
             static_cast<uint16_t>(used));
+}
+
+void SmbServer::Impl::clearTransferProgress(Handle& handle,
+                                            bool releaseMemory) {
+  handle.progressMode = TransferProgressMode::kNone;
+  handle.progressBytes = 0;
+  handle.progressRangeCount = 0;
+  if (!releaseMemory) {
+    return;
+  }
+  heap_caps_free(handle.progressRanges);
+  handle.progressRanges = nullptr;
+  handle.progressRangeCapacity = 0;
+}
+
+bool SmbServer::Impl::noteTransferProgress(Handle& handle,
+                                           TransferProgressMode mode,
+                                           uint32_t offset,
+                                           uint32_t length) {
+  if (length == 0 || mode == TransferProgressMode::kNone ||
+      offset > UINT32_MAX - length) {
+    return length == 0;
+  }
+  if (handle.progressMode != mode) {
+    clearTransferProgress(handle, false);
+    handle.progressMode = mode;
+  }
+
+  const uint32_t end = offset + length;
+  size_t first = 0;
+  while (first < handle.progressRangeCount &&
+         handle.progressRanges[first].end < offset) {
+    ++first;
+  }
+
+  uint32_t mergedStart = offset;
+  uint32_t mergedEnd = end;
+  uint64_t removedBytes = 0;
+  size_t after = first;
+  while (after < handle.progressRangeCount &&
+         handle.progressRanges[after].start <= mergedEnd) {
+    const TransferRange& current = handle.progressRanges[after];
+    if (current.start < mergedStart) {
+      mergedStart = current.start;
+    }
+    if (current.end > mergedEnd) {
+      mergedEnd = current.end;
+    }
+    removedBytes += static_cast<uint64_t>(current.end - current.start);
+    ++after;
+  }
+
+  const size_t removedRanges = after - first;
+  const size_t required = handle.progressRangeCount - removedRanges + 1;
+  if (required > handle.progressRangeCapacity) {
+    size_t capacity = handle.progressRangeCapacity == 0
+                          ? static_cast<size_t>(8)
+                          : handle.progressRangeCapacity;
+    while (capacity < required && capacity <= SIZE_MAX / 2) {
+      capacity *= 2;
+    }
+    if (capacity < required || capacity > SIZE_MAX / sizeof(TransferRange)) {
+      return false;
+    }
+    TransferRange* ranges = static_cast<TransferRange*>(heap_caps_malloc(
+        capacity * sizeof(TransferRange), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (ranges == nullptr) {
+      ranges = static_cast<TransferRange*>(heap_caps_malloc(
+          capacity * sizeof(TransferRange), MALLOC_CAP_8BIT));
+    }
+    if (ranges == nullptr) {
+      return false;
+    }
+    if (handle.progressRangeCount != 0) {
+      memcpy(ranges, handle.progressRanges,
+             handle.progressRangeCount * sizeof(TransferRange));
+    }
+    heap_caps_free(handle.progressRanges);
+    handle.progressRanges = ranges;
+    handle.progressRangeCapacity = capacity;
+  }
+
+  if (after < handle.progressRangeCount) {
+    memmove(handle.progressRanges + first + 1,
+            handle.progressRanges + after,
+            (handle.progressRangeCount - after) * sizeof(TransferRange));
+  }
+  handle.progressRanges[first].start = mergedStart;
+  handle.progressRanges[first].end = mergedEnd;
+  handle.progressRangeCount = required;
+
+  const uint64_t covered = static_cast<uint64_t>(handle.progressBytes) -
+                           removedBytes +
+                           static_cast<uint64_t>(mergedEnd - mergedStart);
+  handle.progressBytes =
+      covered > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(covered);
+  return true;
+}
+
+void SmbServer::Impl::clipTransferProgress(Handle& handle, uint32_t size) {
+  uint64_t covered = 0;
+  size_t kept = 0;
+  for (size_t index = 0; index < handle.progressRangeCount; ++index) {
+    TransferRange current = handle.progressRanges[index];
+    if (current.start >= size) {
+      break;
+    }
+    if (current.end > size) {
+      current.end = size;
+    }
+    handle.progressRanges[kept++] = current;
+    covered += static_cast<uint64_t>(current.end - current.start);
+  }
+  handle.progressRangeCount = kept;
+  handle.progressBytes =
+      covered > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(covered);
 }
 
 // Человекочитаемый размер с одним знаком после запятой. Делить и печатать на
@@ -4144,6 +4360,7 @@ void SmbServer::Impl::updateSharedPhysicalSize(const char* path,
     if (handle.position > newSize) {
       handle.position = newSize;
     }
+    clipTransferProgress(handle, newSize);
     if (handle.sizeReserved && newSize >= handle.reservedSize) {
       handle.sizeReserved = false;
       handle.ownsSizeReservation = false;
@@ -4350,6 +4567,7 @@ int SmbServer::Impl::allocateHandle(smb2_context* owner, uint32_t treeId) {
       continue;
     }
     Handle& handle = handles[index];
+    clearTransferProgress(handle, true);
     memset(&handle, 0, sizeof(handle));
     handle.used = true;
     handle.owner = owner;
@@ -4406,6 +4624,7 @@ void SmbServer::Impl::releaseHandle(int slot) {
   cancelNotifiesForHandle(handles[slot].owner, slot,
                           handles[slot].generation, SMB2_STATUS_CANCELLED);
   releaseByteRangeLocksForHandle(slot, handles[slot].generation);
+  clearTransferProgress(handles[slot], true);
   memset(&handles[slot], 0, sizeof(handles[slot]));
 }
 
@@ -4896,6 +5115,80 @@ bool SmbServer::Impl::queueAsyncStatus(smb2_context* smb2, uint8_t command,
   return true;
 }
 
+bool SmbServer::Impl::queueIoInterimPending(smb2_context* context,
+                                            uint8_t command,
+                                            uint64_t messageId,
+                                            bool& pendingSent) {
+  if (context == nullptr || messageId == 0 || pendingSent) {
+    return context != nullptr && messageId != 0;
+  }
+  // Сначала сжимаем окно: STATUS_PENDING продлевает тайм-аут Windows, но не
+  // должен немедленно вернуть кредит под ещё один медленный запрос.
+  if (smb2_set_server_credit_target(context, 1) != 0 ||
+      !queueAsyncStatus(context, command, SMB2_STATUS_PENDING, messageId)) {
+    return false;
+  }
+  pendingSent = true;
+  diagnosticLogEvent("SMB interim-pending cmd=%u mid=%llu",
+                     static_cast<unsigned>(command),
+                     static_cast<unsigned long long>(messageId));
+  return true;
+}
+
+void SmbServer::Impl::restoreServerCreditsIfIoIdle(smb2_context* context) {
+  if (context == nullptr) {
+    return;
+  }
+  for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
+    if ((asyncReads[index].used && asyncReads[index].context == context) ||
+        (asyncWrites[index].used && asyncWrites[index].context == context)) {
+      return;
+    }
+  }
+  for (const QueuedRead* pending = queuedReadHead; pending != nullptr;
+       pending = pending->next) {
+    if (pending->context == context) {
+      return;
+    }
+  }
+  (void)smb2_set_server_credit_target(context, SMB2_SERVER_CREDIT_TARGET);
+}
+
+void SmbServer::Impl::pollIoInterimPending() {
+  const uint32_t now = millis();
+  const uint32_t delay = longIoInterimPendingMs();
+  for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
+    AsyncRead& pending = asyncReads[index];
+    if (pending.used && pending.context != nullptr && !pending.pendingSent &&
+        static_cast<uint32_t>(now - pending.requestStartedMs) >= delay &&
+        !queueIoInterimPending(pending.context, SMB2_READ,
+                               pending.messageId, pending.pendingSent)) {
+      smb2_close_context(pending.context);
+      return;
+    }
+  }
+  for (QueuedRead* pending = queuedReadHead; pending != nullptr;
+       pending = pending->next) {
+    if (pending->context != nullptr && !pending->pendingSent &&
+        static_cast<uint32_t>(now - pending->requestStartedMs) >= delay &&
+        !queueIoInterimPending(pending->context, SMB2_READ,
+                               pending->messageId, pending->pendingSent)) {
+      smb2_close_context(pending->context);
+      return;
+    }
+  }
+  for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
+    AsyncWrite& pending = asyncWrites[index];
+    if (pending.used && pending.context != nullptr && !pending.pendingSent &&
+        static_cast<uint32_t>(now - pending.requestStartedMs) >= delay &&
+        !queueIoInterimPending(pending.context, SMB2_WRITE,
+                               pending.messageId, pending.pendingSent)) {
+      smb2_close_context(pending.context);
+      return;
+    }
+  }
+}
+
 bool SmbServer::Impl::queueAsyncWriteReply(smb2_context* smb2,
                                            uint64_t messageId,
                                            uint32_t count) {
@@ -4911,25 +5204,6 @@ bool SmbServer::Impl::queueAsyncWriteReply(smb2_context* smb2,
   }
   smb2_set_pdu_message_id(smb2, pdu, messageId);
   smb2_queue_pdu(smb2, pdu);
-  return true;
-}
-
-bool SmbServer::Impl::queueBufferedWriteReplies() {
-  if (asyncWriteCount > kAsyncWriteEarlyReplyDepth) {
-    return true;
-  }
-  for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
-    AsyncWrite& pending = asyncWrites[index];
-    if (!pending.used || pending.replied || pending.writeThrough ||
-        pending.context == nullptr) {
-      continue;
-    }
-    if (!queueAsyncWriteReply(pending.context, pending.messageId,
-                              pending.length)) {
-      return false;
-    }
-    pending.replied = true;
-  }
   return true;
 }
 
@@ -5028,12 +5302,18 @@ void SmbServer::Impl::pollAsyncRead() {
                                     SMB2_STATUS_IO_DEVICE_ERROR, true);
         return;
       }
+      const uint32_t progressOffset = current.offset + current.filled;
       current.filled += static_cast<uint32_t>(got);
       activeLogicalOffset += static_cast<uint32_t>(got);
       current.lastProgressMs = millis();
       // SMB-ответ остаётся целым 64-КиБ запросом, но экрану не нужно ждать
       // завершения всех четырёх физических окон FILEX.
-      sendProgress(*handle, "READ", current.offset + current.filled, false);
+      if (!noteTransferProgress(*handle, TransferProgressMode::kRead,
+                                progressOffset, static_cast<uint32_t>(got))) {
+        diagnosticLogEvent("SMB progress-range-oom mode=READ path=%s",
+                           handle->path);
+      }
+      sendProgress(*handle, "READ", handle->progressBytes, false);
     }
 
     if (current.filled == current.length) {
@@ -5052,6 +5332,7 @@ void SmbServer::Impl::pollAsyncRead() {
         if (asyncReadCount != 0) {
           --asyncReadCount;
         }
+        restoreServerCreditsIfIoIdle(completedContext);
         smb2_close_context(completedContext);
         return;
       }
@@ -5067,6 +5348,7 @@ void SmbServer::Impl::pollAsyncRead() {
       if (asyncReadCount != 0) {
         --asyncReadCount;
       }
+      restoreServerCreditsIfIoIdle(completedContext);
       return;
     }
 
@@ -5208,14 +5490,20 @@ void SmbServer::Impl::pollAsyncWrite() {
       return;
     }
 
+    const uint32_t progressOffset = completed.offset + completed.flushed;
     completed.flushed += transferred;
     completed.inFlight = false;
     completed.windowLength = 0;
-    sendProgress(*handle, "WRITE", handle->position, false);
+    if (!noteTransferProgress(*handle, TransferProgressMode::kWrite,
+                              progressOffset, transferred)) {
+      diagnosticLogEvent("SMB progress-range-oom mode=WRITE path=%s",
+                         handle->path);
+    }
+    sendProgress(*handle, "WRITE", handle->progressBytes, false);
 
     const bool finished = completed.flushed == completed.length;
-    // WRITE_THROUGH и запросы, удержанные обратным давлением, обязаны получить
-    // ответ не позднее полного физического завершения.
+    // Любой WRITE получает ответ только после полного физического завершения.
+    // Поэтому незавершённый запрос остаётся адресуемым для SMB CANCEL.
     if (finished && !completed.replied) {
       smb2_context* completedContext = completed.context;
       if (completedContext == nullptr ||
@@ -5226,6 +5514,7 @@ void SmbServer::Impl::pollAsyncWrite() {
         if (asyncWriteCount != 0) {
           --asyncWriteCount;
         }
+        restoreServerCreditsIfIoIdle(completedContext);
         failAsyncWrites(SMB2_STATUS_IO_DEVICE_ERROR);
         if (completedContext != nullptr) {
           smb2_close_context(completedContext);
@@ -5237,6 +5526,7 @@ void SmbServer::Impl::pollAsyncWrite() {
 
     if (finished) {
       const bool detached = completed.context == nullptr;
+      smb2_context* const completedContext = completed.context;
       smb2_context* const owner = completed.owner;
       sendOperation("WRITE", handle->path);
       notifyChange(handle->path, SMB2_NOTIFY_CHANGE_FILE_ACTION_MODIFIED,
@@ -5246,13 +5536,7 @@ void SmbServer::Impl::pollAsyncWrite() {
       if (asyncWriteCount != 0) {
         --asyncWriteCount;
       }
-      if (!queueBufferedWriteReplies()) {
-        failAsyncWrites(SMB2_STATUS_IO_DEVICE_ERROR);
-        if (owner != nullptr && knownClient(owner)) {
-          smb2_close_context(owner);
-        }
-        return;
-      }
+      restoreServerCreditsIfIoIdle(completedContext);
       if (detached) {
         closeActive(true);
         releaseDetachedOwnerIfIdle(owner);
@@ -6371,6 +6655,7 @@ int SmbServer::Impl::destructionHandler(smb2_server* serverValue,
 int SmbServer::Impl::serviceHandler(smb2_server* serverValue) {
   Impl* self = from(serverValue);
   if (self != nullptr) {
+    self->pollIoInterimPending();
     if (self->asyncIoTimedOut()) {
       diagnosticLogEvent("SMB async-io-watchdog timeout=%lu",
                          static_cast<unsigned long>(
@@ -6384,8 +6669,8 @@ int SmbServer::Impl::serviceHandler(smb2_server* serverValue) {
       return 0;
     }
     self->pollAsyncRead();
-    // После финала запускаем старейший уже принятый READ. На проводе он остаётся
-    // синхронным и не возвращает credit до собственного финального ответа.
+    // После финала запускаем старейший уже принятый READ. До 30 секунд он
+    // удерживает credit; более долгий получает отдельный interim PENDING.
     self->promoteQueuedReads();
     self->pollAsyncRead();
     self->pollAsyncWrite();
@@ -6911,11 +7196,12 @@ uint32_t SmbServer::Impl::finalizeClose(int slot, uint32_t generation,
     // единственное уведомление о суммарном изменении длины файла.
     invalidateParent(handle.path);
   }
-  if (!handle.directory && handle.position != 0) {
+  if (!handle.directory && handle.progressMode != TransferProgressMode::kNone &&
+      handle.progressBytes != 0) {
     // Итоговая строка обязана пройти без ограничения частоты, иначе счётчик
     // замрёт на предпоследнем блоке и файл будет выглядеть недокопированным.
     sendProgress(handle, handle.deletePending ? "DELETE" : "DONE",
-                 handle.position, true);
+                 handle.progressBytes, true);
   }
   sendOperation(handle.deletePending ? "DELETE" : "CLOSE", handle.path);
   releaseHandle(slot);
@@ -7016,7 +7302,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   }
   if (request->offset > UINT32_MAX ||
       request->minimum_count > request->length ||
-      request->minimum_count > kSmbAdvertisedIoSize) {
+      request->minimum_count > kSmbAdvertisedReadSize) {
     return replyStatus(smb2, SMB2_READ, SMB2_STATUS_INVALID_PARAMETER);
   }
   if (self->asyncWriteCount != 0) {
@@ -7045,7 +7331,7 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   const uint32_t wanted = static_cast<uint32_t>(minimum64(
       request->length,
       minimum64(static_cast<uint64_t>(remaining),
-                static_cast<uint64_t>(kSmbAdvertisedIoSize))));
+                static_cast<uint64_t>(kSmbAdvertisedReadSize))));
   if (wanted == 0) {
     reply->data = nullptr;
     reply->data_length = 0;
@@ -7072,7 +7358,12 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     diagnosticLogEvent("SMB read-cached bytes=%lu off=%lu path=%s",
                        static_cast<unsigned long>(wanted),
                        static_cast<unsigned long>(offset), handle->path);
-    self->sendProgress(*handle, "READ", handle->position, false);
+    if (!self->noteTransferProgress(*handle, TransferProgressMode::kRead,
+                                    offset, wanted)) {
+      diagnosticLogEvent("SMB progress-range-oom mode=READ path=%s",
+                         handle->path);
+    }
+    self->sendProgress(*handle, "READ", handle->progressBytes, false);
     self->sendOperation("READ", handle->path);
     return 0;
   }
@@ -7096,10 +7387,9 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
   const uint64_t operationSequence = self->nextAsyncVfsSequence();
   int index = -1;
   // Не обгоняем уже поставленные в очередь READ. Пока единственный физический
-  // FILEX-сервис занят, сохраняем только метаданные. Все READ остаются
-  // синхронными на проводе и не возвращают credit до финального ответа: после
-  // отмены Windows не может поддерживать бесконечную очередь заменами на каждый
-  // STATUS_PENDING.
+  // FILEX-сервис занят, сохраняем только метаданные. До 30 секунд запросы не
+  // возвращают credit; более долгий PENDING одновременно сжимает target до 1,
+  // поэтому отмена не поддерживает бесконечную очередь запросами-заменами.
   if (self->queuedReadHead == nullptr) {
     index = self->allocateAsyncRead();
   }
@@ -7119,14 +7409,15 @@ int SmbServer::Impl::readHandler(smb2_server* serverValue,
     return 1;
   }
 
-  // Активный READ тоже остаётся синхронным на проводе. internal_async только
-  // передаёт его время жизни watchdog приложения и не создаёт AsyncId/interim
-  // credit.
+  // internal_async передаёт время жизни watchdog приложения. Если физический
+  // READ не успеет за 30 секунд, serviceHandler отдельно создаст AsyncId и
+  // STATUS_PENDING без повторной выдачи credit.
   if (smb2_set_current_request_internal_async(smb2) != 0) {
     return -1;
   }
   if (!self->beginAsyncRead(smb2, messageId, slot, operationSequence,
-                            handle->generation, offset, wanted, index)) {
+                             handle->generation, offset, wanted, millis(),
+                             false, index)) {
     return -1;
   }
 
@@ -7182,7 +7473,7 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
     return replyStatus(smb2, SMB2_WRITE, SMB2_STATUS_ACCESS_DENIED);
   }
   if (request->offset > UINT32_MAX ||
-      request->length > kSmbAdvertisedIoSize ||
+      request->length > kSmbAdvertisedWriteSize ||
       request->length > UINT32_MAX -
                                 static_cast<uint32_t>(request->offset) ||
       (request->length != 0 && request->buf == nullptr)) {
@@ -7207,8 +7498,7 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
   // Windows CopyFile не повторяет хвост короткого успешного WRITE. Поэтому весь
   // запрос копируется в PSRAM и всегда подтверждается полной длиной. Ответ
   // приходит после физической записи: освобождение слота и возврат SMB-кредита
-  // должны происходить вместе, иначе клиент сможет прислать семнадцатую порцию
-  // данных.
+  // происходят вместе, а до этого запрос можно отменить точным SMB CANCEL.
   const bool needsAsync =
       request->length > window || self->asyncReadCount != 0 ||
       self->queuedReadCount != 0 || self->asyncWriteCount != 0 ||
@@ -7223,13 +7513,13 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
       return replyStatus(smb2, SMB2_WRITE,
                          SMB2_STATUS_INSUFFICIENT_RESOURCES);
     }
-    // WRITE_THROUGH и WRITE за пределами раннего окна подтверждаются только
-    // после физической записи. Их Request должен жить под watchdog приложения,
-    // а не исчезать из waitqueue по обычному тайм-ауту libsmb2.
+    // Request подтверждается только после физической записи и должен жить под
+    // watchdog приложения, а не исчезать из waitqueue по обычному тайм-ауту
+    // libsmb2.
     if (smb2_set_current_request_internal_async(smb2) != 0) {
       return -1;
     }
-    const int asyncIndex = self->allocateAsyncWrite();
+    const int asyncIndex = self->allocateAsyncWrite(request->length);
     if (asyncIndex < 0) {
       return replyStatus(smb2, SMB2_WRITE,
                          SMB2_STATUS_INSUFFICIENT_RESOURCES);
@@ -7239,6 +7529,7 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
     pending.inFlight = false;
     pending.cancelRequested = false;
     pending.replied = false;
+    pending.pendingSent = false;
     pending.writeThrough =
         (request->flags & SMB2_WRITEFLAG_WRITE_THROUGH) != 0;
     pending.context = smb2;
@@ -7251,14 +7542,23 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
     pending.length = request->length;
     pending.flushed = 0;
     pending.windowLength = 0;
+    pending.requestStartedMs = millis();
     pending.lastProgressMs = millis();
     memcpy(self->asyncIoBuffers[asyncIndex], request->buf,
             request->length);
     ++self->asyncWriteCount;
-    if (!self->queueBufferedWriteReplies()) {
-      self->failAsyncWrites(SMB2_STATUS_IO_DEVICE_ERROR);
-      smb2_close_context(smb2);
-      return 1;
+    // Multi-credit порция занимает всё окно клиента. Возвращаем один credit
+    // вместе с быстрым STATUS_PENDING: Windows продлевает тайм-аут операции,
+    // но не может прислать следующую 512-КиБ порцию до физического финала.
+    if (request->length > kSmbAdvertisedReadSize &&
+        !self->queueIoInterimPending(smb2, SMB2_WRITE, messageId,
+                                     pending.pendingSent)) {
+      pending = {};
+      if (self->asyncWriteCount != 0) {
+        --self->asyncWriteCount;
+      }
+      self->restoreServerCreditsIfIoIdle(smb2);
+      return -1;
     }
     self->pollAsyncWrite();
     return 1;
@@ -7286,6 +7586,7 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
           result.status != 0 ? smbStatusFromFilex(result.status)
                              : SMB2_STATUS_IO_DEVICE_ERROR);
     }
+    const uint32_t progressOffset = offset + written;
     written += static_cast<uint32_t>(part);
     const uint32_t end = offset + written;
     if (end > handle->physicalSize) {
@@ -7300,7 +7601,13 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
       handle->sizeReserved = false;
       handle->ownsSizeReservation = false;
     }
-    self->sendProgress(*handle, "WRITE", handle->position, false);
+    if (!self->noteTransferProgress(*handle, TransferProgressMode::kWrite,
+                                    progressOffset,
+                                    static_cast<uint32_t>(part))) {
+      diagnosticLogEvent("SMB progress-range-oom mode=WRITE path=%s",
+                         handle->path);
+    }
+    self->sendProgress(*handle, "WRITE", handle->progressBytes, false);
   }
   reply->count = request->length;
   reply->remaining = 0;
@@ -7642,7 +7949,7 @@ int SmbServer::Impl::queryCachedDirectory(
   }
 
   const size_t room = minimum(request->output_buffer_length,
-                              static_cast<uint32_t>(kSmbAdvertisedIoSize));
+                              static_cast<uint32_t>(kSmbAdvertisedTransactSize));
   size_t encoded = 0;
   size_t count = 0;
   bool reachedEnd = false;
@@ -7767,7 +8074,7 @@ int SmbServer::Impl::queryDirectoryHandler(
   // Сервер объявляет MaxTransactSize=64 КиБ. [MS-SMB2] 3.3.5.18 разрешает
   // отклонить больший запрос; молча обрезать клиентский максимум нельзя,
   // потому что CreditCharge был рассчитан для исходной длины.
-  if (request->output_buffer_length > kSmbAdvertisedIoSize) {
+  if (request->output_buffer_length > kSmbAdvertisedTransactSize) {
     return replyStatus(smb2, SMB2_QUERY_DIRECTORY,
                        SMB2_STATUS_INVALID_PARAMETER);
   }

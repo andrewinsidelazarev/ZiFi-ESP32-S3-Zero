@@ -739,7 +739,11 @@ session_setup_cb(struct smb2_context *smb2, int status,
 #endif
 
 
-        if (smb2->sign || smb2->seal || smb2->dialect == SMB2_VERSION_0311) {
+        /* Keep the authenticated session key even when signing is optional.
+         * Windows signs FSCTL_VALIDATE_NEGOTIATE_INFO independently of the
+         * normal Session.SigningRequired state, and the client must be able
+         * to verify the equally signed reply. */
+        {
                 uint8_t zero_key[SMB2_KEY_SIZE] = {0};
                 int have_valid_session_key = 1;
 
@@ -771,9 +775,17 @@ session_setup_cb(struct smb2_context *smb2, int status,
                         return;
                 }
 
-                smb2_create_signing_key(smb2);
+                if (have_valid_session_key) {
+                        smb2_create_signing_key(smb2);
+                }
 
                 if (smb2->hdr.flags & SMB2_FLAGS_SIGNED) {
+                        if (!have_valid_session_key) {
+                                smb2_set_error(smb2, "Signed session setup reply without a valid key");
+                                c_data->cb(smb2, -EACCES, NULL, c_data->cb_data);
+                                free_c_data(smb2, c_data);
+                                return;
+                        }
                         uint8_t signature[16] _U_;
 
                         memcpy(&signature[0], &smb2->in.iov[1].buf[48], 16);
@@ -4293,10 +4305,11 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                 return;
         }
 
-        if (smb2->sign)  {
-                /* Derive the signing key from session key
-                * This is based on negotiated protocol
-                */
+        if (pdu == NULL && !more_processing_needed &&
+            have_valid_session_key && smb2->session_key != NULL &&
+            smb2->session_key_size != 0) {
+                /* Optional signing still needs a key for the mandatory
+                 * signed FSCTL_VALIDATE_NEGOTIATE_INFO exchange. */
                 smb2_create_signing_key(smb2);
         }
 

@@ -49,6 +49,25 @@ struct raw_async_read_state {
   uint64_t final_async_id;
 };
 
+struct raw_async_write_state {
+  uint32_t expected_count;
+  int completed;
+  int pending_count;
+  int final_count;
+  int final_status;
+  uint32_t final_count_value;
+  uint16_t pending_command;
+  uint16_t final_command;
+  uint16_t pending_credit;
+  uint16_t final_credit;
+  uint32_t pending_flags;
+  uint32_t final_flags;
+  uint64_t pending_message_id;
+  uint64_t final_message_id;
+  uint64_t pending_async_id;
+  uint64_t final_async_id;
+};
+
 struct raw_change_notify_state {
   int *completed_total;
   int completed;
@@ -142,6 +161,8 @@ struct raw_command_state {
   int done;
   int status;
   uint32_t tree_id;
+  uint32_t flags;
+  uint16_t command;
 };
 
 struct raw_create_state {
@@ -400,6 +421,8 @@ static void raw_command_cb(struct smb2_context *smb2, int status,
   (void)command_data;
   state->status = status;
   state->tree_id = smb2->hdr.sync.tree_id;
+  state->flags = smb2->hdr.flags;
+  state->command = smb2->hdr.command;
   state->done = 1;
 }
 
@@ -476,6 +499,35 @@ static int raw_windows_create_directory(struct smb2_context *smb2,
     smb2_set_passthrough(smb2, old_passthrough);
     return result;
   }
+}
+
+static void raw_async_write_cb(struct smb2_context *smb2, int status,
+                               void *command_data, void *private_data) {
+  struct raw_async_write_state *state =
+      (struct raw_async_write_state*)private_data;
+  if ((uint32_t)status == SMB2_STATUS_PENDING) {
+    ++state->pending_count;
+    state->pending_command = smb2->hdr.command;
+    state->pending_credit = smb2->hdr.credit_request_response;
+    state->pending_flags = smb2->hdr.flags;
+    state->pending_message_id = smb2->hdr.message_id;
+    state->pending_async_id = smb2->hdr.async.async_id;
+    return;
+  }
+
+  ++state->final_count;
+  state->final_status = status;
+  state->final_command = smb2->hdr.command;
+  state->final_credit = smb2->hdr.credit_request_response;
+  state->final_flags = smb2->hdr.flags;
+  state->final_message_id = smb2->hdr.message_id;
+  state->final_async_id = smb2->hdr.async.async_id;
+  if ((uint32_t)status == SMB2_STATUS_SUCCESS && command_data != NULL) {
+    const struct smb2_write_reply *reply =
+        (const struct smb2_write_reply*)command_data;
+    state->final_count_value = reply->count;
+  }
+  state->completed = 1;
 }
 
 static int raw_set_basic_info(struct smb2_context *smb2, struct smb2fh *fh) {
@@ -1329,6 +1381,49 @@ static struct smb2_context *connect_context(const char *server,
   return context;
 }
 
+static int signed_validate_negotiate(const char *server, const char *share) {
+  struct smb2_context *context = connect_context(server, share);
+  struct smb2_ioctl_validate_negotiate_info input;
+  struct smb2_ioctl_request request;
+  struct raw_command_state state;
+  struct smb2_pdu *pdu;
+  int ok = 0;
+  if (context == NULL) return 0;
+
+  memset(&input, 0, sizeof(input));
+  input.capabilities = context->capabilities;
+  memcpy(input.guid, context->client_guid, sizeof(input.guid));
+  input.security_mode = SMB2_NEGOTIATE_SIGNING_ENABLED;
+  input.dialect = context->dialect;
+
+  memset(&request, 0, sizeof(request));
+  request.ctl_code = SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO;
+  memcpy(request.file_id, compound_file_id, SMB2_FD_SIZE);
+  request.input_count = sizeof(input);
+  request.max_output_response = SMB2_IOCTL_VALIDIATE_NEGOTIATE_INFO_SIZE;
+  request.flags = SMB2_0_IOCTL_IS_FSCTL;
+  request.input = &input;
+  memset(&state, 0, sizeof(state));
+
+  /* The session was negotiated as optional/unsigned. Windows nevertheless
+   * signs this integrity check and requires the server reply to be signed. */
+  smb2_set_sign(context, 1);
+  pdu = smb2_cmd_ioctl_async(context, &request, raw_command_cb, &state);
+  if (pdu != NULL) {
+    smb2_queue_pdu(context, pdu);
+    ok = wait_raw_command(context, &state) == 0 &&
+         (uint32_t)state.status == SMB2_STATUS_SUCCESS &&
+         state.command == SMB2_IOCTL &&
+         (state.flags & SMB2_FLAGS_SIGNED) != 0;
+  }
+  printf("SIGNED VALIDATE NEGOTIATE: status=%08x flags=%08lx (%s)\n",
+         (unsigned)state.status, (unsigned long)state.flags,
+         ok ? "PASS" : "FAIL");
+  smb2_disconnect_share(context);
+  smb2_destroy_context(context);
+  return ok;
+}
+
 int main(int argc, char **argv) {
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
@@ -1337,7 +1432,7 @@ int main(int argc, char **argv) {
   }
 
   if (argc < 3) {
-    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8|test9|test10|test11|test12|test13|test14|test15|test16|test17|test18|test19|test20|test21|test22|test23|test24|test25|test26|test27|test28|test29|test30|test31|test32|test33] [test-directory]\n");
+    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8..test38] [test-directory]\n");
     return 1;
   }
   const char *server = argv[1];
@@ -1361,13 +1456,25 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("SUCCESS: Connected to %s/%s\n", server, share);
-  /* Сервер начинает с одного кредита по MS-SMB2 и расширяет окно до четырёх:
-   * это постоянное окно обратного давления для одного FILEX-сервиса. */
+  /* Сервер начинает с одного кредита по MS-SMB2 и расширяет окно до восьми:
+   * этого ровно достаточно для одного 512-КиБ multi-credit WRITE. */
   {
     const int credit_ok = smb2->credits == SMB2_SERVER_CREDIT_TARGET;
     printf("NEGOTIATED CREDITS: %d (%s)\n", smb2->credits,
-           credit_ok ? "PASS" : "FAIL: expected bounded window of 4");
+           credit_ok ? "PASS" : "FAIL: expected bounded window of 8");
     failures += !credit_ok;
+  }
+
+  {
+    const int sizes_ok = smb2->max_transact_size == 64 * 1024 &&
+                         smb2->max_read_size == 64 * 1024 &&
+                         smb2->max_write_size == 512 * 1024;
+    printf("NEGOTIATED I/O: transact=%lu read=%lu write=%lu (%s)\n",
+           (unsigned long)smb2->max_transact_size,
+           (unsigned long)smb2->max_read_size,
+           (unsigned long)smb2->max_write_size,
+           sizes_ok ? "PASS" : "FAIL");
+    failures += !sizes_ok;
   }
 
   /* Повторные ответы должны возвращать только израсходованный кредит. Если
@@ -1447,6 +1554,8 @@ int main(int argc, char **argv) {
     }
   }
 
+  failures += !signed_validate_negotiate(server, share);
+
   const char *only_test = argc >= 4 ? argv[3] : NULL;
   if (only_test != NULL && strcmp(only_test, "all") == 0) {
     only_test = NULL;
@@ -1480,6 +1589,10 @@ int main(int argc, char **argv) {
     if (strcmp(only_test, "test33") == 0) goto test_33;
     if (strcmp(only_test, "test34") == 0) goto test_34;
     if (strcmp(only_test, "test35") == 0) goto test_35;
+    if (strcmp(only_test, "test36") == 0) goto test_36;
+    if (strcmp(only_test, "test37") == 0) goto test_37;
+    if (strcmp(only_test, "test38") == 0) goto test_38;
+    if (strcmp(only_test, "test39") == 0) goto test_39;
   }
 
   /* TEST 1: Sequential & Multiple Reads check */
@@ -2711,10 +2824,9 @@ test_19:
   if (only_test != NULL) goto done;
 
 test_20:
-  /* TEST 20: клиент ставит 64 READ, но сервер физически обслуживает один.
-   * Ни активный, ни ожидающий READ не должен получать STATUS_PENDING: каждый
-   * удерживает свой credit до синхронного финала. Поэтому клиентская очередь не
-   * превращается в самопополняющийся конвейер, который игнорирует отмену. */
+  /* TEST 20: на быстром backend клиент ставит 64 READ, но сервер физически
+   * обслуживает один. Все успевают до 30-секундной границы и завершаются без
+   * STATUS_PENDING; отдельный TEST 39 проверяет медленную async-ветку. */
   printf("\n--- TEST 20: bounded synchronous READ credit window ---\n");
   {
     const uint32_t chunk_size = 65536;
@@ -3138,9 +3250,9 @@ test_23:
   if (only_test != NULL) goto done;
 
 test_24:
-  /* ТЕСТ 24: медленный READ остаётся синхронным на проводе. CANCEL адресуется
-   * по MessageId, не расходует credit/номер последовательности и завершает
-   * только исходный запрос ответом STATUS_CANCELLED без interim PENDING. */
+  /* ТЕСТ 24: отмена READ до 30-секундной границы адресуется по MessageId, не
+   * расходует credit/номер последовательности и завершает только исходный
+   * запрос ответом STATUS_CANCELLED без interim PENDING. */
   printf("\n--- TEST 24: exact synchronous READ CANCEL contract ---\n");
   {
     const uint32_t length = 8192;
@@ -4192,13 +4304,12 @@ test_32:
   if (only_test != NULL) goto done;
 
 test_33:
-  /* ТЕСТ 33 воспроизводит скрытую очередь из чистой SD->SD трассы. Сервер уже
-   * ответил SUCCESS на буферизованный WRITE второго Open, поэтому на проводе
-   * нет незавершённых SMB-команд, но физический FILEX ещё пишет. Финальный
-   * CLOSE первого файла с отложенными BASIC_INFORMATION не имеет права
-   * превращать внутренний bridge-busy в IO_DEVICE_ERROR. Отдельный сервер
-   * этого теста запускается с медленным каналом. */
-  printf("\n--- TEST 33: CLOSE waits behind early-replied physical WRITE ---\n");
+  /* ТЕСТ 33 воспроизводит очередь из чистой SD->SD трассы. WRITE второго Open
+   * ставится асинхронно, а CLOSE первого Open сразу идёт следом. Финальный
+   * CLOSE с отложенными BASIC_INFORMATION обязан дождаться физического FILEX
+   * WRITE по общей FIFO, не превращая bridge-busy в IO_DEVICE_ERROR. Отдельный
+   * сервер этого теста запускается с медленным каналом. */
+  printf("\n--- TEST 33: CLOSE waits behind physical WRITE ---\n");
   {
     enum { file_size = 32768 };
     struct smb2fh *closing = NULL;
@@ -4206,10 +4317,14 @@ test_33:
     struct smb2fh *verify = NULL;
     uint8_t *payload = (uint8_t*)malloc(file_size);
     uint8_t *readback = (uint8_t*)calloc(file_size, 1);
+    struct raw_command_state write_state;
     int close_result = -1;
     int read_result = -1;
     int test_ok = payload != NULL && readback != NULL;
     int index;
+
+    memset(&write_state, 0, sizeof(write_state));
+    write_state.status = -1;
 
     for (index = 0; payload != NULL && index < file_size; ++index) {
       payload[index] = test_byte((uint64_t)index);
@@ -4238,15 +4353,17 @@ test_33:
       test_ok = background != NULL;
     }
     if (test_ok) {
-      /* Обычный WRITE получает ранний SUCCESS после копирования payload в
-       * PSRAM. При throttle=6000 физическая запись гарантированно остаётся
-       * активной, когда сразу следом приходит CLOSE другого Open. */
-      test_ok = smb2_write(smb2, background, payload, file_size) == file_size;
+      /* Асинхронный вызов оставляет WRITE незавершённым на проводе. При
+       * throttle=6000 следующий CLOSE гарантированно приходит, пока FILEX
+       * ещё пишет другой Open. */
+      test_ok = smb2_write_async(smb2, background, payload, file_size,
+                                 raw_command_cb, &write_state) == 0;
     }
     if (closing != NULL) {
       close_result = smb2_close(smb2, closing);
       closing = NULL;
-      test_ok = close_result == 0 && test_ok;
+      test_ok = close_result == 0 && write_state.done &&
+                write_state.status == file_size && test_ok;
     }
     if (background != NULL) {
       test_ok = smb2_close(smb2, background) == 0 && test_ok;
@@ -4415,6 +4532,320 @@ test_35:
     free(readback);
     free(payload);
     printf("RESULT TEST 35: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_36:
+  /* TEST 36 повторяет порядок WRITE из FAR/Windows CopyFile: смещения могут
+   * идти назад, а повторный диапазон не является новыми скопированными
+   * байтами. Последний WRITE намеренно заканчивается на 256 КиБ, хотя все
+   * уникальные диапазоны полного файла уже покрывают 320 КиБ. Индикатор на
+   * CLOSE обязан показать 320/320, а не end последнего блока и не сумму с
+   * двойным учётом повторов. Содержимое остаётся для проверки host-runner. */
+  printf("\n--- TEST 36: progress merges out-of-order duplicate WRITE ranges ---\n");
+  {
+    enum { block_size = 65536, file_size = block_size * 5 };
+    const uint32_t offsets[] = {
+      block_size * 3u, 0, block_size, 0,
+      block_size * 2u, block_size * 4u, block_size * 3u
+    };
+    struct smb2fh *created = NULL;
+    uint8_t *payload = (uint8_t*)malloc(block_size);
+    int close_result = -1;
+    int test_ok = payload != NULL;
+    size_t item;
+
+    (void)smb2_unlink(smb2, test_path("progress_out_of_order.bin"));
+    if (test_ok) {
+      created = smb2_open(smb2, test_path("progress_out_of_order.bin"),
+                          O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = created != NULL;
+    }
+    if (test_ok) {
+      test_ok = smb2_ftruncate(smb2, created, file_size) == 0;
+    }
+    for (item = 0; test_ok && item < sizeof(offsets) / sizeof(offsets[0]);
+         ++item) {
+      const uint32_t offset = offsets[item];
+      uint32_t index;
+      for (index = 0; index < block_size; ++index) {
+        payload[index] = test_byte((uint64_t)offset + index);
+      }
+      const int written =
+          smb2_pwrite(smb2, created, payload, block_size, offset);
+      printf("  PWRITE offset=%lu count=%u result=%d error=%s\n",
+             (unsigned long)offset, (unsigned)block_size, written,
+             smb2_get_error(smb2));
+      test_ok = written == block_size;
+    }
+    if (created != NULL) {
+      close_result = smb2_close(smb2, created);
+      created = NULL;
+      test_ok = close_result == 0 && test_ok;
+    }
+
+    printf("  out-of-order CLOSE=%d error=%s\n", close_result,
+           smb2_get_error(smb2));
+    free(payload);
+    printf("RESULT TEST 36: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_37:
+  /* Одна полная порция Windows должна уйти единственным 512-КиБ WRITE, а
+   * сервер обязан разбить её только внутри FILEX и вернуть все байты. */
+  printf("\n--- TEST 37: negotiated 512 KiB WRITE round-trip ---\n");
+  {
+    enum { file_size = 512 * 1024 };
+    struct smb2fh *created = NULL;
+    struct smb2fh *verify = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint8_t *readback = (uint8_t*)malloc(file_size);
+    int test_ok = payload != NULL && readback != NULL;
+    int written = -1;
+    int read_total = 0;
+    int index;
+
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x250000ULL);
+    }
+    (void)smb2_unlink(smb2, test_path("write_512k.bin"));
+    if (test_ok) {
+      created = smb2_open(smb2, test_path("write_512k.bin"),
+                          O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = created != NULL;
+    }
+    if (test_ok) {
+      written = smb2_pwrite(smb2, created, payload, file_size, 0);
+      test_ok = written == file_size;
+    }
+    if (created != NULL) {
+      test_ok = smb2_close(smb2, created) == 0 && test_ok;
+      created = NULL;
+    }
+    if (test_ok) {
+      verify = smb2_open(smb2, test_path("write_512k.bin"), O_RDONLY);
+      test_ok = verify != NULL;
+    }
+    while (test_ok && read_total < file_size) {
+      const int part = smb2_read(smb2, verify, readback + read_total,
+                                 file_size - read_total);
+      if (part <= 0) {
+        test_ok = 0;
+        break;
+      }
+      read_total += part;
+    }
+    if (verify != NULL) {
+      test_ok = smb2_close(smb2, verify) == 0 && test_ok;
+      verify = NULL;
+    }
+    test_ok = read_total == file_size &&
+              memcmp(payload, readback, file_size) == 0 && test_ok;
+    printf("  WRITE=%d READ=%d error=%s\n", written, read_total,
+           smb2_get_error(smb2));
+    (void)smb2_unlink(smb2, test_path("write_512k.bin"));
+    free(readback);
+    free(payload);
+    printf("RESULT TEST 37: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_38:
+  /* 512-КиБ WRITE быстро получает STATUS_PENDING и один credit, но не SUCCESS.
+   * После этого Windows адресует CANCEL по AsyncId. Финал не выдаёт credit
+   * повторно, а следующий ECHO восстанавливает рабочее окно до восьми. */
+  printf("\n--- TEST 38: exact 512 KiB WRITE CANCEL contract ---\n");
+  {
+    enum { file_size = 512 * 1024 };
+    struct smb2fh *created = NULL;
+    struct probe_fh_mirror *mirror = NULL;
+    struct smb2_write_request request;
+    struct raw_async_write_state state;
+    struct smb2_pdu *pdu = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint64_t target_message_id = 0;
+    uint64_t sequence_before_cancel = 0;
+    uint64_t sequence_after_cancel = 0;
+    int credits_before_cancel = 0;
+    int credits_after_cancel = 0;
+    int credits_after_echo = 0;
+    int old_passthrough = 0;
+    int echo_ok = 0;
+    int test_ok = payload != NULL;
+    int index;
+
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x380000ULL);
+    }
+    memset(&request, 0, sizeof(request));
+    memset(&state, 0, sizeof(state));
+    state.final_status = -1;
+    (void)smb2_unlink(smb2, test_path("cancel_write_512k.bin"));
+    if (test_ok) {
+      created = smb2_open(smb2, test_path("cancel_write_512k.bin"),
+                          O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = created != NULL;
+    }
+    if (test_ok) {
+      mirror = (struct probe_fh_mirror*)created;
+      request.offset = 0;
+      request.length = file_size;
+      request.buf = payload;
+      memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+      target_message_id = smb2->message_id;
+      pdu = smb2_cmd_write_async(smb2, &request, 0,
+                                  raw_async_write_cb, &state);
+      test_ok = pdu != NULL;
+    }
+    if (test_ok) {
+      smb2_queue_pdu(smb2, pdu);
+      sequence_before_cancel = smb2->message_id;
+      test_ok = wait_for_count(smb2, &state.pending_count, 1, 10000) == 0;
+      credits_before_cancel = smb2->credits;
+      pdu = smb2_cmd_cancel_async(smb2, 0, state.pending_async_id);
+      test_ok = pdu != NULL;
+      if (pdu != NULL) smb2_queue_pdu(smb2, pdu);
+    }
+    if (test_ok) {
+      test_ok = wait_for_count(smb2, &state.completed, 1, 10000) == 0;
+    }
+    sequence_after_cancel = smb2->message_id;
+    credits_after_cancel = smb2->credits;
+    test_ok = test_ok &&
+              state.pending_count == 1 && state.final_count == 1 &&
+              state.pending_command == SMB2_WRITE &&
+              state.pending_credit == 1 &&
+              (state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+              state.pending_message_id == target_message_id &&
+              state.pending_async_id != 0 &&
+              (uint32_t)state.final_status == SMB2_STATUS_CANCELLED &&
+              state.final_command == SMB2_WRITE && state.final_credit == 0 &&
+              (state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+              state.final_message_id == target_message_id &&
+              state.final_async_id == state.pending_async_id &&
+              sequence_after_cancel == sequence_before_cancel &&
+              credits_before_cancel == 1 && credits_after_cancel == 1;
+    echo_ok = smb2_echo(smb2) == 0;
+    credits_after_echo = smb2->credits;
+    test_ok = test_ok && echo_ok && credits_after_echo == 8;
+    smb2_set_passthrough(smb2, old_passthrough);
+    printf("  target-mid=0x%016llx async=0x%016llx final=%08x "
+           "sequence=%llu/%llu credits=%d/%d/%d echo=%s\n",
+           (unsigned long long)target_message_id,
+           (unsigned long long)state.pending_async_id,
+           (unsigned)state.final_status,
+           (unsigned long long)sequence_before_cancel,
+           (unsigned long long)sequence_after_cancel,
+           credits_before_cancel, credits_after_cancel, credits_after_echo,
+           echo_ok ? "PASS" : "FAIL");
+    if (created != NULL) {
+      (void)smb2_close(smb2, created);
+    }
+    (void)smb2_unlink(smb2, test_path("cancel_write_512k.bin"));
+    free(payload);
+    printf("RESULT TEST 38: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_39:
+  /* Медленный 64-КиБ READ должен получить interim до клиентского тайм-аута,
+   * сохранить тот же AsyncId до финала и вернуть точные данные. */
+  printf("\n--- TEST 39: delayed READ interim timeout extension ---\n");
+  {
+    enum { file_size = 64 * 1024 };
+    struct smb2fh *writer = NULL;
+    struct smb2fh *reader = NULL;
+    struct probe_fh_mirror *mirror = NULL;
+    struct smb2_read_request request;
+    struct raw_async_read_state state;
+    struct smb2_pdu *pdu = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    int completed = 0;
+    int event_counter = 0;
+    int credits_after_final = 0;
+    int credits_after_echo = 0;
+    int old_passthrough = 0;
+    int echo_ok = 0;
+    int test_ok = payload != NULL;
+    int index;
+
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index);
+    }
+    memset(&request, 0, sizeof(request));
+    memset(&state, 0, sizeof(state));
+    state.buffer = payload;
+    state.expected_length = file_size;
+    state.offset = 0;
+    state.completed_total = &completed;
+    state.event_counter = &event_counter;
+    state.final_status = -1;
+    (void)smb2_unlink(smb2, test_path("delayed_read_pending.bin"));
+    if (test_ok) {
+      writer = smb2_open(smb2, test_path("delayed_read_pending.bin"),
+                         O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = writer != NULL &&
+                smb2_write(smb2, writer, payload, file_size) == file_size;
+    }
+    if (writer != NULL) {
+      test_ok = smb2_close(smb2, writer) == 0 && test_ok;
+      writer = NULL;
+    }
+    if (test_ok) {
+      reader = smb2_open(smb2, test_path("delayed_read_pending.bin"), O_RDONLY);
+      test_ok = reader != NULL;
+    }
+    if (test_ok) {
+      mirror = (struct probe_fh_mirror*)reader;
+      request.length = file_size;
+      request.buf = payload;
+      memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+      pdu = smb2_cmd_read_async(smb2, &request, raw_async_read_cb, &state);
+      test_ok = pdu != NULL;
+    }
+    if (test_ok) {
+      smb2_queue_pdu(smb2, pdu);
+      test_ok = wait_for_count(smb2, &state.pending_count, 1, 10000) == 0 &&
+                wait_for_count(smb2, &completed, 1, 30000) == 0;
+    }
+    credits_after_final = smb2->credits;
+    test_ok = test_ok && state.pending_count == 1 && state.final_count == 1 &&
+              state.pending_command == SMB2_READ &&
+              (state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+              state.pending_async_id != 0 && state.pending_credit == 0 &&
+              (uint32_t)state.final_status == SMB2_STATUS_SUCCESS &&
+              state.final_command == SMB2_READ && state.final_credit == 0 &&
+              (state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+              state.final_async_id == state.pending_async_id &&
+              state.corrupted == 0;
+    echo_ok = smb2_echo(smb2) == 0;
+    credits_after_echo = smb2->credits;
+    test_ok = test_ok && echo_ok && credits_after_echo == 8;
+    smb2_set_passthrough(smb2, old_passthrough);
+    printf("  pending=%d credit=%u async=0x%016llx final=%08x/%u "
+           "credits=%d/%d echo=%s\n",
+           state.pending_count, (unsigned)state.pending_credit,
+           (unsigned long long)state.pending_async_id,
+           (unsigned)state.final_status, (unsigned)state.final_credit,
+           credits_after_final, credits_after_echo,
+           echo_ok ? "PASS" : "FAIL");
+    if (reader != NULL) test_ok = smb2_close(smb2, reader) == 0 && test_ok;
+    (void)smb2_unlink(smb2, test_path("delayed_read_pending.bin"));
+    free(payload);
+    printf("RESULT TEST 39: %s\n", test_ok ? "PASS" : "FAIL");
     failures += !test_ok;
   }
 

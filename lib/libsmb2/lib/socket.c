@@ -841,8 +841,8 @@ read_more_data:
          * setup has completed, so we can not yet verify the signature
          * of the final leg of session setup.
          */
-        if (smb2->sign &&
-            (smb2->hdr.flags & SMB2_FLAGS_SIGNED) &&
+        if ((smb2->hdr.flags & SMB2_FLAGS_SIGNED) &&
+            smb2->session_key_size != 0 &&
             (smb2->hdr.command != SMB2_SESSION_SETUP) ) {
                 uint8_t signature[16] _U_;
                 memcpy(&signature[0], &smb2->in.iov[1 + iov_offset].buf[48], 16);

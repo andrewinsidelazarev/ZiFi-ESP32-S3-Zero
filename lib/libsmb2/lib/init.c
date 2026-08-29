@@ -318,6 +318,7 @@ struct smb2_context *smb2_init_context(void)
         /* По MS-SMB2 3.3.1.2 новое соединение начинается с одного кредита.
          * Ответы сервера расширяют окно только до локального предела. */
         smb2->server_credit_window = 1;
+        smb2->server_credit_target = SMB2_SERVER_CREDIT_TARGET;
 
         for (i = 0; i < 8; i++) {
                 smb2->client_challenge[i] = random() & 0xff;

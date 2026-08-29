@@ -1,8 +1,45 @@
 import subprocess
 import os
+import socket
+import struct
 import time
 import shutil
+import uuid
 from pathlib import Path
+
+def probe_negotiate_security_mode(host, port):
+    dialects = (0x0202, 0x0210, 0x0300, 0x0302)
+    header = (b'\xfeSMB' +
+              struct.pack('<HHIHHIIQIIQ', 64, 0, 0, 0, 1, 0, 0,
+                          0, 0xfeff, 0, 0) + bytes(16))
+    body = (struct.pack('<HHHHI', 36, len(dialects),
+                        0x0001, 0, 0) +
+            uuid.uuid4().bytes + struct.pack('<IHH', 0, 0, 0) +
+            b''.join(struct.pack('<H', dialect) for dialect in dialects))
+    packet = header + body
+    with socket.create_connection((host, port), timeout=5) as connection:
+        connection.sendall(b'\x00' + len(packet).to_bytes(3, 'big') + packet)
+        netbios = connection.recv(4)
+        if len(netbios) != 4:
+            raise RuntimeError('Short SMB NEGOTIATE NetBIOS header')
+        expected = int.from_bytes(netbios[1:4], 'big')
+        response = bytearray()
+        while len(response) < expected:
+            part = connection.recv(expected - len(response))
+            if not part:
+                raise RuntimeError('Short SMB NEGOTIATE response')
+            response.extend(part)
+    if len(response) < 68 or response[:4] != b'\xfeSMB':
+        raise RuntimeError('Invalid SMB NEGOTIATE response')
+    status = struct.unpack_from('<I', response, 8)[0]
+    security_mode = struct.unpack_from('<H', response, 66)[0]
+    dialect = struct.unpack_from('<H', response, 68)[0]
+    if status != 0 or security_mode != 0x0001:
+        raise RuntimeError(
+            f'SMB signing is not optional: '
+            f'status=0x{status:08x} security_mode=0x{security_mode:04x} '
+            f'dialect=0x{dialect:04x}')
+    print('NEGOTIATED SIGNING: enabled, not required (PASS)')
 
 def main():
     root = Path(__file__).resolve().parent.parent.parent
@@ -70,6 +107,7 @@ echo Compilation SUCCESS!
             stdout=server_log, stderr=subprocess.STDOUT, text=True)
         try:
             time.sleep(1.5)
+            probe_negotiate_security_mode('127.0.0.1', port)
             print("Running smb_reproduce_test.exe...")
             test_proc = subprocess.run(
                 ['.test-build/host_smb/smb_reproduce_test.exe',
@@ -164,9 +202,9 @@ echo Compilation SUCCESS!
         print("MKDIR FIFO SERVER LOG TAIL:\n" + mkdir_tail)
         raise RuntimeError("Deferred MKDIR failed behind active FINDNEXT")
 
-    # WRITE второго Open уже подтверждён клиенту, но при медленном физическом
-    # канале остаётся в очереди FILEX. CLOSE первого Open обязан занять своё
-    # место в общей FIFO и дождаться этой записи без IO_DEVICE_ERROR.
+    # Незавершённый WRITE второго Open и CLOSE первого Open одновременно
+    # находятся на проводе. CLOSE обязан занять своё место в общей FIFO и
+    # дождаться физической записи без IO_DEVICE_ERROR.
     close_port = 14448
     close_share = Path('.test-build/test_share_close_fifo')
     if close_share.exists():
@@ -174,6 +212,7 @@ echo Compilation SUCCESS!
     close_share.mkdir(parents=True)
     close_log_path = out / 'host_smb_close_fifo.log'
     close_test = None
+    write_cancel_test = None
     with close_log_path.open('w', encoding='utf-8') as close_log:
         close_server = subprocess.Popen(
             ['.test-build/host_smb/host_smb.exe', str(close_share),
@@ -187,6 +226,12 @@ echo Compilation SUCCESS!
                  f'127.0.0.1:{close_port}', 'SD', 'test33'],
                 capture_output=True, text=True, timeout=90)
             print("CLOSE FIFO TEST OUTPUT:\n" + close_test.stdout)
+            print('Running 512 KiB WRITE CANCEL regression...')
+            write_cancel_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{close_port}', 'SD', 'test38'],
+                capture_output=True, text=True, timeout=90)
+            print("WRITE CANCEL TEST OUTPUT:\n" + write_cancel_test.stdout)
         finally:
             close_server.terminate()
             try:
@@ -200,6 +245,51 @@ echo Compilation SUCCESS!
             encoding='utf-8', errors='replace')[-4000:]
         print("CLOSE FIFO SERVER LOG TAIL:\n" + close_tail)
         raise RuntimeError("Deferred CLOSE failed behind physical WRITE")
+    if write_cancel_test is None or write_cancel_test.returncode != 0:
+        close_tail = close_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("WRITE CANCEL SERVER LOG TAIL:\n" + close_tail)
+        raise RuntimeError("512 KiB WRITE CANCEL regression failed")
+
+    # На железе один 64-КиБ FILEX READ уже приближался к 60 секундам. Здесь
+    # медленный UART и 100-мс порог детерминированно проверяют отдельный
+    # STATUS_PENDING, единый AsyncId и восстановление credits после финала.
+    pending_port = 14449
+    pending_share = Path('.test-build/test_share_pending')
+    if pending_share.exists():
+        shutil.rmtree(pending_share)
+    pending_share.mkdir(parents=True)
+    pending_env = os.environ.copy()
+    pending_env['ZIFI_HOST_INTERIM_PENDING_MS'] = '100'
+    pending_log_path = out / 'host_smb_interim_pending.log'
+    pending_test = None
+    with pending_log_path.open('w', encoding='utf-8') as pending_log:
+        pending_server = subprocess.Popen(
+            ['.test-build/host_smb/host_smb.exe', str(pending_share),
+             str(pending_port), '8192'],
+            stdout=pending_log, stderr=subprocess.STDOUT, text=True,
+            env=pending_env)
+        try:
+            time.sleep(1.5)
+            print('Running delayed READ interim STATUS_PENDING regression...')
+            pending_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{pending_port}', 'SD', 'test39'],
+                capture_output=True, text=True, timeout=60)
+            print("INTERIM PENDING TEST OUTPUT:\n" + pending_test.stdout)
+        finally:
+            pending_server.terminate()
+            try:
+                pending_server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pending_server.kill()
+                pending_server.wait(timeout=2)
+
+    if pending_test is None or pending_test.returncode != 0:
+        pending_tail = pending_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("INTERIM PENDING SERVER LOG TAIL:\n" + pending_tail)
+        raise RuntimeError("Delayed SMB READ did not preserve async contract")
 
     # Windows перед CLOSE присылает BASIC_INFORMATION. SMB с первого WRITE
     # использует FILEX mode=3, поэтому данные и SET_METADATA остаются в одном
@@ -207,6 +297,8 @@ echo Compilation SUCCESS!
     # используют точные размеры clock.wmf из 0.6.79 и plasmatw.wmf из 0.6.80.
     metadata_test = None
     sequential_close_test = None
+    progress_test = None
+    maxwrite_test = None
     metadata_log_path = out / 'host_smb_metadata_close.log'
     with metadata_log_path.open('w', encoding='utf-8') as metadata_log:
         metadata_server = subprocess.Popen(
@@ -228,6 +320,19 @@ echo Compilation SUCCESS!
                 capture_output=True, text=True, timeout=90)
             print("SEQUENTIAL CLOSE TEST OUTPUT:\n" +
                   sequential_close_test.stdout)
+            print('Running negotiated 512 KiB WRITE regression...')
+            maxwrite_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{close_port + 1}', 'SD', 'test37'],
+                capture_output=True, text=True, timeout=90)
+            print("512 KIB WRITE TEST OUTPUT:\n" + maxwrite_test.stdout)
+            print('Running out-of-order progress regression...')
+            progress_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{close_port + 1}', 'SD', 'test36'],
+                capture_output=True, text=True, timeout=90)
+            print("OUT-OF-ORDER PROGRESS TEST OUTPUT:\n" +
+                  progress_test.stdout)
         finally:
             metadata_server.terminate()
             try:
@@ -249,6 +354,16 @@ echo Compilation SUCCESS!
         print("SEQUENTIAL CLOSE SERVER LOG TAIL:\n" + metadata_tail)
         raise RuntimeError(
             "New SMB file still depended on deferred sequential CLOSE")
+    if progress_test is None or progress_test.returncode != 0:
+        metadata_tail = metadata_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("OUT-OF-ORDER PROGRESS SERVER LOG TAIL:\n" + metadata_tail)
+        raise RuntimeError("Out-of-order WRITE progress regression failed")
+    if maxwrite_test is None or maxwrite_test.returncode != 0:
+        metadata_tail = metadata_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("512 KIB WRITE SERVER LOG TAIL:\n" + metadata_tail)
+        raise RuntimeError("Negotiated 512 KiB WRITE regression failed")
 
     server_text = server_log_path.read_text(encoding='utf-8', errors='replace')
 
@@ -270,6 +385,38 @@ echo Compilation SUCCESS!
         raise RuntimeError(
             'No partial Copying progress for: ' + ', '.join(missing_progress))
     print("Copying progress: partial READ and WRITE events found")
+
+    # TEST 36 идёт последним и закрывает полностью покрытый файл после
+    # внепорядковых и повторных WRITE. Старый счётчик показывал конец
+    # последнего блока (256 КиБ), наивная сумма показала бы 448 КиБ.
+    metadata_text = metadata_log_path.read_text(
+        encoding='utf-8', errors='replace')
+    maxwrite_operations = metadata_text.count(
+        '[LAST] WRITE /write_512k.bin')
+    if maxwrite_operations != 1:
+        raise RuntimeError(
+            '512 KiB pwrite was split into '
+            f'{maxwrite_operations} server WRITE operations')
+    print('Negotiated 512 KiB WRITE: one server request verified')
+    done_lines = [
+        line for line in metadata_text.splitlines()
+        if line.startswith('[COPYING] DONE ')
+    ]
+    expected_done = '[COPYING] DONE 320.0K/320.0K'
+    if not done_lines or done_lines[-1] != expected_done:
+        actual = done_lines[-1] if done_lines else '<missing>'
+        raise RuntimeError(
+            f'Out-of-order progress mismatch: {actual}; '
+            f'expected {expected_done}')
+
+    progress_file = close_share / 'progress_out_of_order.bin'
+    progress_data = progress_file.read_bytes()
+    if len(progress_data) != 5 * 65536 or any(
+            value != (((offset * 37) ^ (offset >> 8) ^
+                       (offset >> 16)) & 0xff)
+            for offset, value in enumerate(progress_data)):
+        raise RuntimeError('Out-of-order WRITE data verification failed')
+    print('Out-of-order progress: unique coverage 320.0K/320.0K verified')
     print("Test finished!")
 
 if __name__ == '__main__':

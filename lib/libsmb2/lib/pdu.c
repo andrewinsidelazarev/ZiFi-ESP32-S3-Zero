@@ -628,15 +628,18 @@ smb2_server_credit_grant(struct smb2_context *smb2,
                          const struct smb2_pdu *req_pdu)
 {
         uint32_t held = smb2->server_credit_window;
+        uint32_t target = smb2->server_credit_target;
         uint32_t consumed = smb2_server_credit_charge(smb2, req_pdu);
         uint32_t requested = req_pdu->header.credit_request_response;
+        uint32_t remaining;
         uint32_t grant_limit;
         uint32_t grant;
 
+        if (target == 0 || target > SMB2_SERVER_CREDIT_TARGET) {
+                target = SMB2_SERVER_CREDIT_TARGET;
+        }
         if (held == 0) {
                 held = 1;
-        } else if (held > SMB2_SERVER_CREDIT_TARGET) {
-                held = SMB2_SERVER_CREDIT_TARGET;
         }
         if (consumed > held) {
                 /* Корректный клиент не может израсходовать больше имеющихся
@@ -647,14 +650,16 @@ smb2_server_credit_grant(struct smb2_context *smb2,
                 requested = 1;
         }
 
-        /* Сначала вычитаем кредиты этого запроса, затем выдаём не больше,
-         * чем запросил клиент и сколько помещается в окно из четырёх кредитов.
-         * Возврат ровно израсходованного сохраняет полное окно, а увеличенный
-         * ответ NEGOTIATE расширяет начальное окно из одного кредита. */
-        grant_limit = SMB2_SERVER_CREDIT_TARGET - (held - consumed);
+        /* При временном снижении target уже выданные кредиты не исчезают:
+         * ответы постепенно гасят их без новых выдач. Это принципиально для
+         * очереди долгих READ: клиент не должен получить новый запрос за каждый
+         * STATUS_PENDING. После восстановления target следующий обычный
+         * запрос снова расширит окно. */
+        remaining = held - consumed;
+        grant_limit = remaining >= target ? 0 : target - remaining;
         grant = requested < grant_limit ? requested : grant_limit;
         smb2->server_credit_window =
-                (uint16_t)(held - consumed + grant);
+                (uint16_t)(remaining + grant);
         return (uint16_t)grant;
 }
 
@@ -981,6 +986,9 @@ smb2_queue_pdu_direct(struct smb2_context *smb2, struct smb2_pdu *pdu)
                  * NOT be signed.  The final response is signed normally. */
                 if (p->header.status != SMB2_STATUS_PENDING &&
                     (smb2->sign ||
+                     (smb2_is_server(smb2) &&
+                      p->header.command == SMB2_IOCTL &&
+                      p->ctl_code == SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO) ||
                      (p->header.command == SMB2_TREE_CONNECT &&
                       smb2->dialect == SMB2_VERSION_0311 && !smb2->seal))) {
                         if (smb2_pdu_add_signature(smb2, p) < 0) {
@@ -1052,6 +1060,17 @@ smb2_set_current_request_internal_async(struct smb2_context *smb2)
          * обычными, STATUS_PENDING не отправляется, но жизнью операции
          * управляет сервер приложения. */
         request->timeout = 0;
+        return 0;
+}
+
+int
+smb2_set_server_credit_target(struct smb2_context *smb2, uint16_t target)
+{
+        if (!smb2 || !smb2_is_server(smb2) || target == 0 ||
+            target > SMB2_SERVER_CREDIT_TARGET) {
+                return -1;
+        }
+        smb2->server_credit_target = target;
         return 0;
 }
 

@@ -678,6 +678,10 @@ int smb2_pdu_is_compound(struct smb2_context *smb2);
 /* Оставить текущий серверный Request PDU синхронным на проводе, но снять с
  * него обычный таймаут: финальный ответ будет поставлен приложением позже. */
 int smb2_set_current_request_internal_async(struct smb2_context *smb2);
+/* Ограничить серверное кредитное окно конкретного соединения. Это позволяет
+ * долгой операции вернуть STATUS_PENDING, не открывая клиенту бесконечный
+ * конвейер новых запросов. Допустимый диапазон задаёт серверная библиотека. */
+int smb2_set_server_credit_target(struct smb2_context *smb2, uint16_t target);
 
 /*
  * OPENDIR
