@@ -96,7 +96,7 @@ constexpr uint32_t kSmbAdvertisedReadSize = 64 * 1024;
 // давало порядок 0, 512K..4M, 64K..512K: клиентский callback стоял на 0%, а
 // затем прыгал сразу на десятки процентов. Принимаем порцию целиком, а внутри
 // всё равно пишем её через короткие окна FILEX.
-constexpr uint32_t kSmbAdvertisedWriteSize = 512 * 1024;
+constexpr uint32_t kSmbAdvertisedWriteSize = 64 * 1024;
 // ЗАПРЕЩЕНО уменьшать: по MS-SMB2 3.2.5.2 клиент обязан разорвать соединение,
 // если для диалекта 0x0210 и выше сервер объявил MaxRead/MaxWrite/MaxTransact
 // меньше 65536. Windows делает это буквально — Проводник показывает «Параметр
@@ -4949,7 +4949,8 @@ bool SmbServer::Impl::commitReservedSize(int slot) {
     return false;
   }
   Handle& handle = handles[slot];
-  if (!handle.sizeReserved || handle.reservedSize <= handle.physicalSize) {
+  if (handle.deletePending || !handle.sizeReserved ||
+      handle.reservedSize <= handle.physicalSize) {
     handle.sizeReserved = false;
     handle.ownsSizeReservation = false;
     return true;
@@ -6684,17 +6685,32 @@ int SmbServer::Impl::serviceHandler(smb2_server* serverValue) {
 int SmbServer::Impl::authorizeHandler(smb2_server* serverValue,
                                       smb2_context* smb2,
                                       const char* requestedUser,
-                                      const char*, const char*) {
+                                      const char* requestedDomain,
+                                      const char*) {
   Impl* self = from(serverValue);
-  if (self == nullptr || requestedUser == nullptr ||
-      !asciiEqualNoCase(requestedUser, self->user)) {
+  if (self == nullptr || requestedUser == nullptr) {
     diagnosticLogEvent("SMB auth-denied user=%s",
                        requestedUser == nullptr ? "(null)" : requestedUser);
     return -1;
   }
-  diagnosticLogEvent("SMB auth-accepted user=%s", requestedUser);
+  const char* pureUser = requestedUser;
+  const char* slash = strpbrk(requestedUser, "\\/");
+  if (slash != nullptr) {
+    pureUser = slash + 1;
+  }
+  if (!asciiEqualNoCase(pureUser, self->user)) {
+    diagnosticLogEvent("SMB auth-denied user=%s", requestedUser);
+    return -1;
+  }
+  diagnosticLogEvent("SMB auth-accepted user=%s pure=%s dom=%s", requestedUser,
+                     pureUser,
+                     requestedDomain != nullptr ? requestedDomain : "(none)");
   smb2_set_user(smb2, self->user);
-  smb2_set_domain(smb2, self->workgroup);
+  if (requestedDomain != nullptr && requestedDomain[0] != 0) {
+    smb2_set_domain(smb2, requestedDomain);
+  } else {
+    smb2_set_domain(smb2, self->workgroup);
+  }
   smb2_set_password(smb2, self->password);
   return 0;
 }
@@ -7139,12 +7155,20 @@ uint32_t SmbServer::Impl::finalizeClose(int slot, uint32_t generation,
     return SMB2_STATUS_FILE_CLOSED;
   }
   Handle& handle = handles[slot];
+  if (handle.deletePending) {
+    for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
+      if (asyncWrites[index].used && asyncWrites[index].slot == slot &&
+          asyncWrites[index].generation == generation) {
+        asyncWrites[index].cancelRequested = true;
+      }
+    }
+  }
   if (!drainAsyncWritesForHandle(slot, generation)) {
     handle.failed = true;
   }
   bool resizeFailed = false;
-  if (!handle.failed && handle.sizeReserved && handle.ownsSizeReservation &&
-      !commitReservedSize(slot)) {
+  if (!handle.failed && !handle.deletePending && handle.sizeReserved &&
+      handle.ownsSizeReservation && !commitReservedSize(slot)) {
     // Не оставляем в ответах логический размер, который не удалось записать на
     // SD. Исходный файл при этом не удаляем: ошибка EXTEND не равна сбою
     // создания нового файла.
@@ -7153,7 +7177,8 @@ uint32_t SmbServer::Impl::finalizeClose(int slot, uint32_t generation,
     resizeFailed = true;
   }
   bool metadataFailed = false;
-  if (!handle.failed && handle.metadataPending && !applyPendingMetadata(slot)) {
+  if (!handle.failed && !handle.deletePending && handle.metadataPending &&
+      !applyPendingMetadata(slot)) {
     // Ошибка времени/атрибутов не должна удалять уже полностью записанный файл.
     // CLOSE всё равно закрывает VFS, но сообщает Windows о сбое метаданных.
     handle.metadataPending = false;
@@ -7163,7 +7188,8 @@ uint32_t SmbServer::Impl::finalizeClose(int slot, uint32_t generation,
   // Обычный файл материализуется ещё в CREATE, поэтому CLOSE не должен снова
   // открывать его с усечением. Это особенно важно, когда второй handle уже
   // записал данные в тот же новый файл.
-  if (wasActive && handle.writable && !closeActive(!handle.failed)) {
+  if (wasActive && handle.writable &&
+      !closeActive(!handle.failed && !handle.deletePending)) {
     handle.failed = true;
   } else if (wasActive && !handle.writable) {
     closeActive(true);
