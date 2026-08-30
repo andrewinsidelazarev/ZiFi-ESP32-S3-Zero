@@ -7265,11 +7265,6 @@ int SmbServer::Impl::flushHandler(smb2_server* serverValue,
       return replyStatus(smb2, SMB2_FLUSH, SMB2_STATUS_IO_DEVICE_ERROR);
     }
   }
-  if (self->activeSlot == slot && self->activeMode == ActiveMode::kWrite &&
-      !self->closeActive(true)) {
-    handle->failed = true;
-    return replyStatus(smb2, SMB2_FLUSH, SMB2_STATUS_IO_DEVICE_ERROR);
-  }
   self->sendOperation("FLUSH", handle->path);
   return 0;
 }
