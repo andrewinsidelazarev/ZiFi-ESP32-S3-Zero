@@ -474,6 +474,9 @@ void Z80Simulator::handleWriteWindow(const std::vector<uint8_t>& payload) {
   const bool sane = windowData_.size() == windowTotal_ &&
                     crc16(windowData_.data(), windowData_.size()) == sum;
   if (sane) {
+    if (writeDelayMs_ != 0 && offset_ >= writeDelayOffset_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(writeDelayMs_));
+    }
     std::FILE* file = nullptr;
     fopen_s(&file, openPath_.string().c_str(), "r+b");
     if (file == nullptr) {
@@ -505,6 +508,9 @@ void Z80Simulator::handleSetEof(const std::vector<uint8_t>& payload) {
   if (!openValid_ || payload.size() < 4) {
     replyStatus(kVfsSetEof, kStatusFail);
     return;
+  }
+  if (setEofDelayMs_ != 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(setEofDelayMs_));
   }
   const uint32_t size = readLe32(payload.data());
   std::error_code code;

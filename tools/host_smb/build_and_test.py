@@ -29,17 +29,25 @@ def probe_negotiate_security_mode(host, port):
             if not part:
                 raise RuntimeError('Short SMB NEGOTIATE response')
             response.extend(part)
-    if len(response) < 68 or response[:4] != b'\xfeSMB':
+    if len(response) < 88 or response[:4] != b'\xfeSMB':
         raise RuntimeError('Invalid SMB NEGOTIATE response')
     status = struct.unpack_from('<I', response, 8)[0]
     security_mode = struct.unpack_from('<H', response, 66)[0]
     dialect = struct.unpack_from('<H', response, 68)[0]
+    server_guid = bytes(response[72:88])
     if status != 0 or security_mode != 0x0001:
         raise RuntimeError(
             f'SMB signing is not optional: '
             f'status=0x{status:08x} security_mode=0x{security_mode:04x} '
             f'dialect=0x{dialect:04x}')
-    print('NEGOTIATED SIGNING: enabled, not required (PASS)')
+    if ((server_guid[7] & 0xf0) != 0x40 or
+            (server_guid[8] & 0xc0) != 0x80):
+        raise RuntimeError(
+            'SMB ServerGuid is not a wire-order UUID v4: ' +
+            server_guid.hex())
+    print('NEGOTIATED SIGNING: enabled, not required (PASS); '
+          f'ServerGuid={uuid.UUID(bytes_le=server_guid)}')
+    return server_guid
 
 def main():
     root = Path(__file__).resolve().parent.parent.parent
@@ -101,13 +109,15 @@ echo Compilation SUCCESS!
     # заполняет системный буфер и блокирует сервер посреди длинной регрессии.
     server_log_path = out / 'host_smb.log'
     test_proc = None
+    first_server_guid = None
     with server_log_path.open('w', encoding='utf-8') as server_log:
         server_proc = subprocess.Popen(
             ['.test-build/host_smb/host_smb.exe', str(test_share), str(port)],
             stdout=server_log, stderr=subprocess.STDOUT, text=True)
         try:
             time.sleep(1.5)
-            probe_negotiate_security_mode('127.0.0.1', port)
+            first_server_guid = probe_negotiate_security_mode(
+                '127.0.0.1', port)
             print("Running smb_reproduce_test.exe...")
             test_proc = subprocess.run(
                 ['.test-build/host_smb/smb_reproduce_test.exe',
@@ -127,6 +137,34 @@ echo Compilation SUCCESS!
             encoding='utf-8', errors='replace')[-4000:]
         print("SERVER LOG TAIL:\n" + server_tail)
         raise RuntimeError("SMB regression failed")
+
+    # [MS-SMB2] 3.3.3 требует новый ServerGuid после новой инициализации
+    # сервера. Два соединения одного процесса уже сравнивает C-регрессия;
+    # отдельный короткий процесс доказывает смену GUID между экземплярами.
+    identity_port = 14451
+    identity_log_path = out / 'host_smb_identity_restart.log'
+    second_server_guid = None
+    with identity_log_path.open('w', encoding='utf-8') as identity_log:
+        identity_server = subprocess.Popen(
+            ['.test-build/host_smb/host_smb.exe', str(test_share),
+             str(identity_port)],
+            stdout=identity_log, stderr=subprocess.STDOUT, text=True)
+        try:
+            time.sleep(1.5)
+            second_server_guid = probe_negotiate_security_mode(
+                '127.0.0.1', identity_port)
+        finally:
+            identity_server.terminate()
+            try:
+                identity_server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                identity_server.kill()
+                identity_server.wait(timeout=2)
+    if (first_server_guid is None or second_server_guid is None or
+            first_server_guid == second_server_guid):
+        raise RuntimeError(
+            'SMB ServerGuid was reused across server initialization')
+    print('SERVER INSTANCE IDENTITY: new UUID v4 after restart (PASS)')
 
     # Сжатый тайм-аут воспроизводит дефект реального медленного FILEX без
     # двухминутного ожидания: третий WRITE и ожидающие READ из TEST 8 должны
@@ -213,11 +251,17 @@ echo Compilation SUCCESS!
     close_log_path = out / 'host_smb_close_fifo.log'
     close_test = None
     write_cancel_test = None
+    logical_close_test = None
+    close_env = os.environ.copy()
+    close_env['ZIFI_HOST_INTERIM_PENDING_MS'] = '100'
+    logical_close_env = os.environ.copy()
+    logical_close_env['ZIFI_EXPECT_LOGICAL_CLOSE_FIRST'] = '1'
     with close_log_path.open('w', encoding='utf-8') as close_log:
         close_server = subprocess.Popen(
             ['.test-build/host_smb/host_smb.exe', str(close_share),
              str(close_port), '6000'],
-            stdout=close_log, stderr=subprocess.STDOUT, text=True)
+            stdout=close_log, stderr=subprocess.STDOUT, text=True,
+            env=close_env)
         try:
             time.sleep(1.5)
             print('Running CLOSE/WRITE FIFO regression...')
@@ -226,12 +270,20 @@ echo Compilation SUCCESS!
                  f'127.0.0.1:{close_port}', 'SD', 'test33'],
                 capture_output=True, text=True, timeout=90)
             print("CLOSE FIFO TEST OUTPUT:\n" + close_test.stdout)
-            print('Running 512 KiB WRITE CANCEL regression...')
+            print('Running 64 KiB WRITE CANCEL regression...')
             write_cancel_test = subprocess.run(
                 ['.test-build/host_smb/smb_reproduce_test.exe',
                  f'127.0.0.1:{close_port}', 'SD', 'test38'],
                 capture_output=True, text=True, timeout=90)
             print("WRITE CANCEL TEST OUTPUT:\n" + write_cancel_test.stdout)
+            print('Running metadata CLOSE isolation regression...')
+            logical_close_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{close_port}', 'SD', 'test41'],
+                capture_output=True, text=True, timeout=90,
+                env=logical_close_env)
+            print("METADATA CLOSE TEST OUTPUT:\n" +
+                  logical_close_test.stdout)
         finally:
             close_server.terminate()
             try:
@@ -249,7 +301,12 @@ echo Compilation SUCCESS!
         close_tail = close_log_path.read_text(
             encoding='utf-8', errors='replace')[-4000:]
         print("WRITE CANCEL SERVER LOG TAIL:\n" + close_tail)
-        raise RuntimeError("512 KiB WRITE CANCEL regression failed")
+        raise RuntimeError("64 KiB WRITE CANCEL regression failed")
+    if logical_close_test is None or logical_close_test.returncode != 0:
+        close_tail = close_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("METADATA CLOSE SERVER LOG TAIL:\n" + close_tail)
+        raise RuntimeError("Metadata CLOSE waited behind unrelated WRITE")
 
     # На железе один 64-КиБ FILEX READ уже приближался к 60 секундам. Здесь
     # медленный UART и 100-мс порог детерминированно проверяют отдельный
@@ -291,6 +348,66 @@ echo Compilation SUCCESS!
         print("INTERIM PENDING SERVER LOG TAIL:\n" + pending_tail)
         raise RuntimeError("Delayed SMB READ did not preserve async contract")
 
+    # CopyFile сообщает конечный EOF до первого WRITE, затем на границе 4 МиБ
+    # делает metadata-only Open и FLUSH при уже поставленных внепорядковых WRITE.
+    # SET_EOF должен физически завершиться через PENDING, а FLUSH — занять место
+    # FIFO-барьера и ответить только после всех старших WRITE.
+    set_eof_port = 14450
+    set_eof_share = Path('.test-build/test_share_set_eof')
+    if set_eof_share.exists():
+        shutil.rmtree(set_eof_share)
+    set_eof_share.mkdir(parents=True)
+    set_eof_log_path = out / 'host_smb_set_eof.log'
+    set_eof_test = None
+    set_eof_env = os.environ.copy()
+    set_eof_env['ZIFI_HOST_INTERIM_PENDING_MS'] = '100'
+    with set_eof_log_path.open('w', encoding='utf-8') as set_eof_log:
+        set_eof_server = subprocess.Popen(
+            ['.test-build/host_smb/host_smb.exe', str(set_eof_share),
+             str(set_eof_port), '0', 'ZX-Evo', '0', '600', '350',
+             str(4 * 1024 * 1024)],
+            stdout=set_eof_log, stderr=subprocess.STDOUT, text=True,
+            env=set_eof_env)
+        try:
+            time.sleep(1.5)
+            print('Running physical EOF and 4 MiB FLUSH FIFO regression...')
+            set_eof_test = subprocess.run(
+                ['.test-build/host_smb/smb_reproduce_test.exe',
+                 f'127.0.0.1:{set_eof_port}', 'SD', 'test40'],
+                capture_output=True, text=True, timeout=60)
+            print("4 MIB FLUSH TEST OUTPUT:\n" + set_eof_test.stdout)
+        finally:
+            set_eof_server.terminate()
+            try:
+                set_eof_server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                set_eof_server.kill()
+                set_eof_server.wait(timeout=2)
+
+    if set_eof_test is None or set_eof_test.returncode != 0:
+        set_eof_tail = set_eof_log_path.read_text(
+            encoding='utf-8', errors='replace')[-4000:]
+        print("4 MIB FLUSH SERVER LOG TAIL:\n" + set_eof_tail)
+        raise RuntimeError(
+            "Physical SET_EOF or 4 MiB FLUSH FIFO barrier failed")
+    set_eof_lines = set_eof_log_path.read_text(
+        encoding='utf-8', errors='replace').splitlines()
+    first_write = next(
+        (i for i, line in enumerate(set_eof_lines)
+         if line.startswith('[COPYING] WRITE ')), -1)
+    done_write = next(
+        (i for i, line in enumerate(set_eof_lines[first_write + 1:],
+                                    first_write + 1)
+         if line.startswith('[COPYING] DONE ')), -1)
+    if first_write < 0 or done_write < 0:
+        raise RuntimeError("4 MiB regression emitted no WRITE/DONE progress")
+    transfer_lines = set_eof_lines[first_write:done_write + 1]
+    if '[COPYING] ' in transfer_lines:
+        raise RuntimeError("Metadata Open reset Copying at the 4 MiB boundary")
+    if any(line.startswith('[LAST] OPEN ') for line in transfer_lines):
+        raise RuntimeError("Metadata Open replaced active WRITE indication")
+    print("4 MiB metadata Open: progress and active WRITE preserved")
+
     # Windows перед CLOSE присылает BASIC_INFORMATION. SMB с первого WRITE
     # использует FILEX mode=3, поэтому данные и SET_METADATA остаются в одном
     # физическом контексте без отложенного последовательного APPEND. Тесты
@@ -320,12 +437,12 @@ echo Compilation SUCCESS!
                 capture_output=True, text=True, timeout=90)
             print("SEQUENTIAL CLOSE TEST OUTPUT:\n" +
                   sequential_close_test.stdout)
-            print('Running negotiated 512 KiB WRITE regression...')
+            print('Running negotiated 64 KiB WRITE regression...')
             maxwrite_test = subprocess.run(
                 ['.test-build/host_smb/smb_reproduce_test.exe',
                  f'127.0.0.1:{close_port + 1}', 'SD', 'test37'],
                 capture_output=True, text=True, timeout=90)
-            print("512 KIB WRITE TEST OUTPUT:\n" + maxwrite_test.stdout)
+            print("64 KIB WRITE TEST OUTPUT:\n" + maxwrite_test.stdout)
             print('Running out-of-order progress regression...')
             progress_test = subprocess.run(
                 ['.test-build/host_smb/smb_reproduce_test.exe',
@@ -362,8 +479,8 @@ echo Compilation SUCCESS!
     if maxwrite_test is None or maxwrite_test.returncode != 0:
         metadata_tail = metadata_log_path.read_text(
             encoding='utf-8', errors='replace')[-4000:]
-        print("512 KIB WRITE SERVER LOG TAIL:\n" + metadata_tail)
-        raise RuntimeError("Negotiated 512 KiB WRITE regression failed")
+        print("64 KIB WRITE SERVER LOG TAIL:\n" + metadata_tail)
+        raise RuntimeError("Negotiated 64 KiB WRITE regression failed")
 
     server_text = server_log_path.read_text(encoding='utf-8', errors='replace')
 
@@ -392,12 +509,12 @@ echo Compilation SUCCESS!
     metadata_text = metadata_log_path.read_text(
         encoding='utf-8', errors='replace')
     maxwrite_operations = metadata_text.count(
-        '[LAST] WRITE /write_512k.bin')
+        '[LAST] WRITE /write_64k.bin')
     if maxwrite_operations != 1:
         raise RuntimeError(
-            '512 KiB pwrite was split into '
+            '64 KiB pwrite was split into '
             f'{maxwrite_operations} server WRITE operations')
-    print('Negotiated 512 KiB WRITE: one server request verified')
+    print('Negotiated 64 KiB WRITE: one server request verified')
     done_lines = [
         line for line in metadata_text.splitlines()
         if line.startswith('[COPYING] DONE ')

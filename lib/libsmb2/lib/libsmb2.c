@@ -4466,6 +4466,9 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
 
         if (req) {
                 rep.capabilities = SMB2_GLOBAL_CAP_LARGE_MTU;
+                if (server->leasing_enabled) {
+                        rep.capabilities |= SMB2_GLOBAL_CAP_LEASING;
+                }
                 if (smb2->version == SMB2_VERSION_ANY  ||
                     smb2->version == SMB2_VERSION_ANY3 ||
                     smb2->version == SMB2_VERSION_0300 ||

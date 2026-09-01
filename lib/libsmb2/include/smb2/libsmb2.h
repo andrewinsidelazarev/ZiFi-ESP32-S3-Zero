@@ -1530,6 +1530,9 @@ struct smb2_server {
         uint32_t max_transact_size;
         uint32_t max_read_size;
         uint32_t max_write_size;
+        /* Advertise SMB2_GLOBAL_CAP_LEASING only when the embedding server
+         * implements CREATE lease request/response handling. */
+        int leasing_enabled;
         int signing_enabled;
         int allow_anonymous;
         /* this can be set non-0 to delegate client authentication to
