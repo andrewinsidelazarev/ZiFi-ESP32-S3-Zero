@@ -4747,6 +4747,24 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                             (timeout.tv_sec > 0 || timeout.tv_usec >= 0) ? &timeout : NULL
                            );
 
+                if (ready < 0) {
+                        int select_error;
+
+#ifdef _WIN32
+                        select_error = WSAGetLastError();
+#else
+                        select_error = errno;
+#endif
+                        /* Раньше обрабатывался только ready > 0: при EBADF,
+                         * EINVAL или другой ошибке select() мгновенно возвращал
+                         * -1, err оставался нулём, и цикл без задержки загружал
+                         * ядро. Теперь ошибка возвращается владельцу сервера:
+                         * он закрывает старые contexts и после ограниченной
+                         * паузы заново запускает listener. */
+                        err = select_error > 0 ? -select_error : -EIO;
+                        break;
+                }
+
                 if (ready > 0) {
                         now = time(NULL);
 

@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <new>
+#include <stdint.h>
 #include <sys/poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -661,6 +662,10 @@ struct SmbServer::Impl {
     // Соединение, которому принадлежит дескриптор. При разрыве освобождаются
     // только его дескрипторы, чужие остаются открытыми.
     smb2_context* owner = nullptr;
+    // Адрес context может быть повторно выдан malloc новому соединению.
+    // Поэтому владение переживших disconnect операций сверяется по отдельному
+    // монотонному идентификатору, а не по значению освобождённого указателя.
+    uint32_t ownerId = 0;
     // [MS-SMB2] связывает каждый открытый объект не только с Session, но и с
     // TreeConnect. TREE_DISCONNECT обязан закрыть только объекты этого дерева.
     uint32_t treeId = 0;
@@ -769,6 +774,7 @@ struct SmbServer::Impl {
     bool ipc = false;
     uint32_t id = 0;
     smb2_context* owner = nullptr;
+    uint32_t ownerId = 0;
   };
 
   // Payload уже скопирован в соответствующий фиксированный PSRAM-слот.
@@ -781,9 +787,7 @@ struct SmbServer::Impl {
     bool pendingSent = false;
     bool writeThrough = false;
     smb2_context* context = nullptr;
-    // Стабильный идентификатор владельца нужен после разрушения context. Сам
-    // указатель больше не разыменовывается, а только сопоставляется с handle.
-    smb2_context* owner = nullptr;
+    uint32_t ownerId = 0;
     uint64_t messageId = 0;
     uint64_t sequence = 0;
     int slot = -1;
@@ -804,7 +808,7 @@ struct SmbServer::Impl {
     bool cancelRequested = false;
     bool pendingSent = false;
     smb2_context* context = nullptr;
-    smb2_context* owner = nullptr;
+    uint32_t ownerId = 0;
     uint64_t messageId = 0;
     uint64_t sequence = 0;
     int slot = -1;
@@ -824,6 +828,7 @@ struct SmbServer::Impl {
   struct QueuedRead {
     QueuedRead* next = nullptr;
     smb2_context* context = nullptr;
+    uint32_t ownerId = 0;
     bool pendingSent = false;
     uint64_t messageId = 0;
     uint64_t sequence = 0;
@@ -853,6 +858,7 @@ struct SmbServer::Impl {
     bool cancelRequested = false;
     bool closeFailed = false;
     smb2_context* context = nullptr;
+    uint32_t ownerId = 0;
     uint64_t messageId = 0;
     uint64_t sequence = 0;
     int slot = -1;
@@ -885,7 +891,7 @@ struct SmbServer::Impl {
     bool inFlight = false;
     bool cancelRequested = false;
     smb2_context* context = nullptr;
-    smb2_context* owner = nullptr;
+    uint32_t ownerId = 0;
     uint64_t messageId = 0;
     uint64_t sequence = 0;
     uint64_t volumeId = 0;
@@ -920,7 +926,7 @@ struct SmbServer::Impl {
     bool cancelRequested = false;
     bool pendingSent = false;
     smb2_context* context = nullptr;
-    smb2_context* owner = nullptr;
+    uint32_t ownerId = 0;
     uint64_t messageId = 0;
     uint64_t sequence = 0;
     uint32_t generation = 0;
@@ -973,6 +979,7 @@ struct SmbServer::Impl {
         byteRangeLocks{},
         metadataUseCounter(0),
         generationCounter(1),
+        ownerIdCounter(1),
         activeSlot(-1),
         activeMode(ActiveMode::kNone),
         activeLogicalOffset(0),
@@ -1116,6 +1123,7 @@ struct SmbServer::Impl {
   ByteRangeLock byteRangeLocks[kByteRangeLockCount];
   uint32_t metadataUseCounter;
   uint32_t generationCounter;
+  uint32_t ownerIdCounter;
   int activeSlot;
   ActiveMode activeMode;
   uint32_t activeLogicalOffset;
@@ -1271,8 +1279,8 @@ struct SmbServer::Impl {
   bool hasAsyncWritesForHandle(int slot, uint32_t generation) const;
   bool hasPendingPhysicalWorkForHandle(int slot,
                                        uint32_t generation) const;
-  bool hasAsyncIoForOwner(smb2_context* owner) const;
-  void releaseDetachedOwnerIfIdle(smb2_context* owner);
+  bool hasAsyncIoForOwner(uint32_t ownerId) const;
+  void releaseDetachedOwnerIfIdle(uint32_t ownerId);
   bool drainAsyncWritesForHandle(int slot, uint32_t generation);
   bool asyncIoTimedOut() const;
   void discardAsyncReadData(int index);
@@ -1281,12 +1289,14 @@ struct SmbServer::Impl {
   void completeCancelledAsyncWrite(int index, bool closePhysical);
   void failAsyncReads(uint32_t status);
   void failAsyncWrites(uint32_t status);
-  void releaseClientHandles(smb2_context* owner);
+  void releaseClientHandles(smb2_context* owner, uint32_t detachedOwnerId);
   bool releaseTreeHandles(smb2_context* owner, uint32_t treeId);
   bool addClient(smb2_context* smb2);
   void forgetClient(smb2_context* smb2);
   bool knownClient(smb2_context* smb2) const;
   size_t clientCount() const;
+  static uint32_t contextOwnerId(smb2_context* smb2);
+  uint32_t allocateOwnerId();
   bool allocateDirectoryBatch();
   void releaseDirectoryBatch();
   void cleanupClient(smb2_context* smb2);
@@ -1621,11 +1631,12 @@ bool SmbServer::Impl::start(const uint8_t* payload, uint16_t length,
   makeServerInstanceGuid(server.guid);
   makeStableDiscoveryId(discoveryId);
   // libsmb2 увеличивает SessionId для последующих SESSION_SETUP; случайна
-  // только начальная точка данного запуска. TreeId и generationCounter далее
+  // только начальная точка данного запуска. Остальные идентификаторы далее
   // также работают как обычные монотонные счётчики внутри этого экземпляра.
   server.session_counter = randomSessionSeed();
   nextTreeId = randomNonzero32();
   generationCounter = randomNonzero32();
+  ownerIdCounter = randomNonzero32();
 
   lastServeResult = 0;
   taskAlive = true;
@@ -1742,7 +1753,7 @@ void SmbServer::Impl::taskLoop() {
       cleanupClient(clients[index]);
     }
   }
-  releaseClientHandles(nullptr);
+  releaseClientHandles(nullptr, 0);
   runningFlag = false;
   taskAlive = false;
   task = nullptr;
@@ -1756,6 +1767,14 @@ void SmbServer::Impl::newClient(smb2_context* smb2, void* context) {
     diagnosticLogEvent("SMB client-invalid");
     return;
   }
+  // Раньше отложенные операции запоминали адрес smb2_context как владельца.
+  // После destroy malloc мог выдать тот же адрес новому клиенту, и завершение
+  // старого WRITE освобождало уже его handle. Теперь context получает отдельный
+  // ownerId: адрес используется только пока соединение живо, а ownerId остаётся
+  // корректным до завершения всей отложенной работы.
+  const uint32_t ownerId = self->allocateOwnerId();
+  smb2_set_opaque(
+      smb2, reinterpret_cast<void*>(static_cast<uintptr_t>(ownerId)));
   // Физический канал к Z80 односессионный, но соединений поверх него может
   // быть несколько: Проводник копирует одним, а эскизы и типы файлов тянет
   // другими. Вытеснять предыдущее соединение нельзя — вместе с ним умирали
@@ -1769,9 +1788,10 @@ void SmbServer::Impl::newClient(smb2_context* smb2, void* context) {
   // здоров. Он открывает три рабочих процесса сразу, и прежний предел в
   // четыре места выбирался одним файловым менеджером.
   const bool registered = self->addClient(smb2);
-  diagnosticLogEvent("SMB client-accepted client=%p count=%u registered=%u",
-                     smb2, static_cast<unsigned>(self->clientCount()),
-                     registered ? 1U : 0U);
+  diagnosticLogEvent(
+      "SMB client-accepted client=%p owner=%lu count=%u registered=%u", smb2,
+      static_cast<unsigned long>(ownerId),
+      static_cast<unsigned>(self->clientCount()), registered ? 1U : 0U);
   // В серверной части libsmb2 6.1.0 расчёт pre-auth hash для SMB 3.1.1
   // пока несовместим с Windows: последний SESSION_SETUP получается с неверной
   // подписью, и Проводник показывает безликую ошибку 0x80004005. SMB 2.1,
@@ -1808,6 +1828,25 @@ void SmbServer::Impl::libraryError(smb2_context*, const char* message) {
   // RAM-кольцо и не трогает ни flash, ни двоичный UART-протокол.
   diagnosticLogEvent("SMB library-error %s",
                      message == nullptr ? "(null)" : message);
+}
+
+uint32_t SmbServer::Impl::contextOwnerId(smb2_context* smb2) {
+  if (smb2 == nullptr) {
+    return 0;
+  }
+  return static_cast<uint32_t>(
+      reinterpret_cast<uintptr_t>(smb2_get_opaque(smb2)));
+}
+
+uint32_t SmbServer::Impl::allocateOwnerId() {
+  uint32_t ownerId = 0;
+  do {
+    ownerId = ownerIdCounter++;
+    if (ownerIdCounter == 0) {
+      ownerIdCounter = 1;
+    }
+  } while (ownerId == 0);
+  return ownerId;
 }
 
 bool SmbServer::Impl::addClient(smb2_context* smb2) {
@@ -2385,6 +2424,7 @@ bool SmbServer::Impl::enqueueAsyncRead(smb2_context* context,
     return false;
   }
   pending->context = context;
+  pending->ownerId = contextOwnerId(context);
   pending->messageId = messageId;
   pending->sequence = sequence;
   pending->slot = slot;
@@ -2423,7 +2463,7 @@ bool SmbServer::Impl::beginAsyncRead(smb2_context* context,
   pending = {};
   pending.used = true;
   pending.context = context;
-  pending.owner = context;
+  pending.ownerId = handles[slot].ownerId;
   pending.messageId = messageId;
   pending.sequence = sequence;
   pending.slot = slot;
@@ -2458,6 +2498,7 @@ void SmbServer::Impl::promoteQueuedReads() {
         static_cast<size_t>(queued->slot) < kHandleCount &&
         handles[queued->slot].used &&
         handles[queued->slot].owner == queued->context &&
+        handles[queued->slot].ownerId == queued->ownerId &&
         handles[queued->slot].generation == queued->generation;
     if (!validHandle) {
       const bool replyQueued = queueAsyncStatus(
@@ -2585,7 +2626,8 @@ int SmbServer::Impl::findReadyAsyncRead() const {
       continue;
     }
     const Handle& handle = handles[pending.slot];
-    if (!handle.used || pending.generation != handle.generation) {
+    if (!handle.used || pending.generation != handle.generation ||
+        pending.ownerId != handle.ownerId) {
       continue;
     }
     if (pending.sequence < oldestSequence) {
@@ -2611,7 +2653,8 @@ int SmbServer::Impl::findReadyAsyncWrite() const {
       continue;
     }
     const Handle& handle = handles[pending.slot];
-    if (!handle.used || pending.generation != handle.generation) {
+    if (!handle.used || pending.generation != handle.generation ||
+        pending.ownerId != handle.ownerId) {
       continue;
     }
     if (pending.sequence < oldestSequence) {
@@ -2665,43 +2708,68 @@ bool SmbServer::Impl::hasPendingPhysicalWorkForHandle(
   return false;
 }
 
-bool SmbServer::Impl::hasAsyncIoForOwner(smb2_context* owner) const {
-  if (owner == nullptr) {
+bool SmbServer::Impl::hasAsyncIoForOwner(uint32_t ownerId) const {
+  if (ownerId == 0) {
     return false;
   }
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
-    if ((asyncReads[index].used && asyncReads[index].owner == owner) ||
-        (asyncWrites[index].used && asyncWrites[index].owner == owner)) {
+    if ((asyncReads[index].used && asyncReads[index].ownerId == ownerId) ||
+        (asyncWrites[index].used && asyncWrites[index].ownerId == ownerId)) {
       return true;
     }
   }
   for (const QueuedRead* pending = queuedReadHead; pending != nullptr;
        pending = pending->next) {
-    if (pending->context == owner) {
+    if (pending->ownerId == ownerId) {
+      return true;
+    }
+  }
+  for (const AsyncDirectory& pending : asyncDirectories) {
+    if (pending.used && pending.ownerId == ownerId) {
       return true;
     }
   }
   for (const AsyncCreate& pending : asyncCreates) {
-    if (pending.used && pending.owner == owner) {
+    if (pending.used && pending.ownerId == ownerId) {
       return true;
     }
   }
   for (const AsyncClose& pending : asyncCloses) {
-    if (pending.used && pending.owner == owner) {
+    if (pending.used && pending.ownerId == ownerId) {
       return true;
     }
   }
   return false;
 }
 
-void SmbServer::Impl::releaseDetachedOwnerIfIdle(smb2_context* owner) {
-  if (owner == nullptr || hasAsyncIoForOwner(owner)) {
+void SmbServer::Impl::releaseDetachedOwnerIfIdle(uint32_t ownerId) {
+  if (ownerId == 0 || hasAsyncIoForOwner(ownerId)) {
     return;
   }
-  // owner используется только как идентификатор; разрушенный smb2_context
-  // здесь не разыменовывается.
-  releaseClientHandles(owner);
-  diagnosticLogEvent("SMB cleanup-deferred done");
+  bool hasDetachedResources = false;
+  for (const Handle& handle : handles) {
+    if (handle.used && handle.owner == nullptr && handle.ownerId == ownerId) {
+      hasDetachedResources = true;
+      break;
+    }
+  }
+  if (!hasDetachedResources) {
+    for (const Tree& tree : trees) {
+      if (tree.used && tree.owner == nullptr && tree.ownerId == ownerId) {
+        hasDetachedResources = true;
+        break;
+      }
+    }
+  }
+  if (!hasDetachedResources) {
+    return;
+  }
+  // Раньше сюда передавался уже освобождённый smb2_context*. Даже без
+  // разыменования его адрес мог совпасть с новым context. Теперь освобождаем
+  // только отвязанные handle/tree с неизменным ownerId старого соединения.
+  releaseClientHandles(nullptr, ownerId);
+  diagnosticLogEvent("SMB cleanup-deferred done owner=%lu",
+                     static_cast<unsigned long>(ownerId));
 }
 
 bool SmbServer::Impl::drainAsyncWritesForHandle(int slot,
@@ -2785,7 +2853,7 @@ void SmbServer::Impl::completeAsyncReadWithStatus(int index, uint32_t status,
 
   AsyncRead& pending = asyncReads[index];
   smb2_context* const context = pending.context;
-  smb2_context* const owner = pending.owner;
+  const uint32_t ownerId = pending.ownerId;
   const uint64_t messageId = pending.messageId;
   const bool detached = context == nullptr;
   if (activeAsyncRead == index) {
@@ -2804,7 +2872,7 @@ void SmbServer::Impl::completeAsyncReadWithStatus(int index, uint32_t status,
       context == nullptr || queueAsyncStatus(context, SMB2_READ, status,
                                              messageId);
   if (detached) {
-    releaseDetachedOwnerIfIdle(owner);
+    releaseDetachedOwnerIfIdle(ownerId);
   }
   if (!replyQueued) {
     smb2_close_context(context);
@@ -2819,7 +2887,7 @@ void SmbServer::Impl::completeCancelledAsyncWrite(int index,
   }
   AsyncWrite& pending = asyncWrites[index];
   smb2_context* const context = pending.context;
-  smb2_context* const owner = pending.owner;
+  const uint32_t ownerId = pending.ownerId;
   const uint64_t messageId = pending.messageId;
   const bool needsReply = context != nullptr && !pending.replied;
   const bool detached = context == nullptr;
@@ -2842,7 +2910,7 @@ void SmbServer::Impl::completeCancelledAsyncWrite(int index,
     smb2_close_context(context);
   }
   if (detached) {
-    releaseDetachedOwnerIfIdle(owner);
+    releaseDetachedOwnerIfIdle(ownerId);
   }
 }
 
@@ -2868,12 +2936,27 @@ void SmbServer::Impl::failAsyncReads(uint32_t status) {
   }
   discardAsyncReadData(activeAsyncRead);
   smb2_context* contextToClose = nullptr;
+  uint32_t detachedOwnerIds[kAsyncIoQueueDepth] = {};
+  size_t detachedOwnerCount = 0;
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     AsyncRead& pending = asyncReads[index];
     if (!pending.used) {
       continue;
     }
     smb2_context* const context = pending.context;
+    if (context == nullptr && pending.ownerId != 0) {
+      bool remembered = false;
+      for (size_t ownerIndex = 0; ownerIndex < detachedOwnerCount;
+           ++ownerIndex) {
+        remembered = detachedOwnerIds[ownerIndex] == pending.ownerId;
+        if (remembered) {
+          break;
+        }
+      }
+      if (!remembered) {
+        detachedOwnerIds[detachedOwnerCount++] = pending.ownerId;
+      }
+    }
     const uint64_t messageId = pending.messageId;
     pending = {};
     restoreServerCreditsIfIoIdle(context);
@@ -2886,6 +2969,9 @@ void SmbServer::Impl::failAsyncReads(uint32_t status) {
   asyncReadCount = 0;
   failQueuedReads(status);
   closeActive(false);
+  for (size_t index = 0; index < detachedOwnerCount; ++index) {
+    releaseDetachedOwnerIfIdle(detachedOwnerIds[index]);
+  }
   if (contextToClose != nullptr) {
     smb2_close_context(contextToClose);
   }
@@ -2906,6 +2992,8 @@ void SmbServer::Impl::failAsyncWrites(uint32_t status) {
     return;
   }
   smb2_context* contextToClose = nullptr;
+  uint32_t detachedOwnerIds[kAsyncIoQueueDepth] = {};
+  size_t detachedOwnerCount = 0;
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     AsyncWrite& pending = asyncWrites[index];
     if (!pending.used) {
@@ -2918,6 +3006,19 @@ void SmbServer::Impl::failAsyncWrites(uint32_t status) {
       handles[pending.slot].failed = true;
     }
     smb2_context* const context = pending.context;
+    if (context == nullptr && pending.ownerId != 0) {
+      bool remembered = false;
+      for (size_t ownerIndex = 0; ownerIndex < detachedOwnerCount;
+           ++ownerIndex) {
+        remembered = detachedOwnerIds[ownerIndex] == pending.ownerId;
+        if (remembered) {
+          break;
+        }
+      }
+      if (!remembered) {
+        detachedOwnerIds[detachedOwnerCount++] = pending.ownerId;
+      }
+    }
     const uint64_t messageId = pending.messageId;
     const bool needsReply = context != nullptr && !pending.replied;
     pending = {};
@@ -2930,6 +3031,9 @@ void SmbServer::Impl::failAsyncWrites(uint32_t status) {
   activeAsyncWrite = -1;
   asyncWriteCount = 0;
   closeActive(false);
+  for (size_t index = 0; index < detachedOwnerCount; ++index) {
+    releaseDetachedOwnerIfIdle(detachedOwnerIds[index]);
+  }
   if (contextToClose != nullptr) {
     smb2_close_context(contextToClose);
   }
@@ -2968,6 +3072,10 @@ void SmbServer::Impl::releaseDirectoryBatch() {
 
 
 uint32_t SmbServer::Impl::allocateTree(bool ipc, smb2_context* owner) {
+  const uint32_t ownerId = contextOwnerId(owner);
+  if (owner == nullptr || ownerId == 0) {
+    return 0;
+  }
   size_t slot = kTreeCount;
   for (size_t index = 0; index < kTreeCount; ++index) {
     if (!trees[index].used) {
@@ -2991,6 +3099,7 @@ uint32_t SmbServer::Impl::allocateTree(bool ipc, smb2_context* owner) {
   trees[slot].ipc = ipc;
   trees[slot].id = id;
   trees[slot].owner = owner;
+  trees[slot].ownerId = ownerId;
   return id;
 }
 
@@ -3016,7 +3125,9 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
   if (smb2 == nullptr) {
     return;
   }
-  diagnosticLogEvent("SMB cleanup-owner client=%p count=%u known=%u", smb2,
+  const uint32_t ownerId = contextOwnerId(smb2);
+  diagnosticLogEvent("SMB cleanup-owner client=%p owner=%lu count=%u known=%u",
+                     smb2, static_cast<unsigned long>(ownerId),
                      static_cast<unsigned>(clientCount()),
                      knownClient(smb2) ? 1U : 0U);
   // Эти запросы ещё синхронны и не владеют PSRAM/VFS. При разрушении transport
@@ -3026,14 +3137,12 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
   dropAsyncCreatesForOwner(smb2);
   dropAsyncClosesForOwner(smb2);
   dropNotifiesForOwner(smb2);
-  bool hadAsyncIo = hasAsyncIoForOwner(smb2);
   for (size_t index = 0; index < kAsyncIoQueueDepth; ++index) {
     AsyncRead& pending = asyncReads[index];
     if (!pending.used || pending.context != smb2) {
       continue;
     }
     if (activeAsyncRead == static_cast<int>(index) || pending.inFlight) {
-      hadAsyncIo = true;
       pending.context = nullptr;
       pending.cancelRequested = true;
       continue;
@@ -3054,7 +3163,6 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
     if (!pending.used || pending.context != smb2) {
       continue;
     }
-    hadAsyncIo = true;
     // Все уже принятые payload находятся в независимых PSRAM-слотах. После
     // разрыва соединения дописываем их на SD до согласованной границы окна,
     // хотя отправить финальный SMB-ответ уже невозможно.
@@ -3062,7 +3170,25 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
     pending.replied = true;
     pending.cancelRequested = false;
   }
+  // Считаем после удаления ещё не запущенных READ/CLOSE: если переживающей
+  // context работы уже нет, ждать некого и ресурсы надо освободить сразу.
+  const bool hadAsyncIo = hasAsyncIoForOwner(ownerId);
   if (hadAsyncIo) {
+    // Раньше handle/tree сохраняли освобождённый smb2_context* как метку
+    // владельца до конца асинхронного WRITE. Если malloc повторно выдавал этот
+    // адрес, поздняя очистка могла захватить ресурсы нового клиента. Теперь до
+    // destroy убираем сырой указатель, но сохраняем ownerId; завершение VFS
+    // освободит только ресурсы с этим числовым идентификатором.
+    for (Handle& handle : handles) {
+      if (handle.used && handle.owner == smb2 && handle.ownerId == ownerId) {
+        handle.owner = nullptr;
+      }
+    }
+    for (Tree& tree : trees) {
+      if (tree.used && tree.owner == smb2 && tree.ownerId == ownerId) {
+        tree.owner = nullptr;
+      }
+    }
     // Core 1 ещё владеет UART и одним из колец. Окончательную очистку выполнит
     // serviceHandler после возврата текущего VFS-окна. Даже ещё не запущенный
     // READ нельзя убирать общим resetAsyncIo(): рядом может выполняться запрос
@@ -3072,7 +3198,7 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
     diagnosticLogEvent("SMB cleanup-deferred async-io");
     return;
   }
-  releaseClientHandles(smb2);
+  releaseClientHandles(smb2, ownerId);
   forgetClient(smb2);
   // Следующий клиент начинает с чистого поля индикации, а дедупликация не
   // должна проглотить его первое событие из-за совпадения с прошлым сеансом.
@@ -3085,16 +3211,30 @@ void SmbServer::Impl::cleanupClient(smb2_context* smb2) {
                      static_cast<unsigned>(clientCount()));
 }
 
-// Освобождает имущество одного соединения. owner == nullptr означает уборку
-// осиротевших дескрипторов: их владелец уже ушёл, а отложенный обмен на core 1
-// закончился только сейчас.
-void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
+// Освобождает имущество одного соединения. Раньше owner == nullptr искал
+// «осиротевшие» ресурсы через !knownClient(resource.owner), то есть сравнивал
+// адреса уже уничтоженных contexts. Теперь live owner сверяется одновременно
+// по указателю и ownerId, а отложенная очистка — только по detachedOwnerId и
+// заранее обнулённому указателю. Нулевые оба аргумента означают общую уборку
+// всех уже отвязанных ресурсов при остановке сервера.
+void SmbServer::Impl::releaseClientHandles(smb2_context* owner,
+                                           uint32_t detachedOwnerId) {
+  const uint32_t liveOwnerId = contextOwnerId(owner);
+  auto belongsToOwner = [&](smb2_context* resourceOwner,
+                            uint32_t resourceOwnerId) {
+    if (owner != nullptr) {
+      return resourceOwner == owner && resourceOwnerId == liveOwnerId;
+    }
+    if (detachedOwnerId != 0) {
+      return resourceOwner == nullptr && resourceOwnerId == detachedOwnerId;
+    }
+    return resourceOwner == nullptr;
+  };
   // Физический файл на Z80 закрываем только если он принадлежал уходящему
   // соединению: чужое чтение посреди окна прерывать нельзя.
   if (activeSlot >= 0 && static_cast<size_t>(activeSlot) < kHandleCount) {
     const Handle& active = handles[activeSlot];
-    const bool mine = owner != nullptr ? active.owner == owner
-                                       : !knownClient(active.owner);
+    const bool mine = belongsToOwner(active.owner, active.ownerId);
     if (active.used && mine) {
       closeActive(true);
     }
@@ -3104,13 +3244,14 @@ void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
     if (!handle.used) {
       continue;
     }
-    const bool mine = owner != nullptr ? handle.owner == owner
-                                       : !knownClient(handle.owner);
+    const bool mine = belongsToOwner(handle.owner, handle.ownerId);
     if (!mine) {
       continue;
     }
-    cancelNotifiesForHandle(handle.owner, static_cast<int>(index),
-                            handle.generation, SMB2_STATUS_CANCELLED);
+    if (handle.owner != nullptr) {
+      cancelNotifiesForHandle(handle.owner, static_cast<int>(index),
+                              handle.generation, SMB2_STATUS_CANCELLED);
+    }
     if (handle.deletePending && strcmp(handle.path, "/") != 0) {
       removePath(handle.path);
     } else if (handle.metadataDirty) {
@@ -3133,13 +3274,18 @@ void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
     if (!tree.used) {
       continue;
     }
-    const bool mine = owner != nullptr ? tree.owner == owner
-                                       : !knownClient(tree.owner);
+    const bool mine = belongsToOwner(tree.owner, tree.ownerId);
     if (mine) {
       memset(&tree, 0, sizeof(tree));
     }
   }
-  if (activeAsyncRead < 0 && activeAsyncWrite < 0 &&
+  // Раньше проверялись только active-индексы. Между физическими окнами они
+  // равны -1 даже при наличии очереди другого отключившегося клиента, поэтому
+  // resetAsyncIo() мог стереть его ещё не дописанные WRITE. Теперь общий reset
+  // разрешён лишь когда пусты и активные операции, и все очереди.
+  if (queuedReadCount == 0 && asyncReadCount == 0 && asyncWriteCount == 0 &&
+      asyncDirectoryCount == 0 && asyncCreateCount == 0 &&
+      asyncCloseCount == 0 && activeAsyncRead < 0 && activeAsyncWrite < 0 &&
       activeAsyncDirectory < 0 && activeAsyncCreate < 0 &&
       activeAsyncClose < 0 &&
       clientCount() == 0) {
@@ -3149,7 +3295,8 @@ void SmbServer::Impl::releaseClientHandles(smb2_context* owner) {
 
 bool SmbServer::Impl::releaseTreeHandles(smb2_context* owner,
                                          uint32_t treeId) {
-  if (owner == nullptr || treeId == 0) {
+  const uint32_t ownerId = contextOwnerId(owner);
+  if (owner == nullptr || ownerId == 0 || treeId == 0) {
     return false;
   }
 
@@ -3166,6 +3313,7 @@ bool SmbServer::Impl::releaseTreeHandles(smb2_context* owner,
         static_cast<size_t>(current->slot) < kHandleCount &&
         handles[current->slot].used &&
         handles[current->slot].owner == owner &&
+        handles[current->slot].ownerId == ownerId &&
         handles[current->slot].treeId == treeId &&
         handles[current->slot].generation == current->generation;
     if (!matches) {
@@ -3206,7 +3354,8 @@ bool SmbServer::Impl::releaseTreeHandles(smb2_context* owner,
       continue;
     }
     const Handle& handle = handles[pending.slot];
-    if (handle.used && handle.owner == owner && handle.treeId == treeId &&
+    if (handle.used && handle.owner == owner && handle.ownerId == ownerId &&
+        handle.treeId == treeId &&
         handle.generation == pending.generation) {
       pending.cancelRequested = true;
     }
@@ -3221,7 +3370,8 @@ bool SmbServer::Impl::releaseTreeHandles(smb2_context* owner,
         continue;
       }
       const Handle& handle = handles[pending.slot];
-      if (handle.used && handle.owner == owner && handle.treeId == treeId &&
+      if (handle.used && handle.owner == owner && handle.ownerId == ownerId &&
+          handle.treeId == treeId &&
           handle.generation == pending.generation) {
         pendingTreeRead = true;
         break;
@@ -3244,7 +3394,8 @@ bool SmbServer::Impl::releaseTreeHandles(smb2_context* owner,
   // финализацию открытого объекта, что на CLOSE.
   for (size_t index = 0; index < kHandleCount; ++index) {
     Handle& handle = handles[index];
-    if (!handle.used || handle.owner != owner || handle.treeId != treeId) {
+    if (!handle.used || handle.owner != owner || handle.ownerId != ownerId ||
+        handle.treeId != treeId) {
       continue;
     }
     const int slot = static_cast<int>(index);
@@ -4653,7 +4804,8 @@ bool SmbServer::Impl::makeInfoName(const Handle& handle) {
 }
 
 int SmbServer::Impl::allocateHandle(smb2_context* owner, uint32_t treeId) {
-  if (owner == nullptr || treeId == 0) {
+  const uint32_t ownerId = contextOwnerId(owner);
+  if (owner == nullptr || ownerId == 0 || treeId == 0) {
     return -1;
   }
   for (size_t index = 0; index < kHandleCount; ++index) {
@@ -4665,6 +4817,7 @@ int SmbServer::Impl::allocateHandle(smb2_context* owner, uint32_t treeId) {
     memset(&handle, 0, sizeof(handle));
     handle.used = true;
     handle.owner = owner;
+    handle.ownerId = ownerId;
     handle.treeId = treeId;
     handle.generation = generationCounter++;
     if (generationCounter == 0) {
@@ -4682,7 +4835,8 @@ int SmbServer::Impl::allocateHandle(smb2_context* owner, uint32_t treeId) {
 
 SmbServer::Impl::Handle* SmbServer::Impl::findHandle(
     smb2_context* owner, const uint8_t fileId[SMB2_FD_SIZE], int* slot) {
-  if (owner == nullptr || fileId == nullptr) {
+  const uint32_t ownerId = contextOwnerId(owner);
+  if (owner == nullptr || ownerId == 0 || fileId == nullptr) {
     return nullptr;
   }
   int found = -1;
@@ -4694,6 +4848,7 @@ SmbServer::Impl::Handle* SmbServer::Impl::findHandle(
   }
   if (found < 0 || static_cast<size_t>(found) >= kHandleCount ||
       !handles[found].used || handles[found].owner != owner ||
+      handles[found].ownerId != ownerId ||
       handles[found].treeId != smb2_get_current_tree_id(owner) ||
       memcmp(handles[found].fileId, fileId, SMB2_FD_SIZE) != 0) {
     return nullptr;
@@ -5410,7 +5565,8 @@ void SmbServer::Impl::pollAsyncRead() {
                              static_cast<size_t>(current.slot) < kHandleCount &&
                              handles[current.slot].used &&
                              handles[current.slot].generation ==
-                                 current.generation
+                                 current.generation &&
+                             handles[current.slot].ownerId == current.ownerId
                          ? &handles[current.slot]
                          : nullptr;
 
@@ -5573,7 +5729,8 @@ void SmbServer::Impl::pollAsyncRead() {
         pending.slot >= 0 &&
         static_cast<size_t>(pending.slot) < kHandleCount &&
         handles[pending.slot].used &&
-        handles[pending.slot].generation == pending.generation;
+        handles[pending.slot].generation == pending.generation &&
+        handles[pending.slot].ownerId == pending.ownerId;
     if (pending.cancelRequested || !validHandle) {
       completeAsyncReadWithStatus(
           static_cast<int>(index),
@@ -5627,7 +5784,9 @@ void SmbServer::Impl::pollAsyncWrite() {
                                  kHandleCount &&
                              handles[completed.slot].used &&
                              handles[completed.slot].generation ==
-                                 completed.generation
+                                 completed.generation &&
+                             handles[completed.slot].ownerId ==
+                                 completed.ownerId
                          ? &handles[completed.slot]
                          : nullptr;
     const uint32_t transferred = static_cast<uint32_t>(minimum(
@@ -5663,15 +5822,10 @@ void SmbServer::Impl::pollAsyncWrite() {
         completeCancelledAsyncWrite(completedIndex, true);
         return;
       }
-      const bool detached = completed.context == nullptr;
       const uint32_t status =
           result.status != 0 ? smbStatusFromFilex(result.status)
                              : SMB2_STATUS_IO_DEVICE_ERROR;
       failAsyncWrites(status);
-      if (detached) {
-        releaseClientHandles(nullptr);
-        diagnosticLogEvent("SMB cleanup-deferred done");
-      }
       return;
     }
 
@@ -5712,7 +5866,7 @@ void SmbServer::Impl::pollAsyncWrite() {
     if (finished) {
       const bool detached = completed.context == nullptr;
       smb2_context* const completedContext = completed.context;
-      smb2_context* const owner = completed.owner;
+      const uint32_t ownerId = completed.ownerId;
       sendOperation("WRITE", handle->path);
       notifyChange(handle->path, SMB2_NOTIFY_CHANGE_FILE_ACTION_MODIFIED,
                    SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_SIZE |
@@ -5724,7 +5878,7 @@ void SmbServer::Impl::pollAsyncWrite() {
       restoreServerCreditsIfIoIdle(completedContext);
       if (detached) {
         closeActive(true);
-        releaseDetachedOwnerIfIdle(owner);
+        releaseDetachedOwnerIfIdle(ownerId);
       }
     }
   }
@@ -5796,6 +5950,7 @@ bool SmbServer::Impl::enqueueAsyncDirectory(
   pending = {};
   pending.used = true;
   pending.context = context;
+  pending.ownerId = contextOwnerId(context);
   pending.messageId = messageId;
   pending.sequence = nextAsyncVfsSequence();
   pending.slot = slot;
@@ -5859,6 +6014,8 @@ void SmbServer::Impl::completeAsyncDirectory(int index, uint32_t status) {
   }
   AsyncDirectory& pending = asyncDirectories[index];
   smb2_context* context = pending.context;
+  const uint32_t ownerId = pending.ownerId;
+  const bool detached = context == nullptr;
   const bool queued = context != nullptr &&
                       queueAsyncStatus(context, SMB2_QUERY_DIRECTORY, status,
                                        pending.messageId);
@@ -5871,6 +6028,9 @@ void SmbServer::Impl::completeAsyncDirectory(int index, uint32_t status) {
   }
   if (context != nullptr && !queued) {
     smb2_close_context(context);
+  }
+  if (detached) {
+    releaseDetachedOwnerIfIdle(ownerId);
   }
 }
 
@@ -5968,7 +6128,7 @@ bool SmbServer::Impl::enqueueAsyncCreate(
   pending = {};
   pending.used = true;
   pending.context = context;
-  pending.owner = context;
+  pending.ownerId = contextOwnerId(context);
   pending.messageId = messageId;
   pending.sequence = nextAsyncVfsSequence();
   pending.volumeId = volumeId;
@@ -5992,7 +6152,8 @@ bool SmbServer::Impl::queueAsyncCreateReply(AsyncCreate& pending) {
     return false;
   }
   const Tree* tree = findTree(pending.treeId);
-  if (tree == nullptr || tree->owner != pending.context) {
+  if (tree == nullptr || tree->owner != pending.context ||
+      tree->ownerId != pending.ownerId) {
     return false;
   }
   const int slot = allocateHandle(pending.context, pending.treeId);
@@ -6053,7 +6214,7 @@ void SmbServer::Impl::completeAsyncCreate(int index, uint32_t status) {
   }
   AsyncCreate& pending = asyncCreates[index];
   smb2_context* const context = pending.context;
-  smb2_context* const owner = pending.owner;
+  const uint32_t ownerId = pending.ownerId;
   const uint64_t messageId = pending.messageId;
   const bool detached = context == nullptr;
   pending = {};
@@ -6069,7 +6230,7 @@ void SmbServer::Impl::completeAsyncCreate(int index, uint32_t status) {
     smb2_close_context(context);
   }
   if (detached) {
-    releaseDetachedOwnerIfIdle(owner);
+    releaseDetachedOwnerIfIdle(ownerId);
   }
 }
 
@@ -6169,13 +6330,13 @@ void SmbServer::Impl::pollAsyncCreate() {
     activeVfsOffset = 0;
   };
   auto discardDetached = [&]() {
-    smb2_context* const owner = pending.owner;
+    const uint32_t ownerId = pending.ownerId;
     pending = {};
     if (asyncCreateCount != 0) {
       --asyncCreateCount;
     }
     activeAsyncCreate = -1;
-    releaseDetachedOwnerIfIdle(owner);
+    releaseDetachedOwnerIfIdle(ownerId);
   };
   auto submit = [&](VfsOperation operation, const char* path) -> bool {
     if (bridge.requestPending()) {
@@ -6288,7 +6449,8 @@ void SmbServer::Impl::pollAsyncCreate() {
     return;
   }
   const Tree* tree = findTree(pending.treeId);
-  if (tree == nullptr || tree->owner != pending.context) {
+  if (tree == nullptr || tree->owner != pending.context ||
+      tree->ownerId != pending.ownerId) {
     completeAsyncCreate(index, SMB2_STATUS_NETWORK_NAME_DELETED);
     return;
   }
@@ -6342,7 +6504,7 @@ bool SmbServer::Impl::enqueueAsyncClose(smb2_context* context,
   pending = {};
   pending.used = true;
   pending.context = context;
-  pending.owner = context;
+  pending.ownerId = handles[slot].ownerId;
   pending.messageId = messageId;
   pending.sequence = nextAsyncVfsSequence();
   pending.generation = generation;
@@ -6369,7 +6531,7 @@ bool SmbServer::Impl::enqueueAsyncFlush(smb2_context* context,
   pending = {};
   pending.used = true;
   pending.context = context;
-  pending.owner = context;
+  pending.ownerId = handles[slot].ownerId;
   pending.messageId = messageId;
   pending.sequence = nextAsyncVfsSequence();
   pending.generation = generation;
@@ -6411,7 +6573,7 @@ bool SmbServer::Impl::enqueueAsyncSetEof(smb2_context* context,
   pending = {};
   pending.used = true;
   pending.context = context;
-  pending.owner = context;
+  pending.ownerId = handles[slot].ownerId;
   pending.messageId = messageId;
   pending.sequence = nextAsyncVfsSequence();
   pending.generation = generation;
@@ -6449,7 +6611,7 @@ void SmbServer::Impl::completeAsyncClose(int index, uint32_t status,
   }
   AsyncClose& pending = asyncCloses[index];
   smb2_context* const context = pending.context;
-  smb2_context* const owner = pending.owner;
+  const uint32_t ownerId = pending.ownerId;
   const uint64_t messageId = pending.messageId;
   const bool detached = context == nullptr;
   pending = {};
@@ -6477,7 +6639,7 @@ void SmbServer::Impl::completeAsyncClose(int index, uint32_t status,
     smb2_close_context(context);
   }
   if (detached) {
-    releaseDetachedOwnerIfIdle(owner);
+    releaseDetachedOwnerIfIdle(ownerId);
   }
 }
 
@@ -6488,7 +6650,7 @@ void SmbServer::Impl::completeAsyncSetEof(int index, uint32_t status) {
   }
   AsyncClose& pending = asyncCloses[index];
   smb2_context* const context = pending.context;
-  smb2_context* const owner = pending.owner;
+  const uint32_t ownerId = pending.ownerId;
   const uint64_t messageId = pending.messageId;
   const bool detached = context == nullptr;
   pending = {};
@@ -6509,7 +6671,7 @@ void SmbServer::Impl::completeAsyncSetEof(int index, uint32_t status) {
     smb2_close_context(context);
   }
   if (detached) {
-    releaseDetachedOwnerIfIdle(owner);
+    releaseDetachedOwnerIfIdle(ownerId);
   }
 }
 
@@ -6520,7 +6682,7 @@ void SmbServer::Impl::completeAsyncFlush(int index, uint32_t status) {
   }
   AsyncClose& pending = asyncCloses[index];
   smb2_context* const context = pending.context;
-  smb2_context* const owner = pending.owner;
+  const uint32_t ownerId = pending.ownerId;
   const uint64_t messageId = pending.messageId;
   const bool detached = context == nullptr;
   pending = {};
@@ -6541,22 +6703,23 @@ void SmbServer::Impl::completeAsyncFlush(int index, uint32_t status) {
     smb2_close_context(context);
   }
   if (detached) {
-    releaseDetachedOwnerIfIdle(owner);
+    releaseDetachedOwnerIfIdle(ownerId);
   }
 }
 
 void SmbServer::Impl::dropAsyncClosesForOwner(smb2_context* owner) {
-  if (owner == nullptr) {
+  const uint32_t ownerId = contextOwnerId(owner);
+  if (ownerId == 0) {
     return;
   }
   for (size_t index = 0; index < kAsyncCloseQueueDepth; ++index) {
     AsyncClose& pending = asyncCloses[index];
-    if (!pending.used || pending.owner != owner) {
+    if (!pending.used || pending.ownerId != ownerId) {
       continue;
     }
     if (activeAsyncClose == static_cast<int>(index) && pending.inFlight) {
       // Core 1 ещё использует общий Exchange. Слот освободит pollAsyncClose
-      // после получения результата; owner остаётся только идентификатором.
+      // после получения результата; ownerId остаётся стабильной меткой.
       pending.context = nullptr;
       pending.cancelRequested = true;
       continue;
@@ -6574,7 +6737,7 @@ void SmbServer::Impl::dropAsyncClosesForOwner(smb2_context* owner) {
 bool SmbServer::Impl::cancelAsyncClose(smb2_context* owner,
                                        uint64_t messageId) {
   for (AsyncClose& pending : asyncCloses) {
-    if (pending.used && pending.owner == owner &&
+    if (pending.used && pending.context == owner &&
         pending.messageId == messageId) {
       pending.cancelRequested = true;
       return true;
@@ -6626,7 +6789,9 @@ void SmbServer::Impl::pollAsyncClose() {
       static_cast<size_t>(pending.slot) >= kHandleCount ||
       !handles[pending.slot].used ||
       handles[pending.slot].generation != pending.generation ||
-      handles[pending.slot].owner != pending.owner) {
+      handles[pending.slot].ownerId != pending.ownerId ||
+      (pending.context != nullptr &&
+       handles[pending.slot].owner != pending.context)) {
     if (pending.phase == AsyncClosePhase::kClose) {
       completeAsyncClose(index, SMB2_STATUS_FILE_CLOSED);
     } else if (pending.phase == AsyncClosePhase::kFlush) {
@@ -6876,7 +7041,9 @@ void SmbServer::Impl::pollAsyncDirectory() {
       return nullptr;
     }
     Handle& handle = handles[pending.slot];
-    return handle.used && handle.owner == pending.context &&
+    return handle.used && handle.ownerId == pending.ownerId &&
+                   (pending.context == nullptr ||
+                    handle.owner == pending.context) &&
                    handle.generation == pending.generation
                ? &handle
                : nullptr;
@@ -6911,6 +7078,7 @@ void SmbServer::Impl::pollAsyncDirectory() {
     pending.inFlight = false;
     pending.lastProgressMs = millis();
     if (pending.context == nullptr || pending.replied) {
+      const uint32_t ownerId = pending.ownerId;
       activeSlot = -1;
       activeMode = ActiveMode::kNone;
       pending = {};
@@ -6918,6 +7086,7 @@ void SmbServer::Impl::pollAsyncDirectory() {
         --asyncDirectoryCount;
       }
       activeAsyncDirectory = -1;
+      releaseDetachedOwnerIfIdle(ownerId);
       return;
     }
     Handle* handle = validHandle();
@@ -7269,7 +7438,7 @@ int SmbServer::Impl::logoffHandler(smb2_server* serverValue,
     // остаётся в списке, и новый SESSION_SETUP на нём снова пройдёт обычную
     // авторизацию. Освобождаем только файлы и деревья этого соединения —
     // соседние сеансы Проводника продолжают работать.
-    self->releaseClientHandles(smb2);
+    self->releaseClientHandles(smb2, self->contextOwnerId(smb2));
     self->sendClientEvent(1);
     self->sendOperation("LOGOFF");
   }
@@ -7319,7 +7488,8 @@ int SmbServer::Impl::treeDisconnectHandler(smb2_server* serverValue,
                                            uint32_t treeId) {
   Impl* self = from(serverValue);
   const Tree* tree = self == nullptr ? nullptr : self->findTree(treeId);
-  if (tree == nullptr || tree->owner != smb2) {
+  if (tree == nullptr || tree->owner != smb2 ||
+      tree->ownerId != self->contextOwnerId(smb2)) {
     return replyStatus(smb2, SMB2_TREE_DISCONNECT,
                        SMB2_STATUS_NETWORK_NAME_DELETED);
   }
@@ -7352,7 +7522,8 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
       request->name == nullptr ? "(null)" : request->name);
   const uint32_t treeId = smb2_get_current_tree_id(smb2);
   const Tree* tree = self->findTree(treeId);
-  if (tree == nullptr || tree->owner != smb2) {
+  if (tree == nullptr || tree->owner != smb2 ||
+      tree->ownerId != self->contextOwnerId(smb2)) {
     return createStatus(smb2, request, SMB2_STATUS_NETWORK_NAME_DELETED);
   }
   if (tree->ipc) {
@@ -8163,7 +8334,7 @@ int SmbServer::Impl::writeHandler(smb2_server* serverValue,
     pending.writeThrough =
         (request->flags & SMB2_WRITEFLAG_WRITE_THROUGH) != 0;
     pending.context = smb2;
-    pending.owner = smb2;
+    pending.ownerId = handle->ownerId;
     pending.messageId = messageId;
     pending.sequence = self->nextAsyncVfsSequence();
     pending.slot = slot;
