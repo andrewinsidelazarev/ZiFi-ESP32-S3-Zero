@@ -28,18 +28,6 @@ class Z80Simulator {
   void setDirectoryDelay(unsigned milliseconds) {
     directoryDelayMs_ = milliseconds;
   }
-  // Отдельная задержка SET_EOF позволяет проверить SMB2 STATUS_PENDING, не
-  // замедляя WRITE/READ того же теста.
-  void setSetEofDelay(unsigned milliseconds) {
-    setEofDelayMs_ = milliseconds;
-  }
-  // Задерживаем только WRITE_AT, начинающиеся с заданного смещения. Так первые
-  // 4 МиБ проходят быстро, а очередь непосредственно за CopyFile-границей
-  // остаётся незавершённой к моменту промежуточного FLUSH.
-  void setWriteDelay(unsigned milliseconds, uint32_t minimumOffset) {
-    writeDelayMs_ = milliseconds;
-    writeDelayOffset_ = minimumOffset;
-  }
 
 
  private:
@@ -112,9 +100,6 @@ class Z80Simulator {
   // обслуженный кэшем прошивки, не должен увеличивать этот счётчик.
   unsigned throttle_ = 0;
   unsigned directoryDelayMs_ = 0;
-  unsigned setEofDelayMs_ = 0;
-  unsigned writeDelayMs_ = 0;
-  uint32_t writeDelayOffset_ = UINT32_MAX;
   unsigned long long windowsServed_ = 0;
   unsigned long long bytesServed_ = 0;
 

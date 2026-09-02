@@ -68,42 +68,6 @@ struct raw_async_write_state {
   uint64_t final_async_id;
 };
 
-struct raw_async_flush_state {
-  struct raw_async_write_state *writes;
-  int write_count;
-  int completed;
-  int pending_count;
-  int final_count;
-  int final_status;
-  int writes_completed_at_pending;
-  int writes_completed_at_final;
-  uint16_t pending_command;
-  uint16_t final_command;
-  uint32_t pending_flags;
-  uint32_t final_flags;
-  uint64_t pending_message_id;
-  uint64_t final_message_id;
-  uint64_t pending_async_id;
-  uint64_t final_async_id;
-};
-
-struct raw_async_set_info_state {
-  int completed;
-  int pending_count;
-  int final_count;
-  int final_status;
-  uint16_t pending_command;
-  uint16_t final_command;
-  uint16_t pending_credit;
-  uint16_t final_credit;
-  uint32_t pending_flags;
-  uint32_t final_flags;
-  uint64_t pending_message_id;
-  uint64_t final_message_id;
-  uint64_t pending_async_id;
-  uint64_t final_async_id;
-};
-
 struct raw_change_notify_state {
   int *completed_total;
   int completed;
@@ -205,13 +169,6 @@ struct raw_create_state {
   int done;
   int status;
   smb2_file_id file_id;
-};
-
-struct normalized_name_state {
-  int done;
-  int status;
-  int decoded;
-  uint32_t name_length;
 };
 
 static uint16_t test_read_le16(const uint8_t *data) {
@@ -544,92 +501,6 @@ static int raw_windows_create_directory(struct smb2_context *smb2,
   }
 }
 
-/* Точный служебный Open из Windows CopyFile на границе 4 МиБ: данных он не
- * читает и не пишет, а получает только READ_ATTRIBUTES | SYNCHRONIZE. */
-static int raw_windows_metadata_open(struct smb2_context *smb2,
-                                     const char *path,
-                                     struct raw_create_state *state) {
-  struct smb2_create_request request;
-  struct smb2_pdu *pdu;
-  int old_passthrough = 0;
-
-  memset(state, 0, sizeof(*state));
-  state->status = -1;
-  memset(&request, 0, sizeof(request));
-  request.requested_oplock_level = SMB2_OPLOCK_LEVEL_NONE;
-  request.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
-  request.desired_access = SMB2_FILE_READ_ATTRIBUTES | SMB2_SYNCHRONIZE;
-  request.file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
-  request.share_access = SMB2_FILE_SHARE_READ | SMB2_FILE_SHARE_WRITE |
-                         SMB2_FILE_SHARE_DELETE;
-  request.create_disposition = SMB2_FILE_OPEN;
-  request.create_options = SMB2_FILE_NON_DIRECTORY_FILE |
-                           SMB2_FILE_SYNCHRONOUS_IO_NONALERT;
-  request.name = path;
-
-  smb2_get_passthrough(smb2, &old_passthrough);
-  smb2_set_passthrough(smb2, 1);
-  pdu = smb2_cmd_create_async(smb2, &request, raw_create_cb, state);
-  if (pdu == NULL) {
-    smb2_set_passthrough(smb2, old_passthrough);
-    return -1;
-  }
-  smb2_queue_pdu(smb2, pdu);
-  {
-    const int result = wait_for_count(smb2, &state->done, 1, 10000);
-    smb2_set_passthrough(smb2, old_passthrough);
-    return result;
-  }
-}
-
-static void normalized_name_cb(struct smb2_context *smb2, int status,
-                               void *command_data, void *private_data) {
-  struct normalized_name_state *state =
-      (struct normalized_name_state*)private_data;
-  struct smb2_query_info_reply *reply =
-      (struct smb2_query_info_reply*)command_data;
-  state->status = status;
-  if ((uint32_t)status == SMB2_STATUS_SUCCESS && reply != NULL &&
-      reply->output_buffer != NULL) {
-    const struct smb2_file_name_info *info =
-        (const struct smb2_file_name_info*)reply->output_buffer;
-    state->name_length = info->file_name_length;
-    state->decoded = info->name != NULL && info->file_name_length != 0;
-    smb2_free_data(smb2, reply->output_buffer);
-  }
-  state->done = 1;
-}
-
-static int raw_query_normalized_name(struct smb2_context *smb2,
-                                     const smb2_file_id file_id,
-                                     struct normalized_name_state *state) {
-  struct smb2_query_info_request request;
-  struct smb2_pdu *pdu;
-  int old_passthrough = 0;
-
-  memset(state, 0, sizeof(*state));
-  state->status = -1;
-  memset(&request, 0, sizeof(request));
-  request.info_type = SMB2_0_INFO_FILE;
-  request.file_info_class = SMB2_FILE_NORMALIZED_NAME_INFORMATION;
-  request.output_buffer_length = 1024;
-  memcpy(request.file_id, file_id, sizeof(request.file_id));
-
-  smb2_get_passthrough(smb2, &old_passthrough);
-  smb2_set_passthrough(smb2, 1);
-  pdu = smb2_cmd_query_info_async(smb2, &request, normalized_name_cb, state);
-  if (pdu == NULL) {
-    smb2_set_passthrough(smb2, old_passthrough);
-    return -1;
-  }
-  smb2_queue_pdu(smb2, pdu);
-  {
-    const int result = wait_for_count(smb2, &state->done, 1, 10000);
-    smb2_set_passthrough(smb2, old_passthrough);
-    return result;
-  }
-}
-
 static void raw_async_write_cb(struct smb2_context *smb2, int status,
                                void *command_data, void *private_data) {
   struct raw_async_write_state *state =
@@ -656,63 +527,6 @@ static void raw_async_write_cb(struct smb2_context *smb2, int status,
         (const struct smb2_write_reply*)command_data;
     state->final_count_value = reply->count;
   }
-  state->completed = 1;
-}
-
-static int completed_async_writes(const struct raw_async_flush_state *state) {
-  int completed = 0;
-  int index;
-  for (index = 0; index < state->write_count; ++index) {
-    completed += state->writes[index].completed != 0;
-  }
-  return completed;
-}
-
-static void raw_async_flush_cb(struct smb2_context *smb2, int status,
-                               void *command_data, void *private_data) {
-  struct raw_async_flush_state *state =
-      (struct raw_async_flush_state*)private_data;
-  (void)command_data;
-  if ((uint32_t)status == SMB2_STATUS_PENDING) {
-    ++state->pending_count;
-    state->pending_command = smb2->hdr.command;
-    state->pending_flags = smb2->hdr.flags;
-    state->pending_message_id = smb2->hdr.message_id;
-    state->pending_async_id = smb2->hdr.async.async_id;
-    state->writes_completed_at_pending = completed_async_writes(state);
-    return;
-  }
-  ++state->final_count;
-  state->final_status = status;
-  state->final_command = smb2->hdr.command;
-  state->final_flags = smb2->hdr.flags;
-  state->final_message_id = smb2->hdr.message_id;
-  state->final_async_id = smb2->hdr.async.async_id;
-  state->writes_completed_at_final = completed_async_writes(state);
-  state->completed = 1;
-}
-
-static void raw_async_set_info_cb(struct smb2_context *smb2, int status,
-                                  void *command_data, void *private_data) {
-  struct raw_async_set_info_state *state =
-      (struct raw_async_set_info_state*)private_data;
-  (void)command_data;
-  if ((uint32_t)status == SMB2_STATUS_PENDING) {
-    ++state->pending_count;
-    state->pending_command = smb2->hdr.command;
-    state->pending_credit = smb2->hdr.credit_request_response;
-    state->pending_flags = smb2->hdr.flags;
-    state->pending_message_id = smb2->hdr.message_id;
-    state->pending_async_id = smb2->hdr.async.async_id;
-    return;
-  }
-  ++state->final_count;
-  state->final_status = status;
-  state->final_command = smb2->hdr.command;
-  state->final_credit = smb2->hdr.credit_request_response;
-  state->final_flags = smb2->hdr.flags;
-  state->final_message_id = smb2->hdr.message_id;
-  state->final_async_id = smb2->hdr.async.async_id;
   state->completed = 1;
 }
 
@@ -1642,9 +1456,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("SUCCESS: Connected to %s/%s\n", server, share);
-  /* Сервер начинает с одного кредита по MS-SMB2 и расширяет окно до восьми.
-   * MaxWrite=64 КиБ использует один credit; остальные держат ограниченный
-   * конвейер запросов без неконтролируемой очереди в PSRAM. */
+  /* Сервер начинает с одного кредита по MS-SMB2 и расширяет окно до восьми:
+   * этого ровно достаточно для одного 512-КиБ multi-credit WRITE. */
   {
     const int credit_ok = smb2->credits == SMB2_SERVER_CREDIT_TARGET;
     printf("NEGOTIATED CREDITS: %d (%s)\n", smb2->credits,
@@ -1655,7 +1468,7 @@ int main(int argc, char **argv) {
   {
     const int sizes_ok = smb2->max_transact_size == 64 * 1024 &&
                          smb2->max_read_size == 64 * 1024 &&
-                         smb2->max_write_size == 64 * 1024;
+                         smb2->max_write_size == 512 * 1024;
     printf("NEGOTIATED I/O: transact=%lu read=%lu write=%lu (%s)\n",
            (unsigned long)smb2->max_transact_size,
            (unsigned long)smb2->max_read_size,
@@ -1694,10 +1507,14 @@ int main(int argc, char **argv) {
     failures += !credit_ok;
   }
 
-  /* [MS-SMB2] 3.3.3 требует новый ServerGuid при каждой инициализации SMB.
-   * Внутри одного живого экземпляра все соединения видят один UUID v4, а
-   * SessionId создаётся отдельно для каждого аутентифицированного соединения. */
+  /* Samba smbd строит стабильный ServerGuid из NetBIOS-имени. Все соединения
+   * ZX-Evo должны видеть ровно "zx-evo" с нулевым хвостом, а SessionId
+   * создаётся отдельно для каждого аутентифицированного соединения. */
   {
+    static const unsigned char expected_guid[16] = {
+      'z', 'x', '-', 'e', 'v', 'o', 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0
+    };
     uint64_t session_id = 0;
     uint64_t peer_session_id = 0;
     struct smb2_context *peer = connect_context(server, share);
@@ -1711,8 +1528,7 @@ int main(int argc, char **argv) {
         smb2_get_session_id(peer, &peer_session_id) == 0;
     const int guid_ok = server_guid != NULL && peer_guid != NULL &&
                         memcmp(server_guid, peer_guid, 16) == 0 &&
-                        (server_guid[7] & 0xf0) == 0x40 &&
-                        (server_guid[8] & 0xc0) == 0x80;
+                        memcmp(server_guid, expected_guid, 16) == 0;
     const int session_ok = have_session && peer_has_session &&
                            session_id != 0 && peer_session_id != 0 &&
                            session_id != 0x1234 &&
@@ -1727,7 +1543,7 @@ int main(int argc, char **argv) {
     } else {
       printf("missing");
     }
-    printf(" instance-v4/shared=%s sessions=0x%016llx/0x%016llx (%s)\n",
+    printf(" samba-stable/shared=%s sessions=0x%016llx/0x%016llx (%s)\n",
            guid_ok ? "PASS" : "FAIL", (unsigned long long)session_id,
            (unsigned long long)peer_session_id,
            session_ok ? "PASS" : "FAIL");
@@ -1777,8 +1593,6 @@ int main(int argc, char **argv) {
     if (strcmp(only_test, "test37") == 0) goto test_37;
     if (strcmp(only_test, "test38") == 0) goto test_38;
     if (strcmp(only_test, "test39") == 0) goto test_39;
-    if (strcmp(only_test, "test40") == 0) goto test_40;
-    if (strcmp(only_test, "test41") == 0) goto test_41;
   }
 
   /* TEST 1: Sequential & Multiple Reads check */
@@ -2389,8 +2203,8 @@ test_12:
   if (only_test != NULL) goto done;
 
 test_13:
-  /* TEST 13: CopyFile pattern: commit EOF, second handle, tail-first writes. */
-  printf("\n--- TEST 13: CopyFile committed EOF and tail-first writes ---\n");
+  /* TEST 13: CopyFile pattern: reserve EOF, second handle, tail-first writes. */
+  printf("\n--- TEST 13: CopyFile reserved EOF and tail-first writes ---\n");
   {
     const uint32_t chunk_size = 65536;
     const uint32_t file_size = 600001;
@@ -2419,7 +2233,7 @@ test_13:
     if (test_ok) {
       const int reserve_result =
           smb2_ftruncate(writer, reserve_handle, file_size);
-      printf("  SET_EOF result=%d error=%s\n", reserve_result,
+      printf("  Reserve EOF result=%d error=%s\n", reserve_result,
              smb2_get_error(writer));
       test_ok = reserve_result == 0;
     }
@@ -2452,7 +2266,7 @@ test_13:
     }
     if (reserve_handle != NULL) {
       const int close_result = smb2_close(writer, reserve_handle);
-      printf("  EOF handle CLOSE result=%d error=%s\n", close_result,
+      printf("  Reserve CLOSE result=%d error=%s\n", close_result,
              smb2_get_error(writer));
       test_ok = close_result == 0 && test_ok;
     }
@@ -4066,11 +3880,11 @@ test_29:
   /* ТЕСТ 29 повторяет наблюдателя Проводника из реальной трассы копирования.
    * Пишущий Open заранее задаёт конечный EOF, после чего другой SMB-сеанс
    * открывает тот же ещё недописанный файл только для чтения и закрывает его.
-   * SET_INFO уже физически применил EOF. Наблюдатель обязан видеть тот же
-   * размер, а его CLOSE не имеет права менять файл на EVO. */
-  printf("\n--- TEST 29: read-only CLOSE preserves another Open's EOF ---\n");
+   * Наблюдатель обязан видеть логический EOF, но не владеет резервом и поэтому
+   * его CLOSE не имеет права физически расширять файл на EVO. */
+  printf("\n--- TEST 29: read-only CLOSE does not commit another Open's EOF ---\n");
   {
-    const uint64_t committed_eof = 3182298;
+    const uint64_t reserved_eof = 3182298;
     struct smb2_context *observer_context = NULL;
     struct smb2fh *owner = NULL;
     struct smb2fh *observer = NULL;
@@ -4085,17 +3899,17 @@ test_29:
     int owner_close = -1;
     int test_ok = 1;
 
-    owner = smb2_open(smb2, test_path("observer_committed_eof.bin"),
+    owner = smb2_open(smb2, test_path("observer_reserved_eof.bin"),
                       O_CREAT | O_TRUNC | O_WRONLY);
     test_ok = owner != NULL;
     if (test_ok) {
-      test_ok = smb2_ftruncate(smb2, owner, committed_eof) == 0;
+      test_ok = smb2_ftruncate(smb2, owner, reserved_eof) == 0;
     }
     if (test_ok) {
       test_ok = query_file_allocation(
                     smb2, owner, SMB2_FILE_STANDARD_INFORMATION,
                     &owner_allocation_before, &owner_eof_before) == 0 &&
-                owner_eof_before == committed_eof;
+                owner_eof_before == reserved_eof;
     }
     if (test_ok) {
       observer_context = connect_context(server, share);
@@ -4103,7 +3917,7 @@ test_29:
     }
     if (test_ok) {
       observer = smb2_open(observer_context,
-                           test_path("observer_committed_eof.bin"), O_RDONLY);
+                           test_path("observer_reserved_eof.bin"), O_RDONLY);
       test_ok = observer != NULL;
     }
     if (test_ok) {
@@ -4111,7 +3925,7 @@ test_29:
                     observer_context, observer,
                     SMB2_FILE_STANDARD_INFORMATION, &observer_allocation,
                     &observer_eof) == 0 &&
-                observer_eof == committed_eof &&
+                observer_eof == reserved_eof &&
                 observer_allocation == owner_allocation_before;
     }
     if (observer != NULL) {
@@ -4123,7 +3937,7 @@ test_29:
       test_ok = query_file_allocation(
                     smb2, owner, SMB2_FILE_STANDARD_INFORMATION,
                     &owner_allocation_after, &owner_eof_after) == 0 &&
-                owner_eof_after == committed_eof &&
+                owner_eof_after == reserved_eof &&
                 owner_allocation_after == owner_allocation_before;
     }
 
@@ -4138,8 +3952,8 @@ test_29:
            (unsigned long long)owner_allocation_after);
 
     if (owner != NULL) {
-      /* Возвращаем тестовый файл к нулевой длине штатным SET_EOF=0 и только
-       * затем закрываем владельца. */
+      /* Тесту не требуется материализовать трёхмегабайтный хвост. Снимаем
+       * резерв штатным SET_EOF=0 и только затем закрываем владельца. */
       cleanup_truncate = smb2_ftruncate(smb2, owner, 0);
       test_ok = cleanup_truncate == 0 && test_ok;
       owner_close = smb2_close(smb2, owner);
@@ -4150,7 +3964,7 @@ test_29:
       smb2_disconnect_share(observer_context);
       smb2_destroy_context(observer_context);
     }
-    (void)smb2_unlink(smb2, test_path("observer_committed_eof.bin"));
+    (void)smb2_unlink(smb2, test_path("observer_reserved_eof.bin"));
     printf("  Cleanup SET_EOF=0=%d Owner CLOSE=%d\n",
            cleanup_truncate, owner_close);
     printf("RESULT TEST 29: %s\n", test_ok ? "PASS" : "FAIL");
@@ -4782,11 +4596,11 @@ test_36:
   if (only_test != NULL) goto done;
 
 test_37:
-  /* Одна полная согласованная порция должна уйти единственным 64-КиБ WRITE, а
+  /* Одна полная порция Windows должна уйти единственным 512-КиБ WRITE, а
    * сервер обязан разбить её только внутри FILEX и вернуть все байты. */
-  printf("\n--- TEST 37: negotiated 64 KiB WRITE round-trip ---\n");
+  printf("\n--- TEST 37: negotiated 512 KiB WRITE round-trip ---\n");
   {
-    enum { file_size = 64 * 1024 };
+    enum { file_size = 512 * 1024 };
     struct smb2fh *created = NULL;
     struct smb2fh *verify = NULL;
     uint8_t *payload = (uint8_t*)malloc(file_size);
@@ -4799,9 +4613,9 @@ test_37:
     for (index = 0; payload != NULL && index < file_size; ++index) {
       payload[index] = test_byte((uint64_t)index + 0x250000ULL);
     }
-    (void)smb2_unlink(smb2, test_path("write_64k.bin"));
+    (void)smb2_unlink(smb2, test_path("write_512k.bin"));
     if (test_ok) {
-      created = smb2_open(smb2, test_path("write_64k.bin"),
+      created = smb2_open(smb2, test_path("write_512k.bin"),
                           O_CREAT | O_TRUNC | O_WRONLY);
       test_ok = created != NULL;
     }
@@ -4814,7 +4628,7 @@ test_37:
       created = NULL;
     }
     if (test_ok) {
-      verify = smb2_open(smb2, test_path("write_64k.bin"), O_RDONLY);
+      verify = smb2_open(smb2, test_path("write_512k.bin"), O_RDONLY);
       test_ok = verify != NULL;
     }
     while (test_ok && read_total < file_size) {
@@ -4834,7 +4648,7 @@ test_37:
               memcmp(payload, readback, file_size) == 0 && test_ok;
     printf("  WRITE=%d READ=%d error=%s\n", written, read_total,
            smb2_get_error(smb2));
-    (void)smb2_unlink(smb2, test_path("write_64k.bin"));
+    (void)smb2_unlink(smb2, test_path("write_512k.bin"));
     free(readback);
     free(payload);
     printf("RESULT TEST 37: %s\n", test_ok ? "PASS" : "FAIL");
@@ -4844,13 +4658,12 @@ test_37:
   if (only_test != NULL) goto done;
 
 test_38:
-  /* 64-КиБ WRITE быстро получает STATUS_PENDING без нового credit и не
-   * SUCCESS. Из восьми credit клиента семь остаются доступными. После CANCEL
-   * по AsyncId финал также не выдаёт credit, а следующий ECHO восстанавливает
-   * рабочее окно до восьми. */
-  printf("\n--- TEST 38: exact 64 KiB WRITE CANCEL contract ---\n");
+  /* 512-КиБ WRITE быстро получает STATUS_PENDING и один credit, но не SUCCESS.
+   * После этого Windows адресует CANCEL по AsyncId. Финал не выдаёт credit
+   * повторно, а следующий ECHO восстанавливает рабочее окно до восьми. */
+  printf("\n--- TEST 38: exact 512 KiB WRITE CANCEL contract ---\n");
   {
-    enum { file_size = 64 * 1024 };
+    enum { file_size = 512 * 1024 };
     struct smb2fh *created = NULL;
     struct probe_fh_mirror *mirror = NULL;
     struct smb2_write_request request;
@@ -4874,9 +4687,9 @@ test_38:
     memset(&request, 0, sizeof(request));
     memset(&state, 0, sizeof(state));
     state.final_status = -1;
-    (void)smb2_unlink(smb2, test_path("cancel_write_64k.bin"));
+    (void)smb2_unlink(smb2, test_path("cancel_write_512k.bin"));
     if (test_ok) {
-      created = smb2_open(smb2, test_path("cancel_write_64k.bin"),
+      created = smb2_open(smb2, test_path("cancel_write_512k.bin"),
                           O_CREAT | O_TRUNC | O_WRONLY);
       test_ok = created != NULL;
     }
@@ -4910,7 +4723,7 @@ test_38:
     test_ok = test_ok &&
               state.pending_count == 1 && state.final_count == 1 &&
               state.pending_command == SMB2_WRITE &&
-              state.pending_credit == 0 &&
+              state.pending_credit == 1 &&
               (state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
               state.pending_message_id == target_message_id &&
               state.pending_async_id != 0 &&
@@ -4920,7 +4733,7 @@ test_38:
               state.final_message_id == target_message_id &&
               state.final_async_id == state.pending_async_id &&
               sequence_after_cancel == sequence_before_cancel &&
-              credits_before_cancel == 7 && credits_after_cancel == 7;
+              credits_before_cancel == 1 && credits_after_cancel == 1;
     echo_ok = smb2_echo(smb2) == 0;
     credits_after_echo = smb2->credits;
     test_ok = test_ok && echo_ok && credits_after_echo == 8;
@@ -4937,7 +4750,7 @@ test_38:
     if (created != NULL) {
       (void)smb2_close(smb2, created);
     }
-    (void)smb2_unlink(smb2, test_path("cancel_write_64k.bin"));
+    (void)smb2_unlink(smb2, test_path("cancel_write_512k.bin"));
     free(payload);
     printf("RESULT TEST 38: %s\n", test_ok ? "PASS" : "FAIL");
     failures += !test_ok;
@@ -5033,378 +4846,6 @@ test_39:
     (void)smb2_unlink(smb2, test_path("delayed_read_pending.bin"));
     free(payload);
     printf("RESULT TEST 39: %s\n", test_ok ? "PASS" : "FAIL");
-    failures += !test_ok;
-  }
-
-  if (only_test != NULL) goto done;
-
-test_40:
-  /* CopyFile задаёт конечный EOF до первого WRITE, а ровно после 4 МиБ делает
-   * metadata Open. Физический SET_EOF32 здесь искусственно задержан на 600 мс
-   * и обязан завершиться как async PENDING/SUCCESS. Несколько WRITE уже стоят
-   * вне порядка в очереди, когда приходит FLUSH; он обязан быть async
-   * FIFO-барьером: PENDING до старших WRITE и SUCCESS после них. */
-  printf("\n--- TEST 40: 4 MiB pending WRITE/FLUSH FIFO barrier ---\n");
-  {
-    enum {
-      block_size = 64 * 1024,
-      boundary_size = 4 * 1024 * 1024,
-      file_size = 7 * 1024 * 1024 + 1,
-      queued_write_count = 4
-    };
-    struct smb2fh *created = NULL;
-    struct smb2fh *metadata_handle = NULL;
-    struct smb2fh *reader = NULL;
-    struct probe_fh_mirror *mirror = NULL;
-    struct raw_create_state metadata_open;
-    struct normalized_name_state normalized_name;
-    struct smb2_file_end_of_file_info eof_info;
-    struct smb2_set_info_request request;
-    struct raw_async_set_info_state state;
-    struct smb2_write_request write_requests[queued_write_count];
-    struct raw_async_write_state write_states[queued_write_count];
-    struct raw_async_flush_state flush_state;
-    struct smb2_flush_request flush_request;
-    struct smb2_stat_64 stat_info;
-    struct smb2_pdu *pdu = NULL;
-    const uint32_t queued_offsets[queued_write_count] = {
-        82u * block_size, 101u * block_size,
-        64u * block_size, 66u * block_size};
-    uint8_t *payload = (uint8_t*)malloc(block_size);
-    uint8_t *queued_payloads =
-        (uint8_t*)malloc((size_t)queued_write_count * block_size);
-    uint8_t *readback = (uint8_t*)malloc(block_size);
-    uint8_t logical_tail = 0xff;
-    uint8_t reopened_boundary = 0xff;
-    uint8_t reopened_tail = 0xff;
-    DWORD set_eof_started = 0;
-    DWORD set_eof_elapsed = 0;
-    DWORD read_started = 0;
-    DWORD read_elapsed = 0;
-    DWORD flush_started = 0;
-    DWORD flush_elapsed = 0;
-    DWORD close_started = 0;
-    DWORD close_elapsed = 0;
-    int old_passthrough = 0;
-    int flush_result = -1;
-    int close_result = -1;
-    int credits_after_eof = 0;
-    int test_ok = payload != NULL && queued_payloads != NULL &&
-                  readback != NULL;
-    uint32_t offset;
-    int index;
-
-    memset(&metadata_open, 0, sizeof(metadata_open));
-    memset(&normalized_name, 0, sizeof(normalized_name));
-    memset(&eof_info, 0, sizeof(eof_info));
-    memset(&request, 0, sizeof(request));
-    memset(&state, 0, sizeof(state));
-    memset(write_requests, 0, sizeof(write_requests));
-    memset(write_states, 0, sizeof(write_states));
-    memset(&flush_state, 0, sizeof(flush_state));
-    memset(&flush_request, 0, sizeof(flush_request));
-    memset(&stat_info, 0, sizeof(stat_info));
-    state.final_status = -1;
-    (void)smb2_unlink(smb2, test_path("async_seteof.bin"));
-
-    if (test_ok) {
-      created = smb2_open(smb2, test_path("async_seteof.bin"),
-                          O_CREAT | O_TRUNC | O_RDWR);
-      test_ok = created != NULL;
-    }
-    if (test_ok) {
-      mirror = (struct probe_fh_mirror*)created;
-      eof_info.end_of_file = file_size;
-      request.info_type = SMB2_0_INFO_FILE;
-      request.file_info_class = SMB2_FILE_END_OF_FILE_INFORMATION;
-      request.input_data = &eof_info;
-      memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
-      /* Рост EOF обязан физически завершиться до SUCCESS. Passthrough
-       * проверяет настоящий async PENDING/SUCCESS одного SET_INFO. */
-      pdu = smb2_cmd_set_info_async(smb2, &request,
-                                    raw_async_set_info_cb, &state);
-      smb2_get_passthrough(smb2, &old_passthrough);
-      smb2_set_passthrough(smb2, 1);
-      test_ok = pdu != NULL;
-    }
-    if (test_ok) {
-      set_eof_started = GetTickCount();
-      smb2_queue_pdu(smb2, pdu);
-      test_ok = wait_for_count(smb2, &state.pending_count, 1, 5000) == 0 &&
-                wait_for_count(smb2, &state.completed, 1, 15000) == 0;
-      set_eof_elapsed = GetTickCount() - set_eof_started;
-    }
-    smb2_set_passthrough(smb2, old_passthrough);
-    test_ok = test_ok && state.pending_count == 1 && state.final_count == 1 &&
-              state.pending_command == SMB2_SET_INFO &&
-              state.final_command == SMB2_SET_INFO &&
-              (state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
-              (state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
-              state.pending_async_id != 0 &&
-              state.final_message_id == state.pending_message_id &&
-              state.final_async_id == state.pending_async_id &&
-              (uint32_t)state.final_status == SMB2_STATUS_SUCCESS &&
-              set_eof_elapsed >= 500 && set_eof_elapsed < 5000;
-    if (test_ok) {
-      test_ok = smb2_fstat(smb2, created, &stat_info) == 0 &&
-                stat_info.smb2_size == file_size;
-    }
-    for (index = 0; test_ok && index < 8 && smb2->credits < 8; ++index) {
-      test_ok = smb2_echo(smb2) == 0;
-    }
-    credits_after_eof = smb2->credits;
-    test_ok = test_ok && credits_after_eof == 8;
-    if (test_ok) {
-      read_started = GetTickCount();
-      test_ok = smb2_pread(smb2, created, &logical_tail, 1,
-                           file_size - 1) == 1 && logical_tail == 0;
-      read_elapsed = GetTickCount() - read_started;
-      test_ok = test_ok && read_elapsed < 300;
-    }
-    for (offset = 0; test_ok && offset < boundary_size;
-         offset += block_size) {
-      for (index = 0; index < block_size; ++index) {
-        payload[index] = test_byte((uint64_t)offset + (uint32_t)index);
-      }
-      test_ok = smb2_pwrite(smb2, created, payload, block_size, offset) ==
-                block_size;
-    }
-    if (test_ok) {
-      test_ok = raw_windows_metadata_open(
-                    smb2, test_path("async_seteof.bin"), &metadata_open) == 0 &&
-                (uint32_t)metadata_open.status == SMB2_STATUS_SUCCESS;
-    }
-    if (test_ok) {
-      test_ok = raw_query_normalized_name(
-                    smb2, metadata_open.file_id, &normalized_name) == 0 &&
-                (uint32_t)normalized_name.status == SMB2_STATUS_SUCCESS &&
-                normalized_name.decoded;
-    }
-    if ((uint32_t)metadata_open.status == SMB2_STATUS_SUCCESS) {
-      metadata_handle = smb2_fh_from_file_id(smb2, &metadata_open.file_id);
-      test_ok = metadata_handle != NULL && test_ok;
-      if (metadata_handle != NULL) {
-        test_ok = smb2_close(smb2, metadata_handle) == 0 && test_ok;
-        metadata_handle = NULL;
-      }
-    }
-    if (test_ok) {
-      flush_state.writes = write_states;
-      flush_state.write_count = queued_write_count;
-      flush_state.final_status = -1;
-      memcpy(flush_request.file_id, mirror->file_id,
-             sizeof(flush_request.file_id));
-      smb2_get_passthrough(smb2, &old_passthrough);
-      smb2_set_passthrough(smb2, 1);
-      for (index = 0; index < queued_write_count; ++index) {
-        uint8_t *queued_payload = queued_payloads + (size_t)index * block_size;
-        int byte_index;
-        for (byte_index = 0; byte_index < block_size; ++byte_index) {
-          queued_payload[byte_index] =
-              test_byte((uint64_t)queued_offsets[index] +
-                        (uint32_t)byte_index);
-        }
-        write_requests[index].offset = queued_offsets[index];
-        write_requests[index].length = block_size;
-        write_requests[index].buf = queued_payload;
-        memcpy(write_requests[index].file_id, mirror->file_id,
-               sizeof(write_requests[index].file_id));
-        write_states[index].expected_count = block_size;
-        write_states[index].final_status = -1;
-        pdu = smb2_cmd_write_async(smb2, &write_requests[index], 0,
-                                   raw_async_write_cb, &write_states[index]);
-        if (pdu == NULL) {
-          test_ok = 0;
-          break;
-        }
-        smb2_queue_pdu(smb2, pdu);
-      }
-    }
-    if (test_ok) {
-      pdu = smb2_cmd_flush_async(smb2, &flush_request,
-                                 raw_async_flush_cb, &flush_state);
-      test_ok = pdu != NULL;
-    }
-    if (test_ok) {
-      flush_started = GetTickCount();
-      smb2_queue_pdu(smb2, pdu);
-      test_ok = wait_for_count(smb2, &flush_state.pending_count, 1, 5000) == 0 &&
-                wait_for_count(smb2, &flush_state.completed, 1, 15000) == 0;
-      flush_elapsed = GetTickCount() - flush_started;
-      flush_result = flush_state.final_status;
-    }
-    smb2_set_passthrough(smb2, old_passthrough);
-    if (test_ok) {
-      test_ok = flush_state.pending_count == 1 &&
-                flush_state.final_count == 1 &&
-                flush_state.pending_command == SMB2_FLUSH &&
-                flush_state.final_command == SMB2_FLUSH &&
-                (flush_state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
-                (flush_state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
-                flush_state.pending_async_id != 0 &&
-                flush_state.final_message_id ==
-                    flush_state.pending_message_id &&
-                flush_state.final_async_id == flush_state.pending_async_id &&
-                (uint32_t)flush_state.final_status == SMB2_STATUS_SUCCESS &&
-                flush_state.writes_completed_at_pending < queued_write_count &&
-                flush_state.writes_completed_at_final == queued_write_count &&
-                flush_elapsed >= 500;
-      for (index = 0; test_ok && index < queued_write_count; ++index) {
-        test_ok = write_states[index].completed &&
-                  write_states[index].final_count == 1 &&
-                  (uint32_t)write_states[index].final_status ==
-                      SMB2_STATUS_SUCCESS &&
-                  write_states[index].final_count_value == block_size;
-      }
-    }
-    if (test_ok) {
-      memset(&stat_info, 0, sizeof(stat_info));
-      test_ok = smb2_fstat(smb2, created, &stat_info) == 0 &&
-                stat_info.smb2_size == file_size;
-    }
-    if (created != NULL) {
-      close_started = GetTickCount();
-      close_result = smb2_close(smb2, created);
-      close_elapsed = GetTickCount() - close_started;
-      test_ok = close_result == 0 && close_elapsed < 1000 && test_ok;
-      created = NULL;
-    }
-    if (test_ok) {
-      reader = smb2_open(smb2, test_path("async_seteof.bin"), O_RDONLY);
-      test_ok = reader != NULL &&
-                smb2_fstat(smb2, reader, &stat_info) == 0 &&
-                stat_info.smb2_size == file_size &&
-                smb2_pread(smb2, reader, &reopened_boundary, 1,
-                           boundary_size) == 1 &&
-                reopened_boundary == test_byte(boundary_size) &&
-                smb2_pread(smb2, reader, &reopened_tail, 1,
-                           file_size - 1) == 1 && reopened_tail == 0;
-    }
-    for (index = 0; test_ok && index < queued_write_count; ++index) {
-      test_ok = smb2_pread(smb2, reader, readback, block_size,
-                           queued_offsets[index]) == block_size &&
-                memcmp(readback,
-                       queued_payloads + (size_t)index * block_size,
-                       block_size) == 0;
-    }
-    if (reader != NULL) {
-      test_ok = smb2_close(smb2, reader) == 0 && test_ok;
-    }
-    printf("  seteof-pending=%d final=%08x EOF=%llu physical=%lu ms credits=%d "
-           "zero-read=%lu ms metadata=%08x/%08x name=%lu "
-           "flush-pending=%d final=%08x writes=%d/%d elapsed=%lu ms "
-           "close=%d/%lu ms boundary=%u tail=%u/%u\n",
-           state.pending_count, (unsigned)state.final_status,
-           (unsigned long long)stat_info.smb2_size,
-           (unsigned long)set_eof_elapsed, credits_after_eof,
-           (unsigned long)read_elapsed,
-           (unsigned)metadata_open.status, (unsigned)normalized_name.status,
-           (unsigned long)normalized_name.name_length,
-           flush_state.pending_count, (unsigned)flush_result,
-           flush_state.writes_completed_at_pending,
-           flush_state.writes_completed_at_final,
-           (unsigned long)flush_elapsed, close_result,
-           (unsigned long)close_elapsed, (unsigned)reopened_boundary,
-           (unsigned)logical_tail,
-           (unsigned)reopened_tail);
-    if (!test_ok) {
-      printf("  error=%s\n", smb2_get_error(smb2));
-    }
-    (void)smb2_unlink(smb2, test_path("async_seteof.bin"));
-    free(readback);
-    free(queued_payloads);
-    free(payload);
-    printf("RESULT TEST 40: %s\n", test_ok ? "PASS" : "FAIL");
-    failures += !test_ok;
-  }
-
-  if (only_test != NULL) goto done;
-
-test_41:
-  /* Незавершённый WRITE одного FileId не должен задерживать CLOSE другого
-   * metadata-only FileId. Старый глобальный physicalQueueBusy ставил такой
-   * CLOSE за чужой WRITE; Windows/FAR видел паузу или сетевую ошибку. */
-  printf("\n--- TEST 41: metadata CLOSE bypasses unrelated WRITE queue ---\n");
-  {
-    enum { file_size = 32768 };
-    struct smb2fh *target = NULL;
-    struct smb2fh *metadata_handle = NULL;
-    struct smb2fh *background = NULL;
-    struct raw_create_state metadata_open;
-    struct normalized_name_state normalized_name;
-    struct raw_command_state write_state;
-    uint8_t *payload = (uint8_t*)malloc(file_size);
-    const int require_early_close =
-        getenv("ZIFI_EXPECT_LOGICAL_CLOSE_FIRST") != NULL;
-    int close_result = -1;
-    int write_was_done_at_close = -1;
-    int test_ok = payload != NULL;
-    int index;
-
-    memset(&metadata_open, 0, sizeof(metadata_open));
-    memset(&normalized_name, 0, sizeof(normalized_name));
-    memset(&write_state, 0, sizeof(write_state));
-    write_state.status = -1;
-    for (index = 0; payload != NULL && index < file_size; ++index) {
-      payload[index] = test_byte((uint64_t)index + 0x410000ULL);
-    }
-    (void)smb2_unlink(smb2, test_path("metadata_close_target.bin"));
-    (void)smb2_unlink(smb2, test_path("metadata_close_background.bin"));
-
-    if (test_ok) {
-      target = smb2_open(smb2, test_path("metadata_close_target.bin"),
-                         O_CREAT | O_TRUNC | O_WRONLY);
-      test_ok = target != NULL;
-    }
-    if (test_ok) {
-      test_ok = raw_windows_metadata_open(
-                    smb2, test_path("metadata_close_target.bin"),
-                    &metadata_open) == 0 &&
-                (uint32_t)metadata_open.status == SMB2_STATUS_SUCCESS &&
-                raw_query_normalized_name(smb2, metadata_open.file_id,
-                                          &normalized_name) == 0 &&
-                (uint32_t)normalized_name.status == SMB2_STATUS_SUCCESS &&
-                normalized_name.decoded;
-    }
-    if (test_ok) {
-      metadata_handle = smb2_fh_from_file_id(smb2, &metadata_open.file_id);
-      test_ok = metadata_handle != NULL;
-    }
-    if (test_ok) {
-      background = smb2_open(
-          smb2, test_path("metadata_close_background.bin"),
-          O_CREAT | O_TRUNC | O_WRONLY);
-      test_ok = background != NULL;
-    }
-    if (test_ok) {
-      test_ok = smb2_write_async(smb2, background, payload, file_size,
-                                 raw_command_cb, &write_state) == 0;
-    }
-    if (metadata_handle != NULL) {
-      close_result = smb2_close(smb2, metadata_handle);
-      metadata_handle = NULL;
-      write_was_done_at_close = write_state.done;
-      test_ok = close_result == 0 &&
-                (!require_early_close || !write_was_done_at_close) && test_ok;
-    }
-    if (background != NULL) {
-      test_ok = smb2_close(smb2, background) == 0 &&
-                write_state.done && write_state.status == file_size && test_ok;
-      background = NULL;
-    }
-    if (target != NULL) {
-      test_ok = smb2_close(smb2, target) == 0 && test_ok;
-      target = NULL;
-    }
-
-    printf("  metadata CLOSE=%d write-done-at-close=%d final-write=%d "
-           "require-early=%d\n",
-           close_result, write_was_done_at_close, write_state.status,
-           require_early_close);
-    (void)smb2_unlink(smb2, test_path("metadata_close_target.bin"));
-    (void)smb2_unlink(smb2, test_path("metadata_close_background.bin"));
-    free(payload);
-    printf("RESULT TEST 41: %s\n", test_ok ? "PASS" : "FAIL");
     failures += !test_ok;
   }
 

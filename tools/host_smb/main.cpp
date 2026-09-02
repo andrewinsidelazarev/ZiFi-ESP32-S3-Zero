@@ -6,8 +6,7 @@
 // поверх обычной папки.
 //
 // Запуск:
-//   host_smb.exe <папка-ресурса> [порт] [байт/с] [имя]
-//                [задержка каталога, мс] [задержка SET_EOF, мс]
+//   host_smb.exe <папка-ресурса> [порт] [байт/с] [имя] [задержка каталога, мс]
 //
 // К нему подключается обычный Проводник Windows по \\127.0.0.1\SD, и любая
 // поломка ловится отладчиком с полным стеком вместо reset_reason=4.
@@ -92,14 +91,6 @@ int main(int argc, char** argv) {
   }
   if (argc >= 6) {
     simulator.setDirectoryDelay(static_cast<unsigned>(std::atoi(argv[5])));
-  }
-  if (argc >= 7) {
-    simulator.setSetEofDelay(static_cast<unsigned>(std::atoi(argv[6])));
-  }
-  if (argc >= 9) {
-    simulator.setWriteDelay(
-        static_cast<unsigned>(std::atoi(argv[7])),
-        static_cast<uint32_t>(std::strtoul(argv[8], nullptr, 10)));
   }
 
   zifi::UartTransport transport(Serial);
