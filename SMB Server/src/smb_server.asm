@@ -14,6 +14,7 @@ PLUGIN:
         ld (ConfigPanelDevice),a
         ld a,1
         call WC_INT_PL                   ; WC не должен перерисовывать часы под окном
+        call Vfs_Crc16Init               ; таблицы CRC — до первого файлового обмена
         call WC_GEDPL
         call Ui_Open
 
