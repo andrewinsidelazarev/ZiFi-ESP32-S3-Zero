@@ -242,8 +242,11 @@ smb2_encode_lease_break_acknowledgement(struct smb2_context *smb2,
         smb2_set_uint16(iov, 0, SMB2_LEASE_BREAK_ACKNOWLEDGE_SIZE);
         smb2_set_uint32(iov, 4, req->flags);
         memcpy(iov->buf + 8, req->lease_key, SMB2_LEASE_KEY_SIZE);
-        smb2_set_uint32(iov, 4, req->lease_state);
-        smb2_set_uint32(iov, 4, req->lease_duration);
+        /* [MS-SMB2] 2.2.24.2: LeaseState расположен после 16-байтного
+         * LeaseKey, а LeaseDuration имеет размер 64 бита. Старый код писал
+         * оба значения поверх Flags, поэтому настоящий ACK повреждался. */
+        smb2_set_uint32(iov, 24, req->lease_state);
+        smb2_set_uint64(iov, 28, req->lease_duration);
 
         return 0;
 }
@@ -300,7 +303,7 @@ smb2_encode_lease_break_reply(struct smb2_context *smb2,
         smb2_set_uint32(iov, 4, rep->flags);
         memcpy(iov->buf + 8, rep->lease_key, SMB2_LEASE_KEY_SIZE);
         smb2_set_uint32(iov, 24, rep->lease_state);
-        smb2_set_uint32(iov, 28, rep->lease_duration);
+        smb2_set_uint64(iov, 28, rep->lease_duration);
 
         return 0;
 }
@@ -356,11 +359,14 @@ smb2_encode_lease_break_notification(struct smb2_context *smb2,
         smb2_set_uint16(iov, 2, req->new_epoch);
         smb2_set_uint32(iov, 4, req->flags);
         memcpy(iov->buf + 8, req->lease_key, SMB2_LEASE_KEY_SIZE);
-        smb2_set_uint32(iov, 4, req->current_lease_state);
-        smb2_set_uint32(iov, 4, req->new_lease_state);
-        smb2_set_uint32(iov, 4, req->break_reason);
-        smb2_set_uint32(iov, 4, req->access_mask_hint);
-        smb2_set_uint32(iov, 4, req->share_mask_hint);
+        /* Смещения совпадают с smb2_lease_break_notification из [MS-SMB2]
+         * и с smbd_smb2_send_lease_break() в Samba. Раньше пять полей
+         * ошибочно накладывались друг на друга по смещению 4. */
+        smb2_set_uint32(iov, 24, req->current_lease_state);
+        smb2_set_uint32(iov, 28, req->new_lease_state);
+        smb2_set_uint32(iov, 32, req->break_reason);
+        smb2_set_uint32(iov, 36, req->access_mask_hint);
+        smb2_set_uint32(iov, 40, req->share_mask_hint);
 
         return 0;
 }
@@ -376,6 +382,17 @@ smb2_cmd_lease_break_notification_async(struct smb2_context *smb2,
         if (pdu == NULL) {
                 return NULL;
         }
+
+        /* Серверное уведомление не является ответом на клиентский Request:
+         * оно не расходует credit, не принадлежит Tree/Session и использует
+         * зарезервированный MessageId UINT64_MAX. smb2_queue_pdu() также
+         * сохраняет эти значения при корреляции unsolicited break. */
+        pdu->header.credit_charge = 0;
+        pdu->header.credit_request_response = 0;
+        pdu->header.message_id = UINT64_MAX;
+        pdu->header.sync.process_id = 0;
+        pdu->header.sync.tree_id = 0;
+        pdu->header.session_id = 0;
 
         if (smb2_encode_lease_break_notification(smb2, pdu, req)) {
                 smb2_free_pdu(smb2, pdu);

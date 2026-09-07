@@ -296,11 +296,24 @@ smb2_write_to_socket(struct smb2_context *smb2)
                 count = writev(smb2->fd, tmpiov, niov);
 
                 if (count == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#if defined(_WIN32) || defined(_XBOX)
+                        /* WSASend сообщает ошибку только через
+                         * WSAGetLastError; errno при WSAEWOULDBLOCK часто
+                         * остаётся нулём. Это временное заполнение socket
+                         * buffer, поэтому PDU остаётся в outqueue до POLLOUT. */
+                        int err = WSAGetLastError();
+                        if (err == WSAEINTR || err == WSAEWOULDBLOCK) {
                                 return 0;
                         }
+#else
+                        int err = errno;
+                        if (err == EINTR || err == EAGAIN ||
+                            err == EWOULDBLOCK) {
+                                return 0;
+                        }
+#endif
                         smb2_set_error(smb2, "Error when writing to "
-                                       "socket :%d %s", errno,
+                                       "socket :%d %s", err,
                                        smb2_get_error(smb2));
                         return -1;
                 }
@@ -456,38 +469,49 @@ read_more_data:
                                        "header: %s", smb2_get_error(smb2));
                         return -1;
                 }
-                /* if serving, and this is an smb1 negotiate, just short-circuit and flush
-                 * any remaining data on input and call the callback */
-                if (smb2_is_server(smb2) && smb2->hdr.command == SMB1_NEGOTIATE) {
-                        uint8_t flusher[32];
-                        struct iovec fiov;
-                        fiov.iov_base = (char *)flusher;
-                        fiov.iov_len = sizeof(flusher);
-                        do {
-                                count = func(smb2, &fiov, 1);
-                                if (count < 0) {
-#if defined(_WIN32) || defined(_XBOX)
-                                        int err = WSAGetLastError();
-                                        if (err == WSAEINTR || err == WSAEWOULDBLOCK) {
-#else
-                                        int err = errno;
-                                        if (err == EINTR || err == EAGAIN || err == EWOULDBLOCK) {
-#endif
-                                                count = 0;
-                                        }
-                                }
+                /* Ключ подписи принадлежит Session, а не TCP-сокету. Windows
+                 * повторно выполняет SESSION_SETUP на уже открытом соединении
+                 * и затем продолжает посылать запросы обеих сессий. */
+                if (smb2_is_server(smb2) && smb2->hdr.session_id != 0) {
+                        if (smb2->hdr.command == SMB2_SESSION_SETUP) {
+                                /* AUTHENTICATE продолжает новую Session. Между
+                                 * его фазами контекст мог обслужить старую. */
+                                smb2->session_id = smb2->hdr.session_id;
+                        } else if (smb2->hdr.command != SMB2_NEGOTIATE &&
+                                   smb2_server_select_session(
+                                           smb2, smb2->hdr.session_id) < 0) {
+                                return -1;
                         }
-                        while (count > 0);
-
-                        /* put on wait queue so queue_pdu doesn't complain */
-                        SMB2_LIST_ADD_END(&smb2->waitqueue, pdu);
-
-                        smb2->in.num_done = 0;
-                        pdu->cb(smb2, smb2->hdr.status, pdu->payload, pdu->cb_data);
-                        smb2->pdu = NULL;
-                        smb2->pdu = smb2->next_pdu;
-                        smb2->next_pdu = NULL;
-                        return 0;
+                }
+                /* SMB1 нужен только для multi-protocol NEGOTIATE. Дочитываем
+                 * ровно остаток текущей NetBIOS-записи. Прежний цикл читал до
+                 * WSAEWOULDBLOCK и мог выбросить уже пришедший следом SMB2
+                 * NEGOTIATE как будто это хвост SMB1-запроса. */
+                if (smb2_is_server(smb2) && smb2->hdr.command == SMB1_NEGOTIATE) {
+                        len = smb2->spl + SMB2_SPL_SIZE -
+                              smb2->in.num_done;
+                        if (len < 0 || len > SMB2_MAX_PDU_SIZE) {
+                                smb2_set_error(smb2,
+                                               "Invalid SMB1 NEGOTIATE length");
+                                return -1;
+                        }
+                        if (len > 0) {
+                                uint8_t *tmp = malloc(len);
+                                if (tmp == NULL) {
+                                        smb2_set_error(smb2,
+                                                       "malloc failed while adding SMB1 tail");
+                                        return -1;
+                                }
+                                if (smb2_add_iovector(smb2, &smb2->in,
+                                                      tmp, len, free) == NULL) {
+                                        free(tmp);
+                                        return -1;
+                                }
+                                smb2->recv_state = SMB2_RECV_SMB1;
+                                goto read_more_data;
+                        }
+                        smb2->recv_state = SMB2_RECV_SMB1;
+                        goto complete_smb1_negotiate;
                 }
                 /* Record the offset for the start of payload data. */
                 smb2->payload_offset = smb2->in.num_done;
@@ -553,11 +577,18 @@ read_more_data:
                         if (!(smb2->hdr.flags & SMB2_FLAGS_ASYNC_COMMAND)) {
                                 pdu->header.sync.tree_id = smb2->hdr.sync.tree_id;
                         }
-                        /* if the session is properly opened then we could get
-                         * any request from the client, so use the header's command
-                         * not the pdu's command for the rest of input
+                        /* На одном TCP-соединении SMB2 разрешает несколько
+                         * сеансов. Windows CopyFile создаёт дополнительный
+                         * SESSION_SETUP для служебного metadata Open. После
+                         * первого входа next_pdu служит лишь приёмным шаблоном
+                         * общей команды (обычно TREE_CONNECT), поэтому новый
+                         * SESSION_SETUP надо разбирать по wire-заголовку.
+                         * Начальные NEGOTIATE/SESSION_SETUP оставляем в прежнем
+                         * строгом автомате: там callback ещё не общий.
                          */
-                        if (smb2->hdr.command > SMB2_SESSION_SETUP) {
+                        if (smb2->hdr.command > SMB2_SESSION_SETUP ||
+                            (smb2->hdr.command == SMB2_SESSION_SETUP &&
+                             pdu->header.command > SMB2_SESSION_SETUP)) {
                                 pdu->header.command = smb2->hdr.command;
                         }
                         pdu->header.credit_charge = smb2->hdr.credit_charge;
@@ -806,6 +837,35 @@ read_more_data:
                  * to do.
                  */
                 smb2->in.num_done = 0;
+                return 0;
+        case SMB2_RECV_SMB1:
+complete_smb1_negotiate:
+                pdu = smb2->pdu;
+                if (pdu == NULL) {
+                        smb2_set_error(smb2,
+                                       "no pdu for SMB1 NEGOTIATE request");
+                        return -1;
+                }
+                /* Поля SMB1-заголовка не проходят через обычную SMB2-ветку.
+                 * Явно переносим их в Request PDU, чтобы первый wildcard-ответ
+                 * выдал ровно один начальный credit, а не всё локальное окно. */
+                pdu->header.command = SMB1_NEGOTIATE;
+                pdu->header.message_id = smb2->hdr.message_id;
+                pdu->header.flags = smb2->hdr.flags;
+                pdu->header.session_id = smb2->hdr.session_id;
+                pdu->header.credit_charge = smb2->hdr.credit_charge;
+                pdu->header.credit_request_response =
+                        smb2->hdr.credit_request_response;
+
+                /* Ответ должен найти исходный запрос при корреляции. */
+                SMB2_LIST_ADD_END(&smb2->waitqueue, pdu);
+
+                smb2->in.num_done = 0;
+                pdu->cb(smb2, smb2->hdr.status, pdu->payload,
+                        pdu->cb_data);
+                smb2->pdu = NULL;
+                smb2->pdu = smb2->next_pdu;
+                smb2->next_pdu = NULL;
                 return 0;
         }
 

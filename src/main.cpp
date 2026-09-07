@@ -730,7 +730,7 @@ void Application::processFtpRamStats() {
 
 void Application::processSmbStart() {
   // Ответ: [успех][порт LE16][NBNS 0/1]. Последний байт позволяет плагину
-  // честно показать, удалось ли занять UDP/137 для имени "ZX-Evo".
+  // честно показать, удалось ли занять UDP/137 для заданного имени SMB.
   exchange_->responseCommand = kRespSmbStart;
   exchange_->responseLength = 4;
   memset(exchange_->response, 0, 4);

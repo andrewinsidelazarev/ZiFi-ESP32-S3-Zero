@@ -68,6 +68,42 @@ struct raw_async_write_state {
   uint64_t final_async_id;
 };
 
+struct raw_async_flush_state {
+  struct raw_async_write_state *writes;
+  int write_count;
+  int completed;
+  int pending_count;
+  int final_count;
+  int final_status;
+  int writes_completed_at_pending;
+  int writes_completed_at_final;
+  uint16_t pending_command;
+  uint16_t final_command;
+  uint32_t pending_flags;
+  uint32_t final_flags;
+  uint64_t pending_message_id;
+  uint64_t final_message_id;
+  uint64_t pending_async_id;
+  uint64_t final_async_id;
+};
+
+struct raw_async_set_info_state {
+  int completed;
+  int pending_count;
+  int final_count;
+  int final_status;
+  uint16_t pending_command;
+  uint16_t final_command;
+  uint16_t pending_credit;
+  uint16_t final_credit;
+  uint32_t pending_flags;
+  uint32_t final_flags;
+  uint64_t pending_message_id;
+  uint64_t final_message_id;
+  uint64_t pending_async_id;
+  uint64_t final_async_id;
+};
+
 struct raw_change_notify_state {
   int *completed_total;
   int completed;
@@ -168,7 +204,18 @@ struct raw_command_state {
 struct raw_create_state {
   int done;
   int status;
+  uint8_t oplock_level;
   smb2_file_id file_id;
+  int context_copy_ok;
+  uint32_t create_context_length;
+  uint8_t create_context[192];
+};
+
+struct normalized_name_state {
+  int done;
+  int status;
+  int decoded;
+  uint32_t name_length;
 };
 
 static uint16_t test_read_le16(const uint8_t *data) {
@@ -455,9 +502,253 @@ static void raw_create_cb(struct smb2_context *smb2, int status,
   if ((uint32_t)status == SMB2_STATUS_SUCCESS && command_data != NULL) {
     const struct smb2_create_reply *reply =
         (const struct smb2_create_reply*)command_data;
+    state->oplock_level = reply->oplock_level;
     memcpy(state->file_id, reply->file_id, sizeof(state->file_id));
+    state->create_context_length = reply->create_context_length;
+    if (reply->create_context_length <= sizeof(state->create_context) &&
+        (reply->create_context_length == 0 ||
+         reply->create_context != NULL)) {
+      if (reply->create_context_length != 0) {
+        memcpy(state->create_context, reply->create_context,
+               reply->create_context_length);
+      }
+      state->context_copy_ok = 1;
+    }
   }
   state->done = 1;
+}
+
+/* Проверяет байтовую раскладку всех трёх lease-break PDU без сети. Это
+ * защищает поля после LeaseKey от повторения старой ошибки, когда они
+ * записывались поверх Flags, а 64-битная LeaseDuration обрезалась. */
+static int test_lease_break_wire_encoders(void) {
+  struct smb2_context *context = smb2_init_context();
+  struct smb2_lease_break_notification notification;
+  struct smb2_lease_break_acknowledgement acknowledgement;
+  struct smb2_lease_break_reply reply;
+  struct smb2_pdu *pdu = NULL;
+  const uint8_t *body = NULL;
+  int ok = context != NULL;
+  int index;
+
+  memset(&notification, 0, sizeof(notification));
+  memset(&acknowledgement, 0, sizeof(acknowledgement));
+  memset(&reply, 0, sizeof(reply));
+  notification.new_epoch = 0x1234;
+  notification.flags = 0x00000001;
+  notification.current_lease_state = 0x00000007;
+  notification.new_lease_state = 0x00000001;
+  notification.break_reason = 0x11223344;
+  notification.access_mask_hint = 0x55667788;
+  notification.share_mask_hint = 0x99aabbcc;
+  for (index = 0; index < SMB2_LEASE_KEY_SIZE; ++index) {
+    notification.lease_key[index] = (uint8_t)(0x30 + index * 3);
+  }
+
+  if (ok) {
+    pdu = smb2_cmd_lease_break_notification_async(
+        context, &notification, NULL, NULL);
+    ok = pdu != NULL && pdu->out.niov >= 2 &&
+         pdu->out.iov[1].len == (SMB2_LEASE_BREAK_NOTIFICATION_SIZE & ~1u);
+  }
+  if (ok) {
+    body = pdu->out.iov[1].buf;
+    ok = test_read_le16(body) == SMB2_LEASE_BREAK_NOTIFICATION_SIZE &&
+         test_read_le16(body + 2) == notification.new_epoch &&
+         test_read_le32(body + 4) == notification.flags &&
+         memcmp(body + 8, notification.lease_key, SMB2_LEASE_KEY_SIZE) == 0 &&
+         test_read_le32(body + 24) == notification.current_lease_state &&
+         test_read_le32(body + 28) == notification.new_lease_state &&
+         test_read_le32(body + 32) == notification.break_reason &&
+         test_read_le32(body + 36) == notification.access_mask_hint &&
+         test_read_le32(body + 40) == notification.share_mask_hint &&
+         pdu->header.credit_charge == 0 &&
+         pdu->header.credit_request_response == 0 &&
+         pdu->header.message_id == UINT64_MAX &&
+         pdu->header.sync.tree_id == 0 && pdu->header.session_id == 0;
+  }
+  if (pdu != NULL) {
+    smb2_free_pdu(context, pdu);
+    pdu = NULL;
+  }
+
+  acknowledgement.flags = 0x01020304;
+  memcpy(acknowledgement.lease_key, notification.lease_key,
+         SMB2_LEASE_KEY_SIZE);
+  acknowledgement.lease_state = 0x05060708;
+  acknowledgement.lease_duration = 0x1122334455667788ULL;
+  if (ok) {
+    pdu = smb2_cmd_lease_break_async(
+        context, &acknowledgement, NULL, NULL);
+    ok = pdu != NULL && pdu->out.niov >= 2;
+  }
+  if (ok) {
+    body = pdu->out.iov[1].buf;
+    ok = test_read_le16(body) == SMB2_LEASE_BREAK_ACKNOWLEDGE_SIZE &&
+         test_read_le32(body + 4) == acknowledgement.flags &&
+         memcmp(body + 8, acknowledgement.lease_key,
+                SMB2_LEASE_KEY_SIZE) == 0 &&
+         test_read_le32(body + 24) == acknowledgement.lease_state &&
+         test_read_le64(body + 28) == acknowledgement.lease_duration;
+  }
+  if (pdu != NULL) {
+    smb2_free_pdu(context, pdu);
+    pdu = NULL;
+  }
+
+  reply.flags = 0xa1b2c3d4;
+  memcpy(reply.lease_key, notification.lease_key, SMB2_LEASE_KEY_SIZE);
+  reply.lease_state = 0x0a0b0c0d;
+  reply.lease_duration = 0x8877665544332211ULL;
+  if (ok) {
+    pdu = smb2_cmd_lease_break_reply_async(context, &reply, NULL, NULL);
+    ok = pdu != NULL && pdu->out.niov >= 2;
+  }
+  if (ok) {
+    body = pdu->out.iov[1].buf;
+    ok = test_read_le16(body) == SMB2_LEASE_BREAK_REPLY_SIZE &&
+         test_read_le32(body + 4) == reply.flags &&
+         memcmp(body + 8, reply.lease_key, SMB2_LEASE_KEY_SIZE) == 0 &&
+         test_read_le32(body + 24) == reply.lease_state &&
+         test_read_le64(body + 28) == reply.lease_duration;
+  }
+  if (pdu != NULL) {
+    smb2_free_pdu(context, pdu);
+  }
+  if (context != NULL) {
+    smb2_destroy_context(context);
+  }
+  printf("LEASE BREAK WIRE CODEC: %s\n", ok ? "PASS" : "FAIL");
+  return ok;
+}
+
+/* Корневой CREATE из захвата Проводника: Windows просит durable handle,
+ * MxAc, QFid и lease v2. Backend не обязан разрешать кэширование каталога,
+ * но обязан вернуть RqLs с LeaseState=NONE и OplockLevel=LEASE. */
+static int raw_windows_directory_lease_open(
+    struct smb2_context *smb2, const char *path,
+    struct raw_create_state *state, uint8_t lease_key[16]) {
+  struct smb2_create_request request;
+  struct smb2_pdu *pdu;
+  uint8_t contexts[180];
+  int old_passthrough = 0;
+  int index;
+
+  memset(state, 0, sizeof(*state));
+  state->status = -1;
+  memset(&request, 0, sizeof(request));
+  memset(contexts, 0, sizeof(contexts));
+
+  /* DH2Q: 24 байта заголовка и 32 байта данных. */
+  test_write_le32(contexts, 56);
+  test_write_le16(contexts + 4, 16);
+  test_write_le16(contexts + 6, 4);
+  test_write_le16(contexts + 10, 24);
+  test_write_le32(contexts + 12, 32);
+  memcpy(contexts + 16, "DH2Q", 4);
+
+  /* MxAc и QFid не имеют данных в запросе. */
+  test_write_le32(contexts + 56, 24);
+  test_write_le16(contexts + 56 + 4, 16);
+  test_write_le16(contexts + 56 + 6, 4);
+  test_write_le16(contexts + 56 + 10, 24);
+  memcpy(contexts + 56 + 16, "MxAc", 4);
+  test_write_le32(contexts + 80, 24);
+  test_write_le16(contexts + 80 + 4, 16);
+  test_write_le16(contexts + 80 + 6, 4);
+  test_write_le16(contexts + 80 + 10, 24);
+  memcpy(contexts + 80 + 16, "QFid", 4);
+
+  /* Последний RqLs v2 занимает ровно 76 байт без хвостового padding. */
+  test_write_le16(contexts + 104 + 4, 16);
+  test_write_le16(contexts + 104 + 6, 4);
+  test_write_le16(contexts + 104 + 10, 24);
+  test_write_le32(contexts + 104 + 12, 52);
+  memcpy(contexts + 104 + 16, "RqLs", 4);
+  for (index = 0; index < 16; ++index) {
+    lease_key[index] = (uint8_t)(0x43 + index * 9);
+  }
+  memcpy(contexts + 104 + 24, lease_key, 16);
+  test_write_le32(contexts + 104 + 24 + 16,
+                  SMB2_LEASE_READ_CACHING |
+                      SMB2_LEASE_HANDLE_CACHING |
+                      SMB2_LEASE_WRITE_CACHING);
+
+  request.requested_oplock_level = SMB2_OPLOCK_LEVEL_LEASE;
+  request.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
+  request.desired_access = SMB2_FILE_READ_DATA |
+                           SMB2_FILE_READ_ATTRIBUTES |
+                           SMB2_SYNCHRONIZE;
+  request.file_attributes = 0;
+  request.share_access = SMB2_FILE_SHARE_READ | SMB2_FILE_SHARE_WRITE |
+                         SMB2_FILE_SHARE_DELETE;
+  request.create_disposition = SMB2_FILE_OPEN;
+  request.create_options = SMB2_FILE_DIRECTORY_FILE |
+                           SMB2_FILE_SYNCHRONOUS_IO_NONALERT;
+  request.name = path;
+  request.create_context_length = sizeof(contexts);
+  request.create_context = contexts;
+
+  smb2_get_passthrough(smb2, &old_passthrough);
+  smb2_set_passthrough(smb2, 1);
+  pdu = smb2_cmd_create_async(smb2, &request, raw_create_cb, state);
+  if (pdu == NULL) {
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  smb2_queue_pdu(smb2, pdu);
+  {
+    const int result = wait_for_count(smb2, &state->done, 1, 10000);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return result;
+  }
+}
+
+static int inspect_raw_lease_response(
+    const struct raw_create_state *state, const uint8_t lease_key[16],
+    uint16_t expected_epoch, uint32_t expected_state) {
+  size_t offset = 0;
+  int seen_lease = 0;
+  if (!state->context_copy_ok) {
+    return -1;
+  }
+  while (offset < state->create_context_length) {
+    const uint8_t *context = state->create_context + offset;
+    const size_t remaining = state->create_context_length - offset;
+    const uint32_t next = remaining >= 4 ? test_read_le32(context) : 0;
+    const uint16_t name_offset =
+        remaining >= 8 ? test_read_le16(context + 4) : 0;
+    const uint16_t name_length =
+        remaining >= 8 ? test_read_le16(context + 6) : 0;
+    const uint16_t data_offset =
+        remaining >= 12 ? test_read_le16(context + 10) : 0;
+    const uint32_t data_length =
+        remaining >= 16 ? test_read_le32(context + 12) : 0;
+    const size_t context_length = next == 0 ? remaining : next;
+    if (remaining < 16 || context_length < 16 || context_length > remaining ||
+        name_offset > context_length ||
+        name_length > context_length - name_offset ||
+        data_offset > context_length ||
+        data_length > context_length - data_offset ||
+        (next != 0 && (next & 7u) != 0)) {
+      return -1;
+    }
+    if (name_length == 4 &&
+        memcmp(context + name_offset, "RqLs", 4) == 0) {
+      if (seen_lease || data_length != 52 ||
+          memcmp(context + data_offset, lease_key, 16) != 0 ||
+          test_read_le32(context + data_offset + 16) != expected_state ||
+          test_read_le16(context + data_offset + 48) != expected_epoch) {
+        return -1;
+      }
+      seen_lease = 1;
+    }
+    if (next == 0) {
+      break;
+    }
+    offset += next;
+  }
+  return seen_lease ? 0 : -1;
 }
 
 /* Точный CREATE каталога из захвата Проводника: DesiredAccess=0x00100081,
@@ -501,6 +792,162 @@ static int raw_windows_create_directory(struct smb2_context *smb2,
   }
 }
 
+/* Точный CREATE назначения из Windows CopyFile с запросом RWH lease. Сервер,
+ * который не объявляет LEASING, всё равно должен устойчиво ответить RqLs с
+ * LeaseState=NONE, если клиент повторил запрос после закэшированного NEGOTIATE. */
+static int raw_windows_destination_open(struct smb2_context *smb2,
+                                        const char *path,
+                                        struct raw_create_state *state) {
+  struct smb2_create_request request;
+  struct smb2_pdu *pdu;
+  uint8_t lease_context[76];
+  int old_passthrough = 0;
+  int index;
+
+  memset(state, 0, sizeof(*state));
+  state->status = -1;
+  memset(&request, 0, sizeof(request));
+  memset(lease_context, 0, sizeof(lease_context));
+  test_write_le16(lease_context + 4, 16);
+  test_write_le16(lease_context + 6, 4);
+  test_write_le16(lease_context + 10, 24);
+  test_write_le32(lease_context + 12, 52);
+  memcpy(lease_context + 16, "RqLs", 4);
+  for (index = 0; index < 16; ++index) {
+    lease_context[24 + index] = (uint8_t)(0x89 + index * 7);
+  }
+  test_write_le32(lease_context + 24 + 16,
+                  SMB2_LEASE_READ_CACHING |
+                      SMB2_LEASE_HANDLE_CACHING |
+                      SMB2_LEASE_WRITE_CACHING);
+
+  request.requested_oplock_level = SMB2_OPLOCK_LEVEL_LEASE;
+  request.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
+  request.desired_access =
+      SMB2_FILE_READ_DATA | SMB2_FILE_WRITE_DATA | SMB2_FILE_APPEND_DATA |
+      SMB2_FILE_READ_EA | SMB2_FILE_WRITE_EA | SMB2_FILE_READ_ATTRIBUTES |
+      SMB2_FILE_WRITE_ATTRIBUTES | SMB2_DELETE | SMB2_READ_CONTROL |
+      SMB2_WRITE_DACL | SMB2_SYNCHRONIZE;
+  request.file_attributes = SMB2_FILE_ATTRIBUTE_ARCHIVE;
+  request.share_access = 0;
+  request.create_disposition = SMB2_FILE_OVERWRITE_IF;
+  request.create_options = SMB2_FILE_SEQUENTIAL_ONLY |
+                           SMB2_FILE_NON_DIRECTORY_FILE;
+  request.name = path;
+  request.create_context_length = sizeof(lease_context);
+  request.create_context = lease_context;
+
+  smb2_get_passthrough(smb2, &old_passthrough);
+  smb2_set_passthrough(smb2, 1);
+  pdu = smb2_cmd_create_async(smb2, &request, raw_create_cb, state);
+  if (pdu == NULL) {
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  smb2_queue_pdu(smb2, pdu);
+  {
+    const int result = wait_for_count(smb2, &state->done, 1, 10000);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return result;
+  }
+}
+
+/* Точный служебный Open из захвата Windows CopyFile на границе 4 МиБ: данных
+ * он не читает и не пишет, передаёт FileAttributes=0, запрашивает
+ * READ_ATTRIBUTES | SYNCHRONIZE, NON_DIRECTORY_FILE | OPEN_REPARSE_POINT и
+ * единственный контекст MxAc. */
+static int raw_windows_metadata_open(struct smb2_context *smb2,
+                                     const char *path,
+                                     struct raw_create_state *state) {
+  struct smb2_create_request request;
+  struct smb2_pdu *pdu;
+  uint8_t maximal_access_context[24];
+  int old_passthrough = 0;
+
+  memset(state, 0, sizeof(*state));
+  state->status = -1;
+  memset(&request, 0, sizeof(request));
+  memset(maximal_access_context, 0, sizeof(maximal_access_context));
+  test_write_le16(maximal_access_context + 4, 16);
+  test_write_le16(maximal_access_context + 6, 4);
+  test_write_le16(maximal_access_context + 10, 24);
+  memcpy(maximal_access_context + 16, "MxAc", 4);
+  request.requested_oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+  request.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION;
+  request.desired_access = SMB2_FILE_READ_ATTRIBUTES | SMB2_SYNCHRONIZE;
+  request.file_attributes = 0;
+  request.share_access = SMB2_FILE_SHARE_READ | SMB2_FILE_SHARE_WRITE |
+                         SMB2_FILE_SHARE_DELETE;
+  request.create_disposition = SMB2_FILE_OPEN;
+  request.create_options = SMB2_FILE_NON_DIRECTORY_FILE |
+                           SMB2_FILE_OPEN_REPARSE_POINT;
+  request.name = path;
+  request.create_context_length = sizeof(maximal_access_context);
+  request.create_context = maximal_access_context;
+
+  smb2_get_passthrough(smb2, &old_passthrough);
+  smb2_set_passthrough(smb2, 1);
+  pdu = smb2_cmd_create_async(smb2, &request, raw_create_cb, state);
+  if (pdu == NULL) {
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  smb2_queue_pdu(smb2, pdu);
+  {
+    const int result = wait_for_count(smb2, &state->done, 1, 10000);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return result;
+  }
+}
+
+static void normalized_name_cb(struct smb2_context *smb2, int status,
+                               void *command_data, void *private_data) {
+  struct normalized_name_state *state =
+      (struct normalized_name_state*)private_data;
+  struct smb2_query_info_reply *reply =
+      (struct smb2_query_info_reply*)command_data;
+  state->status = status;
+  if ((uint32_t)status == SMB2_STATUS_SUCCESS && reply != NULL &&
+      reply->output_buffer != NULL) {
+    const struct smb2_file_name_info *info =
+        (const struct smb2_file_name_info*)reply->output_buffer;
+    state->name_length = info->file_name_length;
+    state->decoded = info->name != NULL && info->file_name_length != 0;
+    smb2_free_data(smb2, reply->output_buffer);
+  }
+  state->done = 1;
+}
+
+static int raw_query_normalized_name(struct smb2_context *smb2,
+                                     const smb2_file_id file_id,
+                                     struct normalized_name_state *state) {
+  struct smb2_query_info_request request;
+  struct smb2_pdu *pdu;
+  int old_passthrough = 0;
+
+  memset(state, 0, sizeof(*state));
+  state->status = -1;
+  memset(&request, 0, sizeof(request));
+  request.info_type = SMB2_0_INFO_FILE;
+  request.file_info_class = SMB2_FILE_NORMALIZED_NAME_INFORMATION;
+  request.output_buffer_length = 1024;
+  memcpy(request.file_id, file_id, sizeof(request.file_id));
+
+  smb2_get_passthrough(smb2, &old_passthrough);
+  smb2_set_passthrough(smb2, 1);
+  pdu = smb2_cmd_query_info_async(smb2, &request, normalized_name_cb, state);
+  if (pdu == NULL) {
+    smb2_set_passthrough(smb2, old_passthrough);
+    return -1;
+  }
+  smb2_queue_pdu(smb2, pdu);
+  {
+    const int result = wait_for_count(smb2, &state->done, 1, 10000);
+    smb2_set_passthrough(smb2, old_passthrough);
+    return result;
+  }
+}
+
 static void raw_async_write_cb(struct smb2_context *smb2, int status,
                                void *command_data, void *private_data) {
   struct raw_async_write_state *state =
@@ -527,6 +974,89 @@ static void raw_async_write_cb(struct smb2_context *smb2, int status,
         (const struct smb2_write_reply*)command_data;
     state->final_count_value = reply->count;
   }
+  state->completed = 1;
+}
+
+static int count_completed_async_writes(
+    const struct raw_async_write_state *states, int count) {
+  int completed = 0;
+  int index;
+  for (index = 0; index < count; ++index) {
+    completed += states[index].completed != 0;
+  }
+  return completed;
+}
+
+static int wait_async_writes(struct smb2_context *smb2,
+                             struct raw_async_write_state *states,
+                             int count, DWORD timeout_ms) {
+  const DWORD started = GetTickCount();
+  while (count_completed_async_writes(states, count) < count) {
+    WSAPOLLFD pfd;
+    pfd.fd = (SOCKET)smb2_get_fd(smb2);
+    pfd.events = (SHORT)smb2_which_events(smb2);
+    pfd.revents = 0;
+    {
+      const int polled = WSAPoll(&pfd, 1, 500);
+      if (polled == SOCKET_ERROR ||
+          smb2_service(smb2, polled > 0 ? pfd.revents : 0) < 0 ||
+          (DWORD)(GetTickCount() - started) >= timeout_ms) {
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int completed_async_writes(const struct raw_async_flush_state *state) {
+  return count_completed_async_writes(state->writes, state->write_count);
+}
+
+static void raw_async_flush_cb(struct smb2_context *smb2, int status,
+                               void *command_data, void *private_data) {
+  struct raw_async_flush_state *state =
+      (struct raw_async_flush_state*)private_data;
+  (void)command_data;
+  if ((uint32_t)status == SMB2_STATUS_PENDING) {
+    ++state->pending_count;
+    state->pending_command = smb2->hdr.command;
+    state->pending_flags = smb2->hdr.flags;
+    state->pending_message_id = smb2->hdr.message_id;
+    state->pending_async_id = smb2->hdr.async.async_id;
+    state->writes_completed_at_pending = completed_async_writes(state);
+    return;
+  }
+  ++state->final_count;
+  state->final_status = status;
+  state->final_command = smb2->hdr.command;
+  state->final_flags = smb2->hdr.flags;
+  state->final_message_id = smb2->hdr.message_id;
+  state->final_async_id = smb2->hdr.async.async_id;
+  state->writes_completed_at_final = completed_async_writes(state);
+  state->completed = 1;
+}
+
+static void raw_async_set_info_cb(struct smb2_context *smb2, int status,
+                                  void *command_data, void *private_data) {
+  struct raw_async_set_info_state *state =
+      (struct raw_async_set_info_state*)private_data;
+  (void)command_data;
+  if ((uint32_t)status == SMB2_STATUS_PENDING) {
+    ++state->pending_count;
+    state->pending_command = smb2->hdr.command;
+    state->pending_credit = smb2->hdr.credit_request_response;
+    state->pending_flags = smb2->hdr.flags;
+    state->pending_message_id = smb2->hdr.message_id;
+    state->pending_async_id = smb2->hdr.async.async_id;
+    return;
+  }
+  ++state->final_count;
+  state->final_status = status;
+  state->final_command = smb2->hdr.command;
+  state->final_credit = smb2->hdr.credit_request_response;
+  state->final_flags = smb2->hdr.flags;
+  state->final_message_id = smb2->hdr.message_id;
+  state->final_async_id = smb2->hdr.async.async_id;
   state->completed = 1;
 }
 
@@ -1365,11 +1895,15 @@ static int queue_raw_change_notify(struct smb2_context *smb2,
 }
 
 static struct smb2_context *connect_context(const char *server,
-                                            const char *share) {
+                                             const char *share) {
   struct smb2_context *context = smb2_init_context();
   if (context == NULL) {
     return NULL;
   }
+  /* Реальный Wi-Fi может потерять первый SYN. Нулевой timeout libsmb2 завершает
+   * синхронный connect при ближайшей смене секунды, ещё до TCP-ретрансляции.
+   * Явная граница совпадает с серверной и оставляет стеку время восстановиться. */
+  smb2_set_timeout(context, 120);
   smb2_set_security_mode(context, SMB2_NEGOTIATE_SIGNING_ENABLED);
   smb2_set_password(context, "zx");
   if (smb2_connect_share(context, server, share, "zx") != 0) {
@@ -1405,8 +1939,8 @@ static int signed_validate_negotiate(const char *server, const char *share) {
   request.input = &input;
   memset(&state, 0, sizeof(state));
 
-  /* The session was negotiated as optional/unsigned. Windows nevertheless
-   * signs this integrity check and requires the server reply to be signed. */
+  /* Сессия согласована с необязательной подписью. Windows всё равно подписывает
+   * эту проверку целостности и требует подписанный ответ сервера. */
   smb2_set_sign(context, 1);
   pdu = smb2_cmd_ioctl_async(context, &request, raw_command_cb, &state);
   if (pdu != NULL) {
@@ -1424,7 +1958,38 @@ static int signed_validate_negotiate(const char *server, const char *share) {
   return ok;
 }
 
+static int signed_echo_after_optional_negotiate(const char *server,
+                                                 const char *share) {
+  struct smb2_context *context = connect_context(server, share);
+  struct raw_command_state state;
+  struct smb2_pdu *pdu;
+  int ok = 0;
+  if (context == NULL) return 0;
+
+  memset(&state, 0, sizeof(state));
+  /* Fedora smbclient согласует необязательную подпись, а затем подписывает
+   * TREE_CONNECT. ECHO проверяет тот же общий контракт без смены дерева:
+   * каждый подписанный запрос должен получить подписанный ответ. */
+  smb2_set_sign(context, 1);
+  pdu = smb2_cmd_echo_async(context, raw_command_cb, &state);
+  if (pdu != NULL) {
+    smb2_queue_pdu(context, pdu);
+    ok = wait_raw_command(context, &state) == 0 &&
+         (uint32_t)state.status == SMB2_STATUS_SUCCESS &&
+         state.command == SMB2_ECHO &&
+         (state.flags & SMB2_FLAGS_SIGNED) != 0;
+  }
+  printf("SIGNED OPTIONAL ECHO: status=%08x flags=%08lx (%s)\n",
+         (unsigned)state.status, (unsigned long)state.flags,
+         ok ? "PASS" : "FAIL");
+  smb2_disconnect_share(context);
+  smb2_destroy_context(context);
+  return ok;
+}
+
 int main(int argc, char **argv) {
+  /* Видимый тестовый клиент пишет стадии сразу, включая вывод через Tee. */
+  setvbuf(stdout, NULL, _IONBF, 0);
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
     printf("FAIL: WSAStartup failed\n");
@@ -1432,11 +1997,19 @@ int main(int argc, char **argv) {
   }
 
   if (argc < 3) {
-    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8..test38] [test-directory]\n");
+    printf("Usage: smb_reproduce_test host[:port] share [all|basic|test8..test48|test42list] [test-directory]\n");
     return 1;
   }
   const char *server = argv[1];
   const char *share = argv[2];
+  const char *only_test = argc >= 4 ? argv[3] : NULL;
+  if (only_test != NULL && strcmp(only_test, "all") == 0) {
+    only_test = NULL;
+  }
+  if (!test_lease_break_wire_encoders()) {
+    WSACleanup();
+    return 1;
+  }
   if (argc >= 5) {
     test_directory = argv[4];
   }
@@ -1447,6 +2020,9 @@ int main(int argc, char **argv) {
     printf("FAIL: smb2_init_context failed\n");
     return 1;
   }
+  /* Не превращаем потерю первого Wi-Fi пакета в ложный отказ SMB-регрессии:
+   * Windows TCP должен успеть повторить SYN до общей 120-секундной границы. */
+  smb2_set_timeout(smb2, 120);
   smb2_set_security_mode(smb2, SMB2_NEGOTIATE_SIGNING_ENABLED);
   smb2_set_password(smb2, "zx");
   
@@ -1456,19 +2032,86 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("SUCCESS: Connected to %s/%s\n", server, share);
-  /* Сервер начинает с одного кредита по MS-SMB2 и расширяет окно до восьми:
-   * этого ровно достаточно для одного 512-КиБ multi-credit WRITE. */
+
+  /* Второй клиент для многоклиентской регрессии одним Open дочитывает холодный
+   * каталог до конца. Так проверяется цепочка FINDNEXT, между звеньями которой
+   * медленный WRITE раньше вклинивался снова. Точные compound Проводника
+   * отдельно проверяются тестами 19 и 43. */
+  if (only_test != NULL && strcmp(only_test, "test42list") == 0) {
+    const char *directory = test_directory[0] == '\0' ? "" : test_directory;
+    struct smb2dir *full_directory = NULL;
+    struct smb2dirent *entry = NULL;
+    DWORD open_started = 0;
+    DWORD open_elapsed = 0;
+    DWORD enumerate_started = 0;
+    DWORD enumerate_elapsed = 0;
+    DWORD close_started = 0;
+    DWORD close_elapsed = 0;
+    DWORD echo_started = 0;
+    DWORD echo_elapsed = 0;
+    DWORD disconnect_started = 0;
+    DWORD disconnect_elapsed = 0;
+    int full_entry_count = 0;
+    int test_ok = 1;
+
+    printf("\n--- TEST 42 LIST: complete second-client directory listing ---\n");
+    open_started = GetTickCount();
+    full_directory = smb2_opendir(smb2, directory);
+    open_elapsed = GetTickCount() - open_started;
+    test_ok = full_directory != NULL;
+    enumerate_started = GetTickCount();
+    while (full_directory != NULL &&
+           (entry = smb2_readdir(smb2, full_directory)) != NULL) {
+      if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+        ++full_entry_count;
+      }
+    }
+    enumerate_elapsed = GetTickCount() - enumerate_started;
+    if (full_directory != NULL) {
+      close_started = GetTickCount();
+      smb2_closedir(smb2, full_directory);
+      close_elapsed = GetTickCount() - close_started;
+    }
+    // Четыре seed-файла создаёт оркестратор; файл копирования — пятый.
+    test_ok = full_entry_count >= 4 && test_ok;
+    echo_started = GetTickCount();
+    test_ok = smb2_echo(smb2) == 0 && test_ok;
+    echo_elapsed = GetTickCount() - echo_started;
+    printf("  full entries=%d open=%lu ms enumerate=%lu ms close=%lu ms "
+           "echo=%lu ms/%s\n", full_entry_count,
+           (unsigned long)open_elapsed, (unsigned long)enumerate_elapsed,
+           (unsigned long)close_elapsed, (unsigned long)echo_elapsed,
+           test_ok ? "PASS" : "FAIL");
+    printf("RESULT TEST 42 LIST: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+    /* Отдельно измеряем штатный TREE_DISCONNECT/LOGOFF: ожидание здесь не
+     * должно ошибочно выглядеть как медленный FINDNEXT оркестратору. */
+    disconnect_started = GetTickCount();
+    smb2_disconnect_share(smb2);
+    disconnect_elapsed = GetTickCount() - disconnect_started;
+    printf("  disconnect=%lu ms\n", (unsigned long)disconnect_elapsed);
+    smb2_destroy_context(smb2);
+    WSACleanup();
+    return failures == 0 ? 0 : 1;
+  }
+  if (only_test != NULL && strcmp(only_test, "test42") == 0) {
+    goto test_42;
+  }
+
+  /* Сервер начинает с одного кредита по MS-SMB2 и ограниченно расширяет окно
+   * до восьми. Этого достаточно для compound-запросов Windows и ограниченной
+   * очереди однокредитных WRITE по 64 КиБ. */
   {
     const int credit_ok = smb2->credits == SMB2_SERVER_CREDIT_TARGET;
-    printf("NEGOTIATED CREDITS: %d (%s)\n", smb2->credits,
-           credit_ok ? "PASS" : "FAIL: expected bounded window of 8");
+    printf("NEGOTIATED CREDITS: %d (%s; expected=%d)\n", smb2->credits,
+           credit_ok ? "PASS" : "FAIL", SMB2_SERVER_CREDIT_TARGET);
     failures += !credit_ok;
   }
 
   {
     const int sizes_ok = smb2->max_transact_size == 64 * 1024 &&
                          smb2->max_read_size == 64 * 1024 &&
-                         smb2->max_write_size == 512 * 1024;
+                         smb2->max_write_size == 64 * 1024;
     printf("NEGOTIATED I/O: transact=%lu read=%lu write=%lu (%s)\n",
            (unsigned long)smb2->max_transact_size,
            (unsigned long)smb2->max_read_size,
@@ -1507,14 +2150,10 @@ int main(int argc, char **argv) {
     failures += !credit_ok;
   }
 
-  /* Samba smbd строит стабильный ServerGuid из NetBIOS-имени. Все соединения
-   * ZX-Evo должны видеть ровно "zx-evo" с нулевым хвостом, а SessionId
-   * создаётся отдельно для каждого аутентифицированного соединения. */
+  /* [MS-SMB2] 3.3.3 требует новый ServerGuid при каждой инициализации SMB.
+   * Внутри одного живого экземпляра все соединения видят один UUID v4, а
+   * SessionId создаётся отдельно для каждого аутентифицированного соединения. */
   {
-    static const unsigned char expected_guid[16] = {
-      'z', 'x', '-', 'e', 'v', 'o', 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0
-    };
     uint64_t session_id = 0;
     uint64_t peer_session_id = 0;
     struct smb2_context *peer = connect_context(server, share);
@@ -1528,7 +2167,8 @@ int main(int argc, char **argv) {
         smb2_get_session_id(peer, &peer_session_id) == 0;
     const int guid_ok = server_guid != NULL && peer_guid != NULL &&
                         memcmp(server_guid, peer_guid, 16) == 0 &&
-                        memcmp(server_guid, expected_guid, 16) == 0;
+                        (server_guid[7] & 0xf0) == 0x40 &&
+                        (server_guid[8] & 0xc0) == 0x80;
     const int session_ok = have_session && peer_has_session &&
                            session_id != 0 && peer_session_id != 0 &&
                            session_id != 0x1234 &&
@@ -1543,7 +2183,7 @@ int main(int argc, char **argv) {
     } else {
       printf("missing");
     }
-    printf(" samba-stable/shared=%s sessions=0x%016llx/0x%016llx (%s)\n",
+    printf(" instance-v4/shared=%s sessions=0x%016llx/0x%016llx (%s)\n",
            guid_ok ? "PASS" : "FAIL", (unsigned long long)session_id,
            (unsigned long long)peer_session_id,
            session_ok ? "PASS" : "FAIL");
@@ -1555,11 +2195,8 @@ int main(int argc, char **argv) {
   }
 
   failures += !signed_validate_negotiate(server, share);
+  failures += !signed_echo_after_optional_negotiate(server, share);
 
-  const char *only_test = argc >= 4 ? argv[3] : NULL;
-  if (only_test != NULL && strcmp(only_test, "all") == 0) {
-    only_test = NULL;
-  }
   if (only_test != NULL) {
     if (strcmp(only_test, "test8") == 0) goto test_8;
     if (strcmp(only_test, "test9") == 0) goto test_9;
@@ -1593,6 +2230,15 @@ int main(int argc, char **argv) {
     if (strcmp(only_test, "test37") == 0) goto test_37;
     if (strcmp(only_test, "test38") == 0) goto test_38;
     if (strcmp(only_test, "test39") == 0) goto test_39;
+    if (strcmp(only_test, "test40") == 0) goto test_40;
+    if (strcmp(only_test, "test41") == 0) goto test_41;
+    if (strcmp(only_test, "test42") == 0) goto test_42;
+    if (strcmp(only_test, "test43") == 0) goto test_43;
+    if (strcmp(only_test, "test44") == 0) goto test_44;
+    if (strcmp(only_test, "test45") == 0) goto test_45;
+    if (strcmp(only_test, "test46") == 0) goto test_46;
+    if (strcmp(only_test, "test47") == 0) goto test_47;
+    if (strcmp(only_test, "test48") == 0) goto test_48;
   }
 
   /* TEST 1: Sequential & Multiple Reads check */
@@ -2203,8 +2849,8 @@ test_12:
   if (only_test != NULL) goto done;
 
 test_13:
-  /* TEST 13: CopyFile pattern: reserve EOF, second handle, tail-first writes. */
-  printf("\n--- TEST 13: CopyFile reserved EOF and tail-first writes ---\n");
+  /* TEST 13: схема CopyFile: логический EOF, второй handle и записи с хвоста. */
+  printf("\n--- TEST 13: CopyFile logical EOF and tail-first writes ---\n");
   {
     const uint32_t chunk_size = 65536;
     const uint32_t file_size = 600001;
@@ -2233,7 +2879,7 @@ test_13:
     if (test_ok) {
       const int reserve_result =
           smb2_ftruncate(writer, reserve_handle, file_size);
-      printf("  Reserve EOF result=%d error=%s\n", reserve_result,
+      printf("  SET_EOF result=%d error=%s\n", reserve_result,
              smb2_get_error(writer));
       test_ok = reserve_result == 0;
     }
@@ -2266,7 +2912,7 @@ test_13:
     }
     if (reserve_handle != NULL) {
       const int close_result = smb2_close(writer, reserve_handle);
-      printf("  Reserve CLOSE result=%d error=%s\n", close_result,
+      printf("  EOF handle CLOSE result=%d error=%s\n", close_result,
              smb2_get_error(writer));
       test_ok = close_result == 0 && test_ok;
     }
@@ -3711,7 +4357,7 @@ test_28:
    * уже занимает физический FILEX, второй ждёт в очереди, а затем приходит
    * чтение файла. Более поздний READ не имеет права обогнать второй QD — это
    * точная регрессия зависания каталога из трассы Проводника. */
-  printf("\n--- TEST 28: global FIFO keeps older directory ahead of later READ ---\n");
+  printf("\n--- TEST 28: per-owner FIFO keeps older directory ahead of later READ ---\n");
   {
     enum { seed_count = 10 };
     const uint32_t read_length = 32768;
@@ -3880,11 +4526,12 @@ test_29:
   /* ТЕСТ 29 повторяет наблюдателя Проводника из реальной трассы копирования.
    * Пишущий Open заранее задаёт конечный EOF, после чего другой SMB-сеанс
    * открывает тот же ещё недописанный файл только для чтения и закрывает его.
-   * Наблюдатель обязан видеть логический EOF, но не владеет резервом и поэтому
-   * его CLOSE не имеет права физически расширять файл на EVO. */
-  printf("\n--- TEST 29: read-only CLOSE does not commit another Open's EOF ---\n");
+   * Владелец уже опубликовал логические EOF и AllocationSize, но физический
+   * файл ещё не дописан. Наблюдатель обязан видеть те же значения, а его CLOSE
+   * не имеет права материализовать хвост или менять файл на EVO. */
+  printf("\n--- TEST 29: read-only CLOSE preserves logical EOF ---\n");
   {
-    const uint64_t reserved_eof = 3182298;
+    const uint64_t logical_eof = 3182298;
     struct smb2_context *observer_context = NULL;
     struct smb2fh *owner = NULL;
     struct smb2fh *observer = NULL;
@@ -3899,17 +4546,18 @@ test_29:
     int owner_close = -1;
     int test_ok = 1;
 
-    owner = smb2_open(smb2, test_path("observer_reserved_eof.bin"),
+    owner = smb2_open(smb2, test_path("observer_logical_eof.bin"),
                       O_CREAT | O_TRUNC | O_WRONLY);
     test_ok = owner != NULL;
     if (test_ok) {
-      test_ok = smb2_ftruncate(smb2, owner, reserved_eof) == 0;
+      test_ok = smb2_ftruncate(smb2, owner, logical_eof) == 0;
     }
     if (test_ok) {
       test_ok = query_file_allocation(
                     smb2, owner, SMB2_FILE_STANDARD_INFORMATION,
                     &owner_allocation_before, &owner_eof_before) == 0 &&
-                owner_eof_before == reserved_eof;
+                owner_eof_before == logical_eof &&
+                owner_allocation_before >= logical_eof;
     }
     if (test_ok) {
       observer_context = connect_context(server, share);
@@ -3917,7 +4565,7 @@ test_29:
     }
     if (test_ok) {
       observer = smb2_open(observer_context,
-                           test_path("observer_reserved_eof.bin"), O_RDONLY);
+                           test_path("observer_logical_eof.bin"), O_RDONLY);
       test_ok = observer != NULL;
     }
     if (test_ok) {
@@ -3925,7 +4573,7 @@ test_29:
                     observer_context, observer,
                     SMB2_FILE_STANDARD_INFORMATION, &observer_allocation,
                     &observer_eof) == 0 &&
-                observer_eof == reserved_eof &&
+                observer_eof == logical_eof &&
                 observer_allocation == owner_allocation_before;
     }
     if (observer != NULL) {
@@ -3937,7 +4585,7 @@ test_29:
       test_ok = query_file_allocation(
                     smb2, owner, SMB2_FILE_STANDARD_INFORMATION,
                     &owner_allocation_after, &owner_eof_after) == 0 &&
-                owner_eof_after == reserved_eof &&
+                owner_eof_after == logical_eof &&
                 owner_allocation_after == owner_allocation_before;
     }
 
@@ -3952,8 +4600,8 @@ test_29:
            (unsigned long long)owner_allocation_after);
 
     if (owner != NULL) {
-      /* Тесту не требуется материализовать трёхмегабайтный хвост. Снимаем
-       * резерв штатным SET_EOF=0 и только затем закрываем владельца. */
+      /* Возвращаем тестовый файл к нулевой длине штатным SET_EOF=0 и только
+       * затем закрываем владельца. */
       cleanup_truncate = smb2_ftruncate(smb2, owner, 0);
       test_ok = cleanup_truncate == 0 && test_ok;
       owner_close = smb2_close(smb2, owner);
@@ -3964,7 +4612,7 @@ test_29:
       smb2_disconnect_share(observer_context);
       smb2_destroy_context(observer_context);
     }
-    (void)smb2_unlink(smb2, test_path("observer_reserved_eof.bin"));
+    (void)smb2_unlink(smb2, test_path("observer_logical_eof.bin"));
     printf("  Cleanup SET_EOF=0=%d Owner CLOSE=%d\n",
            cleanup_truncate, owner_close);
     printf("RESULT TEST 29: %s\n", test_ok ? "PASS" : "FAIL");
@@ -4596,11 +5244,11 @@ test_36:
   if (only_test != NULL) goto done;
 
 test_37:
-  /* Одна полная порция Windows должна уйти единственным 512-КиБ WRITE, а
+  /* Одна полная согласованная порция должна уйти единственным 64-КиБ WRITE, а
    * сервер обязан разбить её только внутри FILEX и вернуть все байты. */
-  printf("\n--- TEST 37: negotiated 512 KiB WRITE round-trip ---\n");
+  printf("\n--- TEST 37: negotiated 64 KiB WRITE round-trip ---\n");
   {
-    enum { file_size = 512 * 1024 };
+    enum { file_size = 64 * 1024 };
     struct smb2fh *created = NULL;
     struct smb2fh *verify = NULL;
     uint8_t *payload = (uint8_t*)malloc(file_size);
@@ -4613,9 +5261,9 @@ test_37:
     for (index = 0; payload != NULL && index < file_size; ++index) {
       payload[index] = test_byte((uint64_t)index + 0x250000ULL);
     }
-    (void)smb2_unlink(smb2, test_path("write_512k.bin"));
+    (void)smb2_unlink(smb2, test_path("write_64k.bin"));
     if (test_ok) {
-      created = smb2_open(smb2, test_path("write_512k.bin"),
+      created = smb2_open(smb2, test_path("write_64k.bin"),
                           O_CREAT | O_TRUNC | O_WRONLY);
       test_ok = created != NULL;
     }
@@ -4628,7 +5276,7 @@ test_37:
       created = NULL;
     }
     if (test_ok) {
-      verify = smb2_open(smb2, test_path("write_512k.bin"), O_RDONLY);
+      verify = smb2_open(smb2, test_path("write_64k.bin"), O_RDONLY);
       test_ok = verify != NULL;
     }
     while (test_ok && read_total < file_size) {
@@ -4648,7 +5296,7 @@ test_37:
               memcmp(payload, readback, file_size) == 0 && test_ok;
     printf("  WRITE=%d READ=%d error=%s\n", written, read_total,
            smb2_get_error(smb2));
-    (void)smb2_unlink(smb2, test_path("write_512k.bin"));
+    (void)smb2_unlink(smb2, test_path("write_64k.bin"));
     free(readback);
     free(payload);
     printf("RESULT TEST 37: %s\n", test_ok ? "PASS" : "FAIL");
@@ -4658,12 +5306,13 @@ test_37:
   if (only_test != NULL) goto done;
 
 test_38:
-  /* 512-КиБ WRITE быстро получает STATUS_PENDING и один credit, но не SUCCESS.
-   * После этого Windows адресует CANCEL по AsyncId. Финал не выдаёт credit
-   * повторно, а следующий ECHO восстанавливает рабочее окно до восьми. */
-  printf("\n--- TEST 38: exact 512 KiB WRITE CANCEL contract ---\n");
+  /* 64-КиБ WRITE быстро получает STATUS_PENDING без нового credit и не
+   * SUCCESS. Один credit занят, остальные остаются доступными. После CANCEL
+   * по AsyncId финал также не выдаёт credit, а следующий ECHO восстанавливает
+   * полное ограниченное окно. */
+  printf("\n--- TEST 38: exact 64 KiB WRITE CANCEL contract ---\n");
   {
-    enum { file_size = 512 * 1024 };
+    enum { file_size = 64 * 1024 };
     struct smb2fh *created = NULL;
     struct probe_fh_mirror *mirror = NULL;
     struct smb2_write_request request;
@@ -4687,9 +5336,9 @@ test_38:
     memset(&request, 0, sizeof(request));
     memset(&state, 0, sizeof(state));
     state.final_status = -1;
-    (void)smb2_unlink(smb2, test_path("cancel_write_512k.bin"));
+    (void)smb2_unlink(smb2, test_path("cancel_write_64k.bin"));
     if (test_ok) {
-      created = smb2_open(smb2, test_path("cancel_write_512k.bin"),
+      created = smb2_open(smb2, test_path("cancel_write_64k.bin"),
                           O_CREAT | O_TRUNC | O_WRONLY);
       test_ok = created != NULL;
     }
@@ -4723,7 +5372,7 @@ test_38:
     test_ok = test_ok &&
               state.pending_count == 1 && state.final_count == 1 &&
               state.pending_command == SMB2_WRITE &&
-              state.pending_credit == 1 &&
+              state.pending_credit == 0 &&
               (state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
               state.pending_message_id == target_message_id &&
               state.pending_async_id != 0 &&
@@ -4733,10 +5382,12 @@ test_38:
               state.final_message_id == target_message_id &&
               state.final_async_id == state.pending_async_id &&
               sequence_after_cancel == sequence_before_cancel &&
-              credits_before_cancel == 1 && credits_after_cancel == 1;
+              credits_before_cancel == SMB2_SERVER_CREDIT_TARGET - 1 &&
+              credits_after_cancel == SMB2_SERVER_CREDIT_TARGET - 1;
     echo_ok = smb2_echo(smb2) == 0;
     credits_after_echo = smb2->credits;
-    test_ok = test_ok && echo_ok && credits_after_echo == 8;
+    test_ok = test_ok && echo_ok &&
+              credits_after_echo == SMB2_SERVER_CREDIT_TARGET;
     smb2_set_passthrough(smb2, old_passthrough);
     printf("  target-mid=0x%016llx async=0x%016llx final=%08x "
            "sequence=%llu/%llu credits=%d/%d/%d echo=%s\n",
@@ -4750,7 +5401,7 @@ test_38:
     if (created != NULL) {
       (void)smb2_close(smb2, created);
     }
-    (void)smb2_unlink(smb2, test_path("cancel_write_512k.bin"));
+    (void)smb2_unlink(smb2, test_path("cancel_write_64k.bin"));
     free(payload);
     printf("RESULT TEST 38: %s\n", test_ok ? "PASS" : "FAIL");
     failures += !test_ok;
@@ -4833,7 +5484,8 @@ test_39:
               state.corrupted == 0;
     echo_ok = smb2_echo(smb2) == 0;
     credits_after_echo = smb2->credits;
-    test_ok = test_ok && echo_ok && credits_after_echo == 8;
+    test_ok = test_ok && echo_ok &&
+              credits_after_echo == SMB2_SERVER_CREDIT_TARGET;
     smb2_set_passthrough(smb2, old_passthrough);
     printf("  pending=%d credit=%u async=0x%016llx final=%08x/%u "
            "credits=%d/%d echo=%s\n",
@@ -4846,6 +5498,1073 @@ test_39:
     (void)smb2_unlink(smb2, test_path("delayed_read_pending.bin"));
     free(payload);
     printf("RESULT TEST 39: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_40:
+  /* Поведение до FLUSH возвращено к .88: начальный рост EOF сразу создаёт
+   * логический резерв, RWH lease не выдаётся, а служебный metadata Open после
+   * 4 МиБ получает снимок из памяти. Физический SET_EOF32 с задержкой 600 мс
+   * выполняется только внутри FLUSH. Несколько WRITE уже стоят вне порядка в
+   * очереди, поэтому FLUSH обязан быть async FIFO-барьером: PENDING до старших
+   * WRITE и SUCCESS после WRITE и SET_EOF. */
+  printf("\n--- TEST 40: .88 SET_EOF + physical FLUSH FIFO barrier ---\n");
+  {
+    enum {
+      block_size = 64 * 1024,
+      boundary_size = 4 * 1024 * 1024,
+      file_size = 7 * 1024 * 1024 + 1,
+      queued_write_count = 4
+    };
+    struct smb2fh *created = NULL;
+    struct smb2fh *reader = NULL;
+    struct smb2fh *metadata_handle = NULL;
+    struct probe_fh_mirror *mirror = NULL;
+    struct raw_create_state lease_open;
+    struct raw_create_state metadata_open;
+    uint8_t lease_key[16];
+    struct smb2_file_end_of_file_info eof_info;
+    struct smb2_set_info_request request;
+    struct raw_async_set_info_state state;
+    struct smb2_write_request write_requests[queued_write_count];
+    struct raw_async_write_state write_states[queued_write_count];
+    struct raw_async_flush_state flush_state;
+    struct smb2_flush_request flush_request;
+    struct smb2_stat_64 stat_info;
+    struct smb2_pdu *pdu = NULL;
+    const uint32_t queued_offsets[queued_write_count] = {
+        82u * block_size, 101u * block_size,
+        64u * block_size, 66u * block_size};
+    uint8_t *payload = (uint8_t*)malloc(block_size);
+    uint8_t *queued_payloads =
+        (uint8_t*)malloc((size_t)queued_write_count * block_size);
+    uint8_t *readback = (uint8_t*)malloc(block_size);
+    uint8_t logical_tail = 0xff;
+    uint8_t reopened_boundary = 0xff;
+    uint8_t reopened_tail = 0xff;
+    DWORD set_eof_started = 0;
+    DWORD set_eof_elapsed = 0;
+    DWORD read_started = 0;
+    DWORD read_elapsed = 0;
+    DWORD flush_started = 0;
+    DWORD flush_elapsed = 0;
+    DWORD close_started = 0;
+    DWORD close_elapsed = 0;
+    int old_passthrough = 0;
+    int flush_result = -1;
+    int close_result = -1;
+    int credits_after_eof = 0;
+    int test_ok = payload != NULL && queued_payloads != NULL &&
+                  readback != NULL;
+    uint32_t offset;
+    int index;
+
+    memset(&lease_open, 0, sizeof(lease_open));
+    memset(&metadata_open, 0, sizeof(metadata_open));
+    for (index = 0; index < 16; ++index) {
+      lease_key[index] = (uint8_t)(0x89 + index * 7);
+    }
+    memset(&eof_info, 0, sizeof(eof_info));
+    memset(&request, 0, sizeof(request));
+    memset(&state, 0, sizeof(state));
+    memset(write_requests, 0, sizeof(write_requests));
+    memset(write_states, 0, sizeof(write_states));
+    memset(&flush_state, 0, sizeof(flush_state));
+    memset(&flush_request, 0, sizeof(flush_request));
+    memset(&stat_info, 0, sizeof(stat_info));
+    state.final_status = -1;
+    (void)smb2_unlink(smb2, test_path("async_seteof.bin"));
+
+    if (test_ok) {
+      test_ok = raw_windows_destination_open(
+                    smb2, test_path("async_seteof.bin"), &lease_open) == 0 &&
+                (uint32_t)lease_open.status == SMB2_STATUS_SUCCESS &&
+                lease_open.oplock_level == SMB2_OPLOCK_LEVEL_LEASE &&
+                inspect_raw_lease_response(
+                    &lease_open, lease_key, 0, SMB2_LEASE_NONE) == 0;
+    }
+    if (test_ok) {
+      created = smb2_fh_from_file_id(smb2, &lease_open.file_id);
+      test_ok = created != NULL;
+    }
+    if (test_ok) {
+      mirror = (struct probe_fh_mirror*)created;
+      eof_info.end_of_file = file_size;
+      request.info_type = SMB2_0_INFO_FILE;
+      request.file_info_class = SMB2_FILE_END_OF_FILE_INFORMATION;
+      request.input_data = &eof_info;
+      memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
+      /* Рост EOF синхронно резервирует видимую длину без физической записи.
+       * Задержанный SET_EOF32 должен появиться только внутри FLUSH. */
+      pdu = smb2_cmd_set_info_async(smb2, &request,
+                                    raw_async_set_info_cb, &state);
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+      test_ok = pdu != NULL;
+    }
+    if (test_ok) {
+      set_eof_started = GetTickCount();
+      smb2_queue_pdu(smb2, pdu);
+      test_ok = wait_for_count(smb2, &state.completed, 1, 5000) == 0;
+      set_eof_elapsed = GetTickCount() - set_eof_started;
+    }
+    smb2_set_passthrough(smb2, old_passthrough);
+    test_ok = test_ok && state.pending_count == 0 && state.final_count == 1 &&
+              state.final_command == SMB2_SET_INFO &&
+              (state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) == 0 &&
+              (uint32_t)state.final_status == SMB2_STATUS_SUCCESS &&
+              set_eof_elapsed < 300;
+    if (test_ok) {
+      test_ok = smb2_fstat(smb2, created, &stat_info) == 0 &&
+                stat_info.smb2_size == file_size;
+    }
+    /* CREATE назначения не уменьшает общее окно: восемь запросов позволяют
+     * Windows поставить целую 512-КиБ порцию без чередования дорожек. */
+    credits_after_eof = smb2->credits;
+    test_ok = test_ok &&
+              credits_after_eof == SMB2_SERVER_CREDIT_TARGET;
+    if (test_ok) {
+      read_started = GetTickCount();
+      test_ok = smb2_pread(smb2, created, &logical_tail, 1,
+                           file_size - 1) == 1 && logical_tail == 0;
+      read_elapsed = GetTickCount() - read_started;
+      test_ok = test_ok && read_elapsed < 300;
+    }
+    for (offset = 0; test_ok && offset < boundary_size;
+         offset += block_size) {
+      for (index = 0; index < block_size; ++index) {
+        payload[index] = test_byte((uint64_t)offset + (uint32_t)index);
+      }
+      test_ok = smb2_pwrite(smb2, created, payload, block_size, offset) ==
+                block_size;
+    }
+    if (test_ok) {
+      test_ok = raw_windows_metadata_open(
+                    smb2, test_path("async_seteof.bin"), &metadata_open) == 0 &&
+                (uint32_t)metadata_open.status == SMB2_STATUS_SUCCESS;
+    }
+    if (test_ok) {
+      metadata_handle = smb2_fh_from_file_id(smb2, &metadata_open.file_id);
+      test_ok = metadata_handle != NULL &&
+                smb2_close(smb2, metadata_handle) == 0;
+      metadata_handle = NULL;
+    }
+    if (test_ok) {
+      flush_state.writes = write_states;
+      flush_state.write_count = queued_write_count;
+      flush_state.final_status = -1;
+      memcpy(flush_request.file_id, mirror->file_id,
+             sizeof(flush_request.file_id));
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+      for (index = 0; index < queued_write_count; ++index) {
+        uint8_t *queued_payload = queued_payloads + (size_t)index * block_size;
+        int byte_index;
+        for (byte_index = 0; byte_index < block_size; ++byte_index) {
+          queued_payload[byte_index] =
+              test_byte((uint64_t)queued_offsets[index] +
+                        (uint32_t)byte_index);
+        }
+        write_requests[index].offset = queued_offsets[index];
+        write_requests[index].length = block_size;
+        write_requests[index].buf = queued_payload;
+        memcpy(write_requests[index].file_id, mirror->file_id,
+               sizeof(write_requests[index].file_id));
+        write_states[index].expected_count = block_size;
+        write_states[index].final_status = -1;
+        pdu = smb2_cmd_write_async(smb2, &write_requests[index], 0,
+                                   raw_async_write_cb, &write_states[index]);
+        if (pdu == NULL) {
+          test_ok = 0;
+          break;
+        }
+        smb2_queue_pdu(smb2, pdu);
+      }
+    }
+    if (test_ok) {
+      pdu = smb2_cmd_flush_async(smb2, &flush_request,
+                                 raw_async_flush_cb, &flush_state);
+      test_ok = pdu != NULL;
+    }
+    if (test_ok) {
+      flush_started = GetTickCount();
+      smb2_queue_pdu(smb2, pdu);
+      /* Полное кредитное окно сразу ставит четыре WRITE и FLUSH. FLUSH не имеет
+       * права обогнать записи и затем отдельно ждёт физический SET_EOF резерва. */
+      test_ok =
+          wait_for_count(smb2, &flush_state.pending_count, 1, 15000) == 0 &&
+          wait_for_count(smb2, &flush_state.completed, 1, 30000) == 0;
+      flush_elapsed = GetTickCount() - flush_started;
+      flush_result = flush_state.final_status;
+    }
+    smb2_set_passthrough(smb2, old_passthrough);
+    if (test_ok) {
+      test_ok = flush_state.pending_count == 1 &&
+                flush_state.final_count == 1 &&
+                flush_state.pending_command == SMB2_FLUSH &&
+                flush_state.final_command == SMB2_FLUSH &&
+                (flush_state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+                (flush_state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+                flush_state.pending_async_id != 0 &&
+                flush_state.final_message_id ==
+                    flush_state.pending_message_id &&
+                flush_state.final_async_id == flush_state.pending_async_id &&
+                (uint32_t)flush_state.final_status == SMB2_STATUS_SUCCESS &&
+                flush_state.writes_completed_at_pending < queued_write_count &&
+                flush_state.writes_completed_at_final == queued_write_count &&
+                flush_elapsed >= 500;
+      for (index = 0; test_ok && index < queued_write_count; ++index) {
+        test_ok = write_states[index].completed &&
+                  write_states[index].final_count == 1 &&
+                  (uint32_t)write_states[index].final_status ==
+                      SMB2_STATUS_SUCCESS &&
+                  write_states[index].final_count_value == block_size;
+      }
+    }
+    if (test_ok) {
+      memset(&stat_info, 0, sizeof(stat_info));
+      test_ok = smb2_fstat(smb2, created, &stat_info) == 0 &&
+                stat_info.smb2_size == file_size;
+    }
+    if (created != NULL) {
+      close_started = GetTickCount();
+      close_result = smb2_close(smb2, created);
+      close_elapsed = GetTickCount() - close_started;
+      test_ok = close_result == 0 && close_elapsed < 1000 && test_ok;
+      created = NULL;
+    }
+    if (test_ok) {
+      reader = smb2_open(smb2, test_path("async_seteof.bin"), O_RDONLY);
+      test_ok = reader != NULL &&
+                smb2_fstat(smb2, reader, &stat_info) == 0 &&
+                stat_info.smb2_size == file_size &&
+                smb2_pread(smb2, reader, &reopened_boundary, 1,
+                           boundary_size) == 1 &&
+                reopened_boundary == test_byte(boundary_size) &&
+                smb2_pread(smb2, reader, &reopened_tail, 1,
+                           file_size - 1) == 1 && reopened_tail == 0;
+    }
+    for (index = 0; test_ok && index < queued_write_count; ++index) {
+      test_ok = smb2_pread(smb2, reader, readback, block_size,
+                           queued_offsets[index]) == block_size &&
+                memcmp(readback,
+                       queued_payloads + (size_t)index * block_size,
+                       block_size) == 0;
+    }
+    if (reader != NULL) {
+      test_ok = smb2_close(smb2, reader) == 0 && test_ok;
+    }
+    printf("  reserve-pending=%d final=%08x EOF=%llu reserve=%lu ms credits=%d "
+           "zero-read=%lu ms metadata-open=%08x "
+           "flush-pending=%d final=%08x writes=%d/%d elapsed=%lu ms "
+           "close=%d/%lu ms boundary=%u tail=%u/%u\n",
+           state.pending_count, (unsigned)state.final_status,
+           (unsigned long long)stat_info.smb2_size,
+           (unsigned long)set_eof_elapsed, credits_after_eof,
+           (unsigned long)read_elapsed, (unsigned)metadata_open.status,
+           flush_state.pending_count, (unsigned)flush_result,
+           flush_state.writes_completed_at_pending,
+           flush_state.writes_completed_at_final,
+           (unsigned long)flush_elapsed, close_result,
+           (unsigned long)close_elapsed, (unsigned)reopened_boundary,
+           (unsigned)logical_tail,
+           (unsigned)reopened_tail);
+    if (!test_ok) {
+      printf("  error=%s\n", smb2_get_error(smb2));
+    }
+    (void)smb2_unlink(smb2, test_path("async_seteof.bin"));
+    free(readback);
+    free(queued_payloads);
+    free(payload);
+    printf("RESULT TEST 40: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_41:
+  /* Незавершённый WRITE одного FileId не должен задерживать CLOSE другого
+   * metadata-only FileId. Старый глобальный physicalQueueBusy ставил такой
+   * CLOSE за чужой WRITE; Windows/FAR видел паузу или сетевую ошибку. */
+  printf("\n--- TEST 41: metadata CLOSE bypasses unrelated WRITE queue ---\n");
+  {
+    enum { file_size = 32768 };
+    struct smb2fh *target = NULL;
+    struct smb2fh *metadata_handle = NULL;
+    struct smb2fh *background = NULL;
+    struct raw_create_state metadata_open;
+    struct normalized_name_state normalized_name;
+    struct raw_command_state write_state;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    const int require_early_close =
+        getenv("ZIFI_EXPECT_LOGICAL_CLOSE_FIRST") != NULL;
+    int close_result = -1;
+    int write_was_done_at_close = -1;
+    int test_ok = payload != NULL;
+    int index;
+
+    memset(&metadata_open, 0, sizeof(metadata_open));
+    memset(&normalized_name, 0, sizeof(normalized_name));
+    memset(&write_state, 0, sizeof(write_state));
+    write_state.status = -1;
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x410000ULL);
+    }
+    (void)smb2_unlink(smb2, test_path("metadata_close_target.bin"));
+    (void)smb2_unlink(smb2, test_path("metadata_close_background.bin"));
+
+    if (test_ok) {
+      target = smb2_open(smb2, test_path("metadata_close_target.bin"),
+                         O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = target != NULL;
+    }
+    if (test_ok) {
+      test_ok = raw_windows_metadata_open(
+                    smb2, test_path("metadata_close_target.bin"),
+                    &metadata_open) == 0 &&
+                (uint32_t)metadata_open.status == SMB2_STATUS_SUCCESS &&
+                raw_query_normalized_name(smb2, metadata_open.file_id,
+                                          &normalized_name) == 0 &&
+                (uint32_t)normalized_name.status == SMB2_STATUS_SUCCESS &&
+                normalized_name.decoded;
+    }
+    if (test_ok) {
+      metadata_handle = smb2_fh_from_file_id(smb2, &metadata_open.file_id);
+      test_ok = metadata_handle != NULL;
+    }
+    if (test_ok) {
+      background = smb2_open(
+          smb2, test_path("metadata_close_background.bin"),
+          O_CREAT | O_TRUNC | O_WRONLY);
+      test_ok = background != NULL;
+    }
+    if (test_ok) {
+      test_ok = smb2_write_async(smb2, background, payload, file_size,
+                                 raw_command_cb, &write_state) == 0;
+    }
+    if (metadata_handle != NULL) {
+      close_result = smb2_close(smb2, metadata_handle);
+      metadata_handle = NULL;
+      write_was_done_at_close = write_state.done;
+      test_ok = close_result == 0 &&
+                (!require_early_close || !write_was_done_at_close) && test_ok;
+    }
+    if (background != NULL) {
+      test_ok = smb2_close(smb2, background) == 0 &&
+                write_state.done && write_state.status == file_size && test_ok;
+      background = NULL;
+    }
+    if (target != NULL) {
+      test_ok = smb2_close(smb2, target) == 0 && test_ok;
+      target = NULL;
+    }
+
+    printf("  metadata CLOSE=%d write-done-at-close=%d final-write=%d "
+           "require-early=%d\n",
+           close_result, write_was_done_at_close, write_state.status,
+           require_early_close);
+    (void)smb2_unlink(smb2, test_path("metadata_close_target.bin"));
+    (void)smb2_unlink(smb2, test_path("metadata_close_background.bin"));
+    free(payload);
+    printf("RESULT TEST 41: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_42:
+  /* Этот процесс играет только клиента A и не использует потоки: один
+   * экземпляр libsmb2 не обязан быть потокобезопасным. Полное согласованное
+   * окно 64-КиБ WRITE заранее ставится в очередь. Отдельный test42list обязан
+   * завершиться после текущего физического запроса, а порядок WRITE и
+   * последующего FLUSH клиента A менять нельзя. */
+  printf("\n--- TEST 42: copy side of two-process concurrent regression ---\n");
+  {
+    enum {
+      block_size = 64 * 1024,
+      block_count = SMB2_SERVER_CREDIT_TARGET,
+      file_size = block_size * block_count
+    };
+    struct smb2fh *writer = NULL;
+    struct smb2fh *reader = NULL;
+    struct probe_fh_mirror *mirror = NULL;
+    struct smb2_stat_64 stat_info;
+    struct smb2_write_request requests[block_count];
+    struct raw_async_write_state states[block_count];
+    struct smb2_pdu *pdu = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint8_t *readback = (uint8_t*)malloc(block_size);
+    int writes_completed = 0;
+    int writer_echo = 0;
+    int flush_ok = 0;
+    int credits_before_write = 0;
+    int old_passthrough = 0;
+    int test_ok = payload != NULL && readback != NULL;
+    int index;
+
+    memset(&stat_info, 0, sizeof(stat_info));
+    memset(requests, 0, sizeof(requests));
+    memset(states, 0, sizeof(states));
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x420000ULL);
+    }
+    (void)smb2_unlink(smb2, test_path("concurrent_copy.bin"));
+
+    if (test_ok) {
+      writer = smb2_open(smb2, test_path("concurrent_copy.bin"),
+                         O_CREAT | O_TRUNC | O_RDWR);
+      test_ok = writer != NULL && smb2_ftruncate(smb2, writer, file_size) == 0;
+    }
+    for (index = 0; test_ok && index < SMB2_SERVER_CREDIT_TARGET &&
+                    smb2->credits < SMB2_SERVER_CREDIT_TARGET; ++index) {
+      test_ok = smb2_echo(smb2) == 0;
+    }
+    credits_before_write = smb2->credits;
+    test_ok = test_ok &&
+              credits_before_write == SMB2_SERVER_CREDIT_TARGET;
+    if (test_ok) {
+      mirror = (struct probe_fh_mirror*)writer;
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+    }
+    for (index = 0; test_ok && index < block_count; ++index) {
+      requests[index].offset = (uint64_t)index * block_size;
+      requests[index].length = block_size;
+      requests[index].buf = payload + (size_t)index * block_size;
+      memcpy(requests[index].file_id, mirror->file_id,
+             sizeof(requests[index].file_id));
+      states[index].expected_count = block_size;
+      states[index].final_status = -1;
+      pdu = smb2_cmd_write_async(smb2, &requests[index], 0,
+                                 raw_async_write_cb, &states[index]);
+      if (pdu == NULL) {
+        test_ok = 0;
+      } else {
+        smb2_queue_pdu(smb2, pdu);
+      }
+    }
+    if (test_ok) {
+      /* При стендовой задержке 1,5 с каждый WRITE состоит из четырёх
+       * физических 16-КиБ окон. Запас учитывает планировщик Windows и медленную
+       * отладочную сборку: таймаут проверяет очередь, а не обрывает её перед
+       * последним финальным SMB-ответом. */
+      test_ok = wait_async_writes(smb2, states, block_count, 180000) == 0;
+    }
+    smb2_set_passthrough(smb2, old_passthrough);
+    for (index = 0; index < block_count; ++index) {
+      const int completed = states[index].completed &&
+                            states[index].final_count == 1 &&
+                            (uint32_t)states[index].final_status ==
+                                SMB2_STATUS_SUCCESS &&
+                            states[index].final_count_value == block_size;
+      writes_completed += completed;
+      test_ok = completed && test_ok;
+    }
+    if (writer != NULL) {
+      flush_ok = smb2_fsync(smb2, writer) == 0;
+      test_ok = flush_ok && smb2_close(smb2, writer) == 0 && test_ok;
+      writer = NULL;
+    }
+    writer_echo = smb2_echo(smb2) == 0;
+    test_ok = writer_echo && test_ok;
+    if (test_ok) {
+      reader = smb2_open(smb2, test_path("concurrent_copy.bin"), O_RDONLY);
+      test_ok = reader != NULL &&
+                smb2_fstat(smb2, reader, &stat_info) == 0 &&
+                stat_info.smb2_size == file_size;
+    }
+    for (index = 0; test_ok && index < block_count; ++index) {
+      test_ok = smb2_pread(smb2, reader, readback, block_size,
+                           (uint64_t)index * block_size) == block_size &&
+                memcmp(readback, payload + (size_t)index * block_size,
+                       block_size) == 0;
+    }
+    if (reader != NULL) {
+      test_ok = smb2_close(smb2, reader) == 0 && test_ok;
+      reader = NULL;
+    }
+
+    printf("  credits=%d pipelined writes=%d/%d FLUSH=%s echo=%s "
+           "size=%llu\n", credits_before_write, writes_completed, block_count,
+           flush_ok ? "SUCCESS" : "FAIL",
+           writer_echo ? "PASS" : "FAIL",
+           (unsigned long long)stat_info.smb2_size);
+    if (!test_ok) {
+      printf("  writer-error=%s\n", smb2_get_error(smb2));
+    }
+    if (writer != NULL) {
+      (void)smb2_close(smb2, writer);
+    }
+    free(readback);
+    free(payload);
+    printf("RESULT TEST 42: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_43:
+  /* Сервер может отказать каталогу в кэширующем lease, но не имеет права
+   * превращать запрошенный lease в ответ без RqLs: на этом месте Windows
+   * Explorer прекращал посылать QUERY_DIRECTORY и оставлял вход висящим. */
+  printf("\n--- TEST 43: Explorer directory lease NONE response ---\n");
+  {
+    const char *directory = test_directory[0] == '\0' ? "" : test_directory;
+    struct raw_create_state state;
+    struct smb2fh *directory_handle = NULL;
+    uint8_t lease_key[16];
+    int test_ok;
+
+    memset(&state, 0, sizeof(state));
+    memset(lease_key, 0, sizeof(lease_key));
+    test_ok = raw_windows_directory_lease_open(
+                  smb2, directory, &state, lease_key) == 0 &&
+              (uint32_t)state.status == SMB2_STATUS_SUCCESS &&
+              state.oplock_level == SMB2_OPLOCK_LEVEL_LEASE &&
+              inspect_raw_lease_response(
+                  &state, lease_key, 0, SMB2_LEASE_NONE) == 0;
+    if ((uint32_t)state.status == SMB2_STATUS_SUCCESS) {
+      directory_handle = smb2_fh_from_file_id(smb2, &state.file_id);
+      test_ok = directory_handle != NULL && test_ok;
+      if (directory_handle != NULL) {
+        test_ok = smb2_close(smb2, directory_handle) == 0 && test_ok;
+      }
+    }
+    printf("  status=%08x oplock=%02x contexts=%lu RqLs(NONE)=%s\n",
+           (unsigned)state.status, (unsigned)state.oplock_level,
+           (unsigned long)state.create_context_length,
+           inspect_raw_lease_response(
+               &state, lease_key, 0, SMB2_LEASE_NONE) == 0 ? "PASS" : "FAIL");
+    printf("RESULT TEST 43: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_44:
+  /* Тестовый сервер сокращает порог долгого I/O до 250 мс. После появления
+   * AsyncId намеренно посылаем SMB2 CANCEL: допустимо закончить только уже
+   * начатое физическое окно 16 КиБ, но не весь исходный WRITE. В производстве
+   * ранний PENDING запрещён, а реальный Explorer в захвате .hil23 после нажатия
+   * кнопки CANCEL вообще не послал и закончил собственный блок 4 МиБ. */
+  printf("\n--- TEST 44: delayed-PENDING CopyFile WRITE CANCEL ---\n");
+  {
+    enum { file_size = 64 * 1024, physical_window = 16 * 1024 };
+    struct smb2fh *created = NULL;
+    struct probe_fh_mirror *mirror = NULL;
+    struct raw_create_state lease_open;
+    struct raw_async_write_state state;
+    struct smb2_write_request request;
+    struct smb2_stat_64 stat_info;
+    struct smb2_pdu *pdu = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint64_t target_message_id = 0;
+    DWORD pending_started = 0;
+    DWORD pending_elapsed = 0;
+    int old_passthrough = 0;
+    int test_ok = payload != NULL;
+    int index;
+
+    memset(&lease_open, 0, sizeof(lease_open));
+    memset(&state, 0, sizeof(state));
+    memset(&request, 0, sizeof(request));
+    memset(&stat_info, 0, sizeof(stat_info));
+    state.final_status = -1;
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x440000ULL);
+    }
+    (void)smb2_unlink(smb2, test_path("copy_cancel_immediate.bin"));
+
+    if (test_ok) {
+      test_ok = raw_windows_destination_open(
+                    smb2, test_path("copy_cancel_immediate.bin"),
+                    &lease_open) == 0 &&
+                (uint32_t)lease_open.status == SMB2_STATUS_SUCCESS &&
+                lease_open.oplock_level == SMB2_OPLOCK_LEVEL_LEASE;
+    }
+    if (test_ok) {
+      created = smb2_fh_from_file_id(smb2, &lease_open.file_id);
+      test_ok = created != NULL;
+    }
+    if (test_ok) {
+      mirror = (struct probe_fh_mirror*)created;
+      request.offset = 0;
+      request.length = file_size;
+      request.buf = payload;
+      memcpy(request.file_id, mirror->file_id, sizeof(request.file_id));
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+      target_message_id = smb2->message_id;
+      pdu = smb2_cmd_write_async(smb2, &request, 0,
+                                 raw_async_write_cb, &state);
+      test_ok = pdu != NULL;
+    }
+    if (test_ok) {
+      pending_started = GetTickCount();
+      smb2_queue_pdu(smb2, pdu);
+      test_ok = wait_for_count(smb2, &state.pending_count, 1, 2000) == 0;
+      pending_elapsed = GetTickCount() - pending_started;
+    }
+    if (test_ok) {
+      pdu = smb2_cmd_cancel_async(smb2, 0, state.pending_async_id);
+      test_ok = pdu != NULL;
+      if (pdu != NULL) smb2_queue_pdu(smb2, pdu);
+    }
+    if (test_ok) {
+      test_ok = wait_for_count(smb2, &state.completed, 1, 10000) == 0;
+    }
+    smb2_set_passthrough(smb2, old_passthrough);
+    if (created != NULL) {
+      test_ok = smb2_fstat(smb2, created, &stat_info) == 0 && test_ok;
+    }
+    test_ok = test_ok &&
+              state.pending_count == 1 && state.final_count == 1 &&
+              state.pending_command == SMB2_WRITE &&
+              (state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+              state.pending_message_id == target_message_id &&
+              state.pending_async_id != 0 &&
+              (uint32_t)state.final_status == SMB2_STATUS_CANCELLED &&
+              state.final_command == SMB2_WRITE &&
+              (state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+              state.final_message_id == target_message_id &&
+              state.final_async_id == state.pending_async_id &&
+              pending_elapsed < 2000 &&
+              stat_info.smb2_size <= physical_window;
+    printf("  pending=%d/%lu ms async=0x%016llx final=%08x "
+           "physical=%llu/%u (%s)\n",
+           state.pending_count, (unsigned long)pending_elapsed,
+           (unsigned long long)state.pending_async_id,
+           (unsigned)state.final_status,
+           (unsigned long long)stat_info.smb2_size, physical_window,
+           test_ok ? "PASS" : "FAIL");
+    if (created != NULL) {
+      (void)smb2_close(smb2, created);
+    }
+    (void)smb2_unlink(smb2, test_path("copy_cancel_immediate.bin"));
+    free(payload);
+    printf("RESULT TEST 44: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  if (only_test != NULL) goto done;
+
+test_45:
+  /* Каждый физический WRITE здесь короче производственного 30-секундного
+   * порога. Поэтому ни активный, ни ожидающий запрос не должен получить ранний
+   * PENDING: возвращённый credit менял порядок частей CopyFile и надолго
+   * задерживал первый 512-КиБ блок индикатора. Шестнадцать заранее поставленных
+   * WRITE одновременно проверяют, что ограниченная очередь не переполняется. */
+  printf("\n--- TEST 45: no early CopyFile WRITE PENDING ---\n");
+  {
+    enum {
+      block_size = 64 * 1024,
+      block_count = 2 * SMB2_SERVER_CREDIT_TARGET,
+      file_size = block_size * block_count
+    };
+    struct smb2fh *created = NULL;
+    struct smb2fh *reader = NULL;
+    struct probe_fh_mirror *mirror = NULL;
+    struct raw_create_state lease_open;
+    struct raw_async_write_state states[block_count];
+    struct smb2_write_request requests[block_count];
+    struct smb2_stat_64 stat_info;
+    struct smb2_pdu *pdu = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint8_t *readback = (uint8_t*)malloc(block_size);
+    int old_passthrough = 0;
+    int writes_completed = 0;
+    int pending_replies = 0;
+    int test_ok = payload != NULL && readback != NULL;
+    int index;
+
+    memset(&lease_open, 0, sizeof(lease_open));
+    memset(states, 0, sizeof(states));
+    memset(requests, 0, sizeof(requests));
+    memset(&stat_info, 0, sizeof(stat_info));
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x450000ULL);
+    }
+    (void)smb2_unlink(smb2, test_path("copy_active_pending.bin"));
+
+    if (test_ok) {
+      test_ok = raw_windows_destination_open(
+                    smb2, test_path("copy_active_pending.bin"),
+                    &lease_open) == 0 &&
+                (uint32_t)lease_open.status == SMB2_STATUS_SUCCESS &&
+                lease_open.oplock_level == SMB2_OPLOCK_LEVEL_LEASE;
+    }
+    if (test_ok) {
+      created = smb2_fh_from_file_id(smb2, &lease_open.file_id);
+      test_ok = created != NULL;
+    }
+    if (test_ok) {
+      mirror = (struct probe_fh_mirror*)created;
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+    }
+    for (index = 0; test_ok && index < block_count; ++index) {
+      states[index].final_status = -1;
+      states[index].expected_count = block_size;
+      requests[index].offset = (uint64_t)index * block_size;
+      requests[index].length = block_size;
+      requests[index].buf = payload + (size_t)index * block_size;
+      memcpy(requests[index].file_id, mirror->file_id,
+             sizeof(requests[index].file_id));
+      pdu = smb2_cmd_write_async(smb2, &requests[index], 0,
+                                 raw_async_write_cb, &states[index]);
+      if (pdu == NULL) {
+        test_ok = 0;
+      } else {
+        smb2_queue_pdu(smb2, pdu);
+      }
+    }
+    if (test_ok) {
+      test_ok = wait_async_writes(smb2, states, block_count, 60000) == 0;
+    }
+    smb2_set_passthrough(smb2, old_passthrough);
+    for (index = 0; index < block_count; ++index) {
+      const int completed = states[index].completed &&
+                            states[index].pending_count == 0 &&
+                            states[index].final_count == 1 &&
+                            (uint32_t)states[index].final_status ==
+                                SMB2_STATUS_SUCCESS &&
+                            states[index].final_count_value == block_size;
+      writes_completed += completed;
+      pending_replies += states[index].pending_count;
+      test_ok = completed && test_ok;
+    }
+    if (created != NULL) {
+      test_ok = smb2_fstat(smb2, created, &stat_info) == 0 &&
+                stat_info.smb2_size == file_size &&
+                smb2_close(smb2, created) == 0 && test_ok;
+      created = NULL;
+    }
+    if (test_ok) {
+      reader = smb2_open(smb2, test_path("copy_active_pending.bin"),
+                         O_RDONLY);
+      test_ok = reader != NULL;
+    }
+    for (index = 0; test_ok && index < block_count; ++index) {
+      test_ok = smb2_pread(smb2, reader, readback, block_size,
+                           (uint64_t)index * block_size) == block_size &&
+                memcmp(readback, payload + (size_t)index * block_size,
+                       block_size) == 0;
+    }
+    if (reader != NULL) {
+      test_ok = smb2_close(smb2, reader) == 0 && test_ok;
+      reader = NULL;
+    }
+
+    printf("  writes=%d/%d pending=%d/0 size=%llu readback=%s\n",
+           writes_completed, block_count, pending_replies,
+           (unsigned long long)stat_info.smb2_size,
+           test_ok ? "PASS" : "FAIL");
+    if (created != NULL) {
+      (void)smb2_close(smb2, created);
+    }
+    (void)smb2_unlink(smb2, test_path("copy_active_pending.bin"));
+    free(readback);
+    free(payload);
+    printf("RESULT TEST 45: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  /* TEST 46 требует намеренно медленного физического I/O, поэтому он запускается
+   * отдельно и не входит в обычный прогон TEST 1..45. Прямой test45 тоже должен
+   * закончиться здесь, а прямой test46 попадает сразу на следующую метку. */
+  if (only_test == NULL || strcmp(only_test, "test45") == 0) goto done;
+
+test_46:
+  /* Windows перед FlushFileBuffers сначала дожидается собственных грязных
+   * WRITE, поэтому его FLUSH часто приходит к уже чистому handle. Здесь восемь
+   * WRITE и FLUSH ставятся в wire-очередь одновременно. FLUSH обязан получить
+   * STATUS_PENDING, пока старшие WRITE ещё физически выполняются, и вернуть
+   * окончательный SUCCESS только после всех восьми ответов. */
+  printf("\n--- TEST 46: pipelined physical FLUSH barrier ---\n");
+  {
+    enum {
+      block_size = 64 * 1024,
+      block_count = SMB2_SERVER_CREDIT_TARGET,
+      file_size = block_size * block_count
+    };
+    struct smb2fh *created = NULL;
+    struct probe_fh_mirror *mirror = NULL;
+    struct smb2_write_request requests[block_count];
+    struct raw_async_write_state states[block_count];
+    struct raw_async_flush_state flush_state;
+    struct smb2_flush_request flush_request;
+    struct smb2_stat_64 stat_info;
+    struct smb2_pdu *pdu = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    DWORD started = 0;
+    DWORD elapsed = 0;
+    int old_passthrough = 0;
+    int writes_completed = 0;
+    int test_ok = payload != NULL;
+    int index;
+
+    memset(requests, 0, sizeof(requests));
+    memset(states, 0, sizeof(states));
+    memset(&flush_state, 0, sizeof(flush_state));
+    memset(&flush_request, 0, sizeof(flush_request));
+    memset(&stat_info, 0, sizeof(stat_info));
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x460000ULL);
+    }
+    (void)smb2_unlink(smb2, test_path("pipelined_flush.bin"));
+
+    if (test_ok) {
+      created = smb2_open(smb2, test_path("pipelined_flush.bin"),
+                          O_CREAT | O_TRUNC | O_RDWR);
+      test_ok = created != NULL;
+    }
+    for (index = 0; test_ok && index < SMB2_SERVER_CREDIT_TARGET &&
+                    smb2->credits < SMB2_SERVER_CREDIT_TARGET; ++index) {
+      test_ok = smb2_echo(smb2) == 0;
+    }
+    test_ok = test_ok && smb2->credits == SMB2_SERVER_CREDIT_TARGET;
+    if (test_ok) {
+      mirror = (struct probe_fh_mirror*)created;
+      smb2_get_passthrough(smb2, &old_passthrough);
+      smb2_set_passthrough(smb2, 1);
+    }
+    for (index = 0; test_ok && index < block_count; ++index) {
+      states[index].expected_count = block_size;
+      states[index].final_status = -1;
+      requests[index].offset = (uint64_t)index * block_size;
+      requests[index].length = block_size;
+      requests[index].buf = payload + (size_t)index * block_size;
+      memcpy(requests[index].file_id, mirror->file_id,
+             sizeof(requests[index].file_id));
+      pdu = smb2_cmd_write_async(smb2, &requests[index], 0,
+                                 raw_async_write_cb, &states[index]);
+      if (pdu == NULL) {
+        test_ok = 0;
+      } else {
+        smb2_queue_pdu(smb2, pdu);
+      }
+    }
+    if (test_ok) {
+      flush_state.writes = states;
+      flush_state.write_count = block_count;
+      flush_state.final_status = -1;
+      memcpy(flush_request.file_id, mirror->file_id,
+             sizeof(flush_request.file_id));
+      pdu = smb2_cmd_flush_async(smb2, &flush_request,
+                                 raw_async_flush_cb, &flush_state);
+      test_ok = pdu != NULL;
+    }
+    if (test_ok) {
+      started = GetTickCount();
+      smb2_queue_pdu(smb2, pdu);
+      test_ok =
+          wait_for_count(smb2, &flush_state.pending_count, 1, 90000) == 0 &&
+          wait_for_count(smb2, &flush_state.completed, 1, 120000) == 0;
+      elapsed = GetTickCount() - started;
+    }
+    smb2_set_passthrough(smb2, old_passthrough);
+
+    for (index = 0; index < block_count; ++index) {
+      const int completed = states[index].completed &&
+                            states[index].final_count == 1 &&
+                            (uint32_t)states[index].final_status ==
+                                SMB2_STATUS_SUCCESS &&
+                            states[index].final_count_value == block_size;
+      writes_completed += completed;
+      test_ok = completed && test_ok;
+    }
+    test_ok = test_ok &&
+              flush_state.pending_count == 1 &&
+              flush_state.final_count == 1 &&
+              flush_state.pending_command == SMB2_FLUSH &&
+              flush_state.final_command == SMB2_FLUSH &&
+              (flush_state.pending_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+              (flush_state.final_flags & SMB2_FLAGS_ASYNC_COMMAND) != 0 &&
+              flush_state.pending_async_id != 0 &&
+              flush_state.final_message_id == flush_state.pending_message_id &&
+              flush_state.final_async_id == flush_state.pending_async_id &&
+              (uint32_t)flush_state.final_status == SMB2_STATUS_SUCCESS &&
+              flush_state.writes_completed_at_pending < block_count &&
+              flush_state.writes_completed_at_final == block_count;
+    if (created != NULL) {
+      test_ok = smb2_fstat(smb2, created, &stat_info) == 0 &&
+                stat_info.smb2_size == file_size && test_ok;
+    }
+    printf("  writes=%d/%d flush-pending=%d at-write=%d "
+           "final=%08x at-write=%d elapsed=%lu ms size=%llu\n",
+           writes_completed, block_count, flush_state.pending_count,
+           flush_state.writes_completed_at_pending,
+           (unsigned)flush_state.final_status,
+           flush_state.writes_completed_at_final, (unsigned long)elapsed,
+           (unsigned long long)stat_info.smb2_size);
+    if (created != NULL) {
+      (void)smb2_close(smb2, created);
+    }
+    (void)smb2_unlink(smb2, test_path("pipelined_flush.bin"));
+    free(payload);
+    printf("RESULT TEST 46: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+
+  goto done;
+
+test_47:
+  /* WRITE_AT задаёт абсолютное смещение: смена offset не требует нового
+   * физического OPEN того же FileId. Между записями Windows вправе открывать
+   * metadata-only FileId, не меняющий FILEX-контекст. Число OPEN проверяет
+   * внешний стенд по [FILEX] OPEN; здесь проверяются ответы и сами байты. */
+  printf("\n--- TEST 47: random WRITE keeps FILEX context across metadata OPEN ---\n");
+  {
+    enum { block_size = 65536, block_count = 8, file_size = block_size * block_count };
+    const int order[block_count] = {0, 4, 1, 5, 2, 6, 3, 7};
+    struct smb2fh *file = NULL;
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    uint8_t *readback = (uint8_t*)malloc(file_size);
+    int test_ok = payload != NULL && readback != NULL;
+    int index;
+    for (index = 0; payload != NULL && index < file_size; ++index) {
+      payload[index] = test_byte((uint64_t)index + 0x470000ULL);
+    }
+    if (test_ok) {
+      file = smb2_open(smb2, test_path("context_reuse.bin"),
+                       O_CREAT | O_EXCL | O_RDWR);
+      test_ok = file != NULL;
+    }
+    if (test_ok) {
+      test_ok = smb2_ftruncate(smb2, file, file_size) == 0;
+    }
+    for (index = 0; test_ok && index < block_count; ++index) {
+      struct raw_create_state metadata_open;
+      struct normalized_name_state normalized_name;
+      struct smb2fh *metadata_handle = NULL;
+      const uint32_t offset = (uint32_t)order[index] * block_size;
+      memset(&metadata_open, 0, sizeof(metadata_open));
+      memset(&normalized_name, 0, sizeof(normalized_name));
+      test_ok = smb2_pwrite(smb2, file, payload + offset, block_size, offset) == block_size;
+      if (test_ok) {
+        test_ok = raw_windows_metadata_open(smb2, test_path("context_reuse.bin"),
+                                            &metadata_open) == 0 &&
+                  (uint32_t)metadata_open.status == SMB2_STATUS_SUCCESS;
+      }
+      if (test_ok) {
+        metadata_handle = smb2_fh_from_file_id(smb2, &metadata_open.file_id);
+        test_ok = metadata_handle != NULL &&
+                  raw_query_normalized_name(smb2, metadata_open.file_id,
+                                            &normalized_name) == 0 &&
+                  (uint32_t)normalized_name.status == SMB2_STATUS_SUCCESS &&
+                  normalized_name.decoded;
+      }
+      if (metadata_handle != NULL) {
+        test_ok = smb2_close(smb2, metadata_handle) == 0 && test_ok;
+      }
+      printf("  random WRITE offset=%lu metadata OPEN/QUERY/CLOSE=%s\n",
+             (unsigned long)offset, test_ok ? "PASS" : "FAIL");
+      fflush(stdout);
+    }
+    if (file != NULL) {
+      test_ok = smb2_close(smb2, file) == 0 && test_ok;
+      file = NULL;
+    }
+    printf("  WRITE PHASE FINISHED\n");
+    fflush(stdout);
+    if (test_ok) {
+      file = smb2_open(smb2, test_path("context_reuse.bin"), O_RDONLY);
+      test_ok = file != NULL;
+    }
+    for (index = 0; test_ok && index < block_count; ++index) {
+      const uint32_t offset = (uint32_t)index * block_size;
+      test_ok = smb2_pread(smb2, file, readback + offset, block_size, offset) == block_size;
+    }
+    test_ok = test_ok && memcmp(payload, readback, file_size) == 0;
+    if (file != NULL) {
+      test_ok = smb2_close(smb2, file) == 0 && test_ok;
+    }
+    free(payload);
+    free(readback);
+    /* Файл сохраняется в отдельной тестовой папке для независимой проверки. */
+    printf("RESULT TEST 47: %s\n", test_ok ? "PASS" : "FAIL");
+    failures += !test_ok;
+  }
+  goto done;
+
+test_48:
+  /* Короткая аппаратная проверка CANCEL до STATUS_PENDING. Не зависит от
+   * старого немедленного interim: отменяем WRITE по исходному MessageId.
+   * Это проверка SMB-протокола, а не кнопки отмены настоящего Explorer. */
+  printf("\n--- TEST 48: explicit synchronous WRITE CANCEL on hardware ---\n");
+  {
+    enum { file_size = 65536 };
+    uint8_t *payload = (uint8_t*)malloc(file_size);
+    struct smb2fh *file = NULL;
+    struct smb2_write_request request;
+    struct raw_async_write_state state;
+    struct smb2_pdu *pdu = NULL;
+    uint64_t message_id = 0;
+    DWORD cancel_started = 0;
+    DWORD cancel_elapsed = 0;
+    int old_passthrough = 0;
+    int test_ok = payload != NULL;
+    int echo_ok = 0;
+    memset(&request, 0, sizeof(request));
+    memset(&state, 0, sizeof(state));
+    state.final_status = -1;
+    if (test_ok) {
+      memset(payload, 0x48, file_size);
+      file = smb2_open(smb2, test_path("cancel48.bin"), O_CREAT | O_EXCL | O_WRONLY);
+      test_ok = file != NULL;
+      if (!test_ok) printf("  OPEN FAILED: %s\n", smb2_get_error(smb2));
+    }
+    smb2_get_passthrough(smb2, &old_passthrough);
+    if (test_ok) {
+      request.length = file_size;
+      request.buf = payload;
+      memcpy(request.file_id, ((struct probe_fh_mirror*)file)->file_id,
+             sizeof(request.file_id));
+      smb2_set_passthrough(smb2, 1);
+      message_id = smb2->message_id;
+      pdu = smb2_cmd_write_async(smb2, &request, 0, raw_async_write_cb, &state);
+      test_ok = pdu != NULL;
+    }
+    if (test_ok) {
+      smb2_queue_pdu(smb2, pdu);
+      /* Обслуживаем сокет, чтобы WRITE действительно ушёл на ESP. Полсекунды
+       * меньше времени физической записи 64 КиБ через UART 115200. */
+      (void)wait_for_count(smb2, &state.completed, 1, 500);
+      test_ok = state.completed == 0 && state.pending_count == 0;
+    }
+    if (test_ok) {
+      pdu = smb2_cmd_cancel_async(smb2, message_id, 0);
+      test_ok = pdu != NULL;
+      if (pdu != NULL) {
+        cancel_started = GetTickCount();
+        smb2_queue_pdu(smb2, pdu);
+        test_ok = wait_for_count(smb2, &state.completed, 1, 10000) == 0;
+        cancel_elapsed = GetTickCount() - cancel_started;
+      }
+    }
+    test_ok = test_ok && state.final_count == 1 &&
+              (uint32_t)state.final_status == SMB2_STATUS_CANCELLED;
+    printf("  mid=0x%016llx final=%08x pending=%d cancel_ms=%lu\n",
+           (unsigned long long)message_id, (unsigned)state.final_status,
+           state.pending_count, (unsigned long)cancel_elapsed);
+    if (state.completed == 0 && pdu != NULL) {
+      /* Не оставляем callback со ссылкой на локальную state после выхода.
+       * Закрывается только соединение этого короткого тестового клиента. */
+      smb2_destroy_context(smb2);
+      free(payload);
+      printf("RESULT TEST 48: FAIL (no completion)\n");
+      return 1;
+    }
+    smb2_set_passthrough(smb2, old_passthrough);
+    if (file != NULL) test_ok = smb2_close(smb2, file) == 0 && test_ok;
+    echo_ok = smb2_echo(smb2) == 0;
+    test_ok = test_ok && echo_ok;
+    free(payload);
+    /* Частично записанный файл не удаляется: он остаётся доказательством. */
+    printf("  ECHO=%s\nRESULT TEST 48: %s\n", echo_ok ? "PASS" : "FAIL",
+           test_ok ? "PASS" : "FAIL");
     failures += !test_ok;
   }
 

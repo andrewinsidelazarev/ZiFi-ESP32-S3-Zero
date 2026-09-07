@@ -396,8 +396,8 @@ void smb2_destroy_context(struct smb2_context *smb2)
                          NULL, smb2->connect_data);
            smb2->connect_cb = NULL;
         }
-        free(smb2->session_key);
-        smb2->session_key = NULL;
+        /* Освобождает как текущий ключ, так и ключи всех серверных Session. */
+        smb2_close_context(smb2);
 
         free(discard_const(smb2->user));
         free(discard_const(smb2->server));

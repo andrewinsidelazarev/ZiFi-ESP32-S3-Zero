@@ -721,8 +721,20 @@ smb2_correlate_reply(struct smb2_context *smb2, struct smb2_pdu *pdu)
                  * the reply has the new tree-id and request was 0)
                  */
                 pdu->header.message_id = req_pdu->header.message_id;
+                if (pdu->header.command != SMB2_NEGOTIATE &&
+                    pdu->header.command != SMB2_SESSION_SETUP) {
+                        pdu->header.session_id = req_pdu->header.session_id;
+                }
                 if (pdu->header.command != SMB2_TREE_CONNECT) {
                         pdu->header.sync.tree_id = req_pdu->header.sync.tree_id;
+                }
+
+                /* При необязательной подписи клиент вправе подписать отдельный
+                 * запрос. Ответ на него тоже обязан быть подписан тем же
+                 * сеансовым ключом; одного глобального smb2->sign здесь мало. */
+                if (pdu->header.status != SMB2_STATUS_PENDING &&
+                    (req_pdu->header.flags & SMB2_FLAGS_SIGNED)) {
+                        pdu->header.flags |= SMB2_FLAGS_SIGNED;
                 }
 
                 /* remove the request from the waitqueue when we get its reply
@@ -969,8 +981,20 @@ smb2_queue_pdu_direct(struct smb2_context *smb2, struct smb2_pdu *pdu)
                                 return;
                         }
 
-                        smb2_correlate_reply(smb2, p);
-                        /* TODO - care about check reply failures? */
+                        if (smb2_correlate_reply(smb2, p) < 0) {
+                                smb2_free_pdu(smb2, pdu);
+                                return;
+                        }
+                        /* Асинхронный ответ может относиться к прежней Session,
+                         * хотя после него на сокете уже прошел новый вход. */
+                        if (p->header.command != SMB2_NEGOTIATE &&
+                            p->header.command != SMB2_SESSION_SETUP &&
+                            p->header.session_id != 0 &&
+                            smb2_server_select_session(
+                                    smb2, p->header.session_id) < 0) {
+                                smb2_free_pdu(smb2, pdu);
+                                return;
+                        }
                 }
                 smb2_encode_header(smb2, &p->out.iov[0], &p->header);
                 if (!smb2_is_server(smb2)) {
@@ -986,6 +1010,8 @@ smb2_queue_pdu_direct(struct smb2_context *smb2, struct smb2_pdu *pdu)
                  * NOT be signed.  The final response is signed normally. */
                 if (p->header.status != SMB2_STATUS_PENDING &&
                     (smb2->sign ||
+                     (smb2_is_server(smb2) &&
+                      (p->header.flags & SMB2_FLAGS_SIGNED)) ||
                      (smb2_is_server(smb2) &&
                       p->header.command == SMB2_IOCTL &&
                       p->ctl_code == SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO) ||

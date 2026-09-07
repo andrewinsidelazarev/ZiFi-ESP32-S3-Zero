@@ -53,6 +53,18 @@ extern "C" {
 #define SMB2_SIGNATURE_SIZE 16
 #define SMB2_KEY_SIZE 16
 
+#define SMB2_SERVER_SESSION_SLOTS 8
+
+struct smb2_server_session {
+        uint64_t session_id;
+        uint8_t *session_key;
+        uint8_t session_key_size;
+        uint8_t signing_key[SMB2_KEY_SIZE];
+        uint8_t serverin_key[SMB2_KEY_SIZE];
+        uint8_t serverout_key[SMB2_KEY_SIZE];
+        uint32_t last_use;
+};
+
 #define SMB2_MAX_VECTORS 256
 
 struct smb2_io_vectors {
@@ -113,6 +125,11 @@ struct smb2_header {
  * 1: SMB2_RECV_SPL        SPL
  * 2: SMB2_RECV_HEADER     SMB3 Transform Header
  * 3: SMB2_RECV_UNKNOWN    data for a PDU we are not waiting for
+ *
+ * Состояние для SMB1 multi-protocol NEGOTIATE:
+ * 1: SMB2_RECV_SPL        длина NetBIOS-записи
+ * 2: SMB2_RECV_HEADER     первые 64 байта SMB1-запроса
+ * 3: SMB2_RECV_SMB1       остаток только этой NetBIOS-записи
  */
 enum smb2_recv_state {
         SMB2_RECV_SPL = 0,
@@ -122,6 +139,7 @@ enum smb2_recv_state {
         SMB2_RECV_PAD,
         SMB2_RECV_TRFM,
         SMB2_RECV_UNKNOWN,
+        SMB2_RECV_SMB1,
 };
 
 /* current tree id stack, note: index 0 in the stack is not used
@@ -130,8 +148,8 @@ enum smb2_recv_state {
 #define smb2_tree_id(smb2) (((smb2)->tree_id_cur >= 0)?smb2->tree_id[(smb2)->tree_id_cur]:0xdeadbeef)
 
 #define MAX_CREDITS 1024
-/* One 512 KiB multi-credit WRITE consumes 8 credits. Smaller requests can use
- * the same fixed window without forcing every PSRAM slot to grow to 512 KiB. */
+/* Окно из восьми credits требуется для составных запросов Windows и вмещает
+ * восемь однокредитных WRITE по 64 КиБ без неограниченного роста очереди. */
 #define SMB2_SERVER_CREDIT_TARGET 8
 #define SMB2_SALT_SIZE 32
 
@@ -216,6 +234,10 @@ struct smb2_context {
         uint8_t signing_key[SMB2_KEY_SIZE];
         uint8_t serverin_key[SMB2_KEY_SIZE];
         uint8_t serverout_key[SMB2_KEY_SIZE];
+        /* SMB2 допускает несколько Session на одном TCP-соединении. Сервер
+         * хранит ключи раздельно и выбирает их по SessionId каждого пакета. */
+        struct smb2_server_session server_sessions[SMB2_SERVER_SESSION_SLOTS];
+        uint32_t server_session_use_counter;
         uint8_t salt[SMB2_SALT_SIZE];
         uint16_t cypher;
         uint8_t preauthhash[SMB2_PREAUTH_HASH_SIZE];
@@ -437,6 +459,9 @@ int smb2_decode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
                        struct smb2_header *hdr);
 int smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
                         struct smb2_iovec *iov, size_t niov);
+int smb2_server_save_session(struct smb2_context *smb2);
+int smb2_server_select_session(struct smb2_context *smb2,
+                               uint64_t session_id);
 
 int smb2_set_uint8(struct smb2_iovec *iov, int offset, uint8_t value);
 int smb2_set_uint16(struct smb2_iovec *iov, int offset, uint16_t value);

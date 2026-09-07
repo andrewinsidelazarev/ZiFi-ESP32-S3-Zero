@@ -2,9 +2,13 @@
 # собираются тесты проекта. Прошивочный код берётся как есть, из src/ и lib/:
 # симулятор существует именно для того, чтобы проверять его, а не копию.
 
-param([switch]$ServerOnly)
+param([switch]$ServerOnly, [int]$AsyncWatchdogMs = 0)
 
 $ErrorActionPreference = 'Stop'
+if ($AsyncWatchdogMs -ne 0 -and ($AsyncWatchdogMs -lt 100 -or $AsyncWatchdogMs -gt 90000)) {
+    throw 'AsyncWatchdogMs: use 0 for production timing, or 100..90000 for a PC test'
+}
+$watchdogOption = if ($AsyncWatchdogMs -eq 0) { '' } else { "/DZIFI_HOST_ASYNC_WATCHDOG_MS=$AsyncWatchdogMs " }
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $root
 
@@ -64,7 +68,7 @@ $command = "cl.exe /nologo /std:c++17 /EHsc /utf-8 /Zi /MDd /W3 " +
            # уже предоставлены системой (например, gethostname).
            # libsmb2 умеет Windows, но включает эту ветку по _WINDOWS и
            # __USE_WINSOCK__, а MSVC сам задаёт только _WIN32.
-           "/DZIFI_HOST_BUILD /D_WINDOWS /DHAVE_LINGER " +
+           "/DZIFI_HOST_BUILD /D_WINDOWS /DHAVE_LINGER " + $watchdogOption +
            # libsmb2 под MSVC не подтягивает stdint сам.
            "/FIzifi_msvc_prelude.h " +
            "$includes $sources $libsmb2 " +
@@ -80,8 +84,9 @@ if ($ServerOnly) {
     return
 }
 
-# Клиент-пробник: Проводник к симулятору не подпустить (порт в UNC не указать,
-# 445 занят ядром), поэтому сценарии прогоняет он.
+# Клиент-пробник для автоматических сценариев и произвольного TCP-порта.
+# Для Проводника нужен отдельно запущенный virtual_ip_bridge: в UNC нельзя
+# указать порт, а локальный 445 обычно занят системным SMB-сервером Windows.
 $probe = "cl.exe /nologo /TC /utf-8 /Zi /MDd /W3 /D_CRT_SECURE_NO_WARNINGS " +
          "/D_WINDOWS /DHAVE_LINGER /FIzifi_msvc_prelude.h " +
          "/Itests\stubs_host /Ilib\libsmb2\include /Ilib\libsmb2\include\smb2 " +

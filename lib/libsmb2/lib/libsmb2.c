@@ -170,6 +170,9 @@ struct smb2fh {
 void
 smb2_close_context(struct smb2_context *smb2)
 {
+        int i;
+        int current_key_is_saved = 0;
+
         if (smb2 == NULL) {
                 return;
         }
@@ -188,11 +191,25 @@ smb2_close_context(struct smb2_context *smb2)
         smb2->tree_id_cur = 0;
         smb2->tree_id[0] = 0xdeadbeef;
         memset(smb2->signing_key, 0, SMB2_KEY_SIZE);
-        if (smb2->session_key) {
-                free(smb2->session_key);
-                smb2->session_key = NULL;
+        for (i = 0; i < SMB2_SERVER_SESSION_SLOTS; i++) {
+                struct smb2_server_session *session = &smb2->server_sessions[i];
+                if (session->session_key == smb2->session_key) {
+                        current_key_is_saved = 1;
+                }
         }
+        if (smb2->session_key && !current_key_is_saved) {
+                free(smb2->session_key);
+        }
+        smb2->session_key = NULL;
         smb2->session_key_size = 0;
+        for (i = 0; i < SMB2_SERVER_SESSION_SLOTS; i++) {
+                struct smb2_server_session *session = &smb2->server_sessions[i];
+                if (session->session_key != NULL) {
+                        free(session->session_key);
+                }
+                memset(session, 0, sizeof(*session));
+        }
+        smb2->server_session_use_counter = 0;
 }
 
 static int
@@ -681,6 +698,71 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 SMB2_PREAUTH_HASH_SIZE,
                                 smb2->serverout_key);
         }
+}
+
+int
+smb2_server_save_session(struct smb2_context *smb2)
+{
+        struct smb2_server_session *slot = NULL;
+        int i;
+
+        if (!smb2_is_server(smb2) || smb2->session_id == 0) {
+                return -1;
+        }
+        for (i = 0; i < SMB2_SERVER_SESSION_SLOTS; i++) {
+                if (smb2->server_sessions[i].session_id == smb2->session_id) {
+                        slot = &smb2->server_sessions[i];
+                        break;
+                }
+                if (slot == NULL && smb2->server_sessions[i].session_id == 0) {
+                        slot = &smb2->server_sessions[i];
+                }
+        }
+        /* Не вытесняем живую сессию: ее дескрипторы и отложенные ответы еще
+         * могут существовать. Ограничение явно возвращает ошибку вместо
+         * незаметного использования чужого ключа подписи. */
+        if (slot == NULL) {
+                smb2_set_error(smb2, "Too many SMB sessions on one connection");
+                return -1;
+        }
+        if (slot->session_key != NULL && slot->session_key != smb2->session_key) {
+                free(slot->session_key);
+        }
+        slot->session_id = smb2->session_id;
+        slot->session_key = smb2->session_key;
+        slot->session_key_size = smb2->session_key_size;
+        memcpy(slot->signing_key, smb2->signing_key, SMB2_KEY_SIZE);
+        memcpy(slot->serverin_key, smb2->serverin_key, SMB2_KEY_SIZE);
+        memcpy(slot->serverout_key, smb2->serverout_key, SMB2_KEY_SIZE);
+        slot->last_use = ++smb2->server_session_use_counter;
+        return 0;
+}
+
+int
+smb2_server_select_session(struct smb2_context *smb2, uint64_t session_id)
+{
+        int i;
+
+        if (!smb2_is_server(smb2) || session_id == 0) {
+                return -1;
+        }
+        for (i = 0; i < SMB2_SERVER_SESSION_SLOTS; i++) {
+                struct smb2_server_session *slot = &smb2->server_sessions[i];
+                if (slot->session_id != session_id) {
+                        continue;
+                }
+                smb2->session_id = slot->session_id;
+                smb2->session_key = slot->session_key;
+                smb2->session_key_size = slot->session_key_size;
+                memcpy(smb2->signing_key, slot->signing_key, SMB2_KEY_SIZE);
+                memcpy(smb2->serverin_key, slot->serverin_key, SMB2_KEY_SIZE);
+                memcpy(smb2->serverout_key, slot->serverout_key, SMB2_KEY_SIZE);
+                slot->last_use = ++smb2->server_session_use_counter;
+                return 0;
+        }
+        smb2_set_error(smb2, "Unknown SMB SessionId %llu",
+                       (unsigned long long)session_id);
+        return -1;
 }
 
 static void
@@ -3680,6 +3762,15 @@ smb2_oplock_break_request_cb(struct smb2_server *server, struct smb2_context *sm
                                        &req->lock.lease);
                         if (!ret) {
                                 memset(&rep_lease, 0, sizeof(rep_lease));
+                                /* [MS-SMB2] 3.3.5.22.2: успешный ответ
+                                 * возвращает тот же LeaseKey и фактически
+                                 * принятый LeaseState. Обработчик вправе
+                                 * сузить req->lease_state перед ответом. */
+                                memcpy(rep_lease.lease_key,
+                                       req->lock.lease.lease_key,
+                                       SMB2_LEASE_KEY_SIZE);
+                                rep_lease.lease_state =
+                                        req->lock.lease.lease_state;
                                 pdu = smb2_cmd_lease_break_reply_async(smb2,
                                         &rep_lease, NULL, cb_data);
                         }
@@ -3688,7 +3779,8 @@ smb2_oplock_break_request_cb(struct smb2_server *server, struct smb2_context *sm
         if(ret < 0) {
                 memset(&err, 0, sizeof(err));
                 pdu = smb2_cmd_error_reply_async(smb2,
-                                &err, SMB2_LOCK, SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
+                                &err, SMB2_OPLOCK_BREAK,
+                                SMB2_STATUS_NOT_IMPLEMENTED, NULL, cb_data);
         }
         if (pdu != NULL) {
                 smb2_set_pdu_message_id(smb2, pdu, smb2->message_id);
@@ -4060,9 +4152,9 @@ smb2_general_client_request_cb(struct smb2_context *smb2, int status, void *comm
                 break;
         case SMB2_LOGOFF:
                 smb2_logoff_request_cb(server, smb2, command_data, cb_data);
-                /* prep for a new session setup req */
+                /* После LOGOFF на этом TCP могут остаться другие Session. */
                 next_cmd = SMB2_SESSION_SETUP;
-                next_cb = smb2_session_setup_request_cb;
+                next_cb = smb2_general_client_request_cb;
                 break;
         case SMB2_TREE_CONNECT:
                 smb2_tree_connect_request_cb(server, smb2, command_data, cb_data);
@@ -4208,9 +4300,11 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                         }
                         smb2->connect_data = c_data;
 
-                        /* alloc a pdu for next request */
+                        /* Между NTLM NEGOTIATE и AUTHENTICATE Windows вправе
+                         * прислать WRITE уже существующей Session на том же
+                         * TCP. Общий callback различит команды по заголовку. */
                         smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_SESSION_SETUP,
-                                       smb2_session_setup_request_cb, cb_data);
+                                       smb2_general_client_request_cb, cb_data);
                         more_processing_needed = 1;
                         smb2->session_id = server->session_counter++;
                 }
@@ -4243,7 +4337,7 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                                                 SMB2_STATUS_LOGON_FAILURE, NULL, cb_data);
                                 smb2_free_pdu(smb2, smb2->next_pdu);
                                 smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_SESSION_SETUP,
-                                               smb2_session_setup_request_cb, cb_data);
+                                               smb2_general_client_request_cb, cb_data);
                                 more_processing_needed = 0;
                                 #endif
                         }
@@ -4280,7 +4374,7 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                 /* alloc a pdu for next request */
                 if (more_processing_needed) {
                         smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_SESSION_SETUP,
-                                                smb2_session_setup_request_cb, cb_data);
+                                                smb2_general_client_request_cb, cb_data);
                         smb2->session_id = server->session_counter++;
                 } else {
                         smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_TREE_CONNECT,
@@ -4311,6 +4405,12 @@ smb2_session_setup_request_cb(struct smb2_context *smb2, int status, void *comma
                 /* Optional signing still needs a key for the mandatory
                  * signed FSCTL_VALIDATE_NEGOTIATE_INFO exchange. */
                 smb2_create_signing_key(smb2);
+        }
+
+        if (pdu == NULL && !more_processing_needed &&
+            smb2_server_save_session(smb2) < 0) {
+                smb2_close_context(smb2);
+                return;
         }
 
         if (server->allow_anonymous &&
@@ -4464,8 +4564,16 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
         smb3_init_preauth_hash(smb2);
         smb3_update_preauth_hash(smb2, smb2->in.niov - 1, &smb2->in.iov[1]);
 
+        /* Wildcard 0x02FF тоже обязан сообщать доступные LEASING и LARGE_MTU.
+         * Windows получает этот ответ при входе по имени через SMB1
+         * multi-protocol NEGOTIATE, тогда как путь по IP начинает сразу с
+         * SMB2. Нулевые capabilities делали два пути необоснованно разными. */
+        rep.capabilities = SMB2_GLOBAL_CAP_LARGE_MTU;
+        if (server->leasing_enabled) {
+                rep.capabilities |= SMB2_GLOBAL_CAP_LEASING;
+        }
+
         if (req) {
-                rep.capabilities = SMB2_GLOBAL_CAP_LARGE_MTU;
                 if (smb2->version == SMB2_VERSION_ANY  ||
                     smb2->version == SMB2_VERSION_ANY3 ||
                     smb2->version == SMB2_VERSION_0300 ||
@@ -4474,7 +4582,7 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
                         rep.capabilities |= SMB2_GLOBAL_CAP_ENCRYPTION;
                 }
 
-                /* update the context with the client capabilities */
+                /* Запоминаем возможности клиента только из SMB2-запроса. */
                 if (smb2->dialect > SMB2_VERSION_0202) {
                         if (req->capabilities & SMB2_GLOBAL_CAP_LARGE_MTU) {
                                 smb2->supports_multi_credit = 1;
@@ -4569,7 +4677,7 @@ smb2_negotiate_request_cb(struct smb2_context *smb2, int status, void *command_d
                 }
         }
         else {
-                /* alloc a pdu for another negotiate  request */
+                /* После wildcard-ответа принимаем настоящий SMB2 NEGOTIATE. */
                 smb2->next_pdu = smb2_allocate_pdu(smb2, SMB2_NEGOTIATE, smb2_negotiate_request_cb, cb_data);
                 if (!smb2->next_pdu) {
                         smb2_set_error(smb2, "can not alloc pdu for second negotiate request");
@@ -4593,7 +4701,14 @@ accept_cb(const int fd, void *cb_data)
 
         smb2 = smb2_init_context();
         if (smb2 == NULL) {
-                err = -ENOMEM;
+                /* Нехватка памяти для одного нового клиента не является
+                 * ошибкой listener. Прежний -ENOMEM выводил весь
+                 * smb2_serve_port(), закрывал живое копирование и оставлял
+                 * принятый fd без владельца. Отказываем только этому
+                 * соединению: клиент может повторить вход, а порт 445
+                 * и ранее принятые сеансы остаются живы. */
+                close(fd);
+                err = 0;
         }
         else {
                 *psmb2 = smb2;
@@ -4664,8 +4779,24 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                 server->max_read_size = 0x100000;
                 server->max_write_size = 0x100000;
         }
-        if (!server->guid[0]) {
-                memcpy(server->guid, "libsmb2-srvrguid", 16);
+        {
+                size_t guid_index;
+                int guid_is_zero = 1;
+                for (guid_index = 0; guid_index < sizeof(server->guid);
+                     ++guid_index) {
+                        if (server->guid[guid_index] != 0) {
+                                guid_is_zero = 0;
+                                break;
+                        }
+                }
+                /* Нулевой первый байт допустим у случайного UUID. Прежняя
+                 * проверка с вероятностью 1/256 затирала настоящий ServerGuid
+                 * постоянной строкой, и Windows связывал новый запуск со
+                 * старым экземпляром сервера. Fallback нужен только для
+                 * полностью неинициализированного GUID. */
+                if (guid_is_zero) {
+                        memcpy(server->guid, "libsmb2-srvrguid", 16);
+                }
         }
         if (!server->hostname[0]) {
                 gethostname(server->hostname, sizeof(server->hostname));
@@ -4746,6 +4877,7 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
 
                 if (ready < 0) {
                         int select_error;
+
 #ifdef _WIN32
                         select_error = WSAGetLastError();
 #else
