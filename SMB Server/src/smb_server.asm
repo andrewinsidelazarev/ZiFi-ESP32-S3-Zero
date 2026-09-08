@@ -3,7 +3,7 @@
 ; Что делает плагин: находит zifi.ini, отдаёт его на ESP целиком, просит поднять
 ; SMB2/SMB3-сервер и дальше отвечает только на файловые запросы. Сеть, TCP,
 ; проверка пароля, подпись SMB и разбор пакетов целиком находятся на ESP32-S3.
-; Z80 видит простой двоичный VFS и работает с SD через API Wild Commander.
+; Z80 видит простой двоичный VFS и работает с томом панели через API WC.
 ;
 ; IX при входе указывает на служебную структуру Wild Commander; поле IX+29 —
 ; устройство активной панели, его надо забрать до того, как IX займут окна.
@@ -12,6 +12,15 @@ PLUGIN:
         push ix
         ld a,(ix+29)
         ld (ConfigPanelDevice),a
+        cp 10
+        jr c,.device_digit
+        ld a,'?'-'0'
+.device_digit:
+        add a,'0'
+        ld (UiVolumeDevice),a
+        ld (UiShareDevice),a
+        ld (UiUncDevice),a
+        ld (LinkSmbShare),a               ; имя шары совпадает с номером устройства WC
         ld a,1
         call WC_INT_PL                   ; WC не должен перерисовывать часы под окном
         call Vfs_Crc16Init               ; таблицы CRC — до первого файлового обмена
@@ -93,8 +102,9 @@ PLUGIN:
         call Link_Stop                   ; попросить ESP закрыть SMB-сервер
         ld ix,SmbWindow
         call WC_RRESB
+        call WC_GEDPL
         ; При возврате Wild Commander сам восстанавливает настройки прерываний.
-        xor a                            ; код возврата: обычный выход из плагина
+        ld a,3                           ; WC 1.10i от 08.09.2026 перечитает обе панели
         pop ix
         ret
 
@@ -470,7 +480,7 @@ LinkSilence:    db 0                     ; счётчик пингов без о
 ; Каждая строка завершается нулём. Это единственное место с настройками SMB.
 LinkSmbStart:
 LinkSmbPort:    dw 445
-                db "SD",0                ; имя общего ресурса
+LinkSmbShare:   db "?",0                  ; номер устройства подставляется при входе
                 db "ZX-Evo",0            ; имя NetBIOS
                 db "WORKGROUP",0         ; рабочая группа Windows
                 db "zx",0                ; логин

@@ -203,8 +203,14 @@ UiPortField:
 UiFirmwareField:
         ds UI_FIELD_FW,' '
         db #0D,#0D
-        db "Share  : SD  (whole selected SD card)",#0D
-        db "UNC    : \\\\ZX-Evo\\SD",#0D
+        db "Share  : "
+UiShareDevice:
+        db "?","  (volume "
+UiVolumeDevice:
+        db "?",":",#5C,")",#0D
+        db "UNC    : \\\\ZX-Evo\\"
+UiUncDevice:
+        db "?",#0D
         db "Login  : zx / zx; SMB signing",#0D
         db "NetBIOS: "
 UiNetbiosField:
@@ -232,7 +238,7 @@ UiStageDhcp:       db "Waiting for IP address",0
 UiStageSmb:        db "Starting SMB listener",0
 UiWifiWaiting:     db "Wi-Fi [................]   0%",0
 UiStageStopping:   db "Stopping",0
-UiErrorSd:         db "ERROR: no readable SD volume",0
+UiErrorSd:         db "ERROR: no readable INI volume",0
 UiErrorDir:        db "ERROR: /zifi directory missing",0
 UiErrorIni:        db "ERROR: /zifi/zifi.ini missing",0
 UiErrorConfig:     db "ERROR: invalid zifi.ini",0

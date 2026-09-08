@@ -1,5 +1,5 @@
 ; SMB-сервер ZiFi для ZX Evolution / TS-Config.
-; Плагин меню Wild Commander; ресурс SD совпадает с корнем основной SD-карты.
+; Плагин меню Wild Commander; имя ресурса — номер устройства активной панели.
 ;
 ; Файл задаёт физическую компоновку WMF. Первые 512 байтов содержат заголовок
 ; формата #0A, а исполняемый код собирается с логическим адресом #8000. Wild
@@ -19,6 +19,7 @@ mainStart:
         ; Порядок INCLUDE важен: smb_server включает UI, сеть и команды SMB,
         ; а config и UART предоставляют используемые ими общие процедуры.
         INCLUDE "smb_server.asm"
+        DEFINE CONFIG_ACTIVE_VOLUME
         INCLUDE "config.asm"
         INCLUDE "zifi_uart.asm"
 

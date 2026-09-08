@@ -25,7 +25,7 @@ ESP-01S через переходник и сохраняет двоичный U
 - FTP с тремя управляющими сессиями на задаваемом порту (обычно `21`),
   active `PORT/EPRT` и отдельными passive `PASV/EPSV`-портами `2122–2124`;
 - односессионный SMB2/SMB3 на TCP/445 с NTLMSSP; signing объявлена доступной,
-  но сервер её не требует (`SecurityMode=1`), ресурсом `SD`,
+  но сервер её не требует (`SecurityMode=1`), ресурсом по номеру устройства WC,
   ответами NBNS по UDP/137 и WS-Discovery по UDP/3702 для сетевого окружения Windows 10/11;
 - мгновенный отклик при открытии шары без блокирующего 60-секундного сканирования FAT;
 - надёжное сохранение и перезапись файлов (`FILE_OVERWRITE_IF` / `FILE_SUPERSEDE`):
@@ -58,7 +58,7 @@ WebDAV ещё не включён. Сетевой файловый listener за
 | **Автономный апдейтер** | [**`ZIFIUPD.WMF`**](Online%20Update/build/ZIFIUPD.WMF) | Пользовательский плагин Wild Commander: читает `zifi.ini`, скачивает и устанавливает прошивку с GitHub |
 | **Режим обновления с PC** | [**`Update Mode`**](Update%20Mode/src/update.asm) | Исходник локально собираемого `update.sna`, запускающего приём OTA на порту 8267 |
 | **Скрипт-прошивальщик (OTA)** | [**`esp_tool.py`**](tools/esp_tool.py) | Python-утилита для прошивки ESP32-S3 по Wi-Fi и выгрузки логов |
-| **SMB-сервер (Windows)** | [**`ZIFISMB.WMF`**](SMB%20Server/build/ZIFISMB.WMF) | Плагин Wild Commander: доступ к SD-карте по сети `\\ZX-Evo\SD` |
+| **SMB-сервер (Windows)** | [**`ZIFISMB.WMF`**](SMB%20Server/build/ZIFISMB.WMF) | Плагин Wild Commander v0.5.9: доступ к текущему тому SD/IDE, например `\\ZX-Evo\0` |
 | **FTP-сервер** | [**`ZIFIFTP.WMF`**](FTP%20Server/build/ZIFIFTP.WMF) | Плагин Wild Commander: полнофункциональный FTP-сервер |
 | **Синхронизация времени** | [**`NTPTIME.WMF`**](NTP%20Time%20Sync/build/NTPTIME.WMF) | Плагин Wild Commander: синхронизация часов RTC через интернет |
 | **Браузер / Загрузчик** | [**`zifi.spg`**](ZiFi%20SPG/build/zifi.spg) ([пример `zifi.ini`](ZiFi%20SPG/build/zifi.ini)) | Программа ZiFi для ZX-Evolution (каталог сайтов, скачивание) |
@@ -109,7 +109,7 @@ credit target соединения до одного, поэтому Windows п�
   распакованный файл сохраняется сразу, а ложный `.zip` без сигнатуры `PK`
   автоматически повторно загружается напрямую как исходный ZIP-архив.
 * **`SMB Server` (`SMB Server/build/ZIFISMB.WMF`):**
-  Плагин для Wild Commander, поднимающий файловый сервер Windows SMB2/SMB3 с доступом к SD-карте по сети `\\ZX-Evo\SD`.
+  Плагин для Wild Commander, открывающий текущий том SD/IDE по SMB2/SMB3. Имя ресурса совпадает с номером устройства в панели WC: например, `0:\` доступен как `\\ZX-Evo\0`.
 * **`FTP Server` (`FTP Server/build/ZIFIFTP.WMF`):**
   Плагин для Wild Commander v0.13 (команда `FTP_START`), запускающий FTP-сервер с поддержкой активного и пассивного режимов и отдельной шкалой Wi-Fi.
 * **`NTP Time Sync` (`NTP Time Sync/build/NTPTIME.WMF`):**
@@ -174,7 +174,16 @@ PlatformIO автоматически создаёт:
 & ".\SMB Server\build.bat"
 ```
 
-Результат: `SMB Server/build/ZIFISMB.WMF` v0.5.8. Прошивка
+Результат: `SMB Server/build/ZIFISMB.WMF` v0.5.9. Плагин публикует корень
+тома активной панели, сохраняя выбранный раздел, даже если `/zifi/zifi.ini`
+найден на другой SD-карте. Номер устройства виден в полях `Share` и `UNC`.
+При выходе в
+[WC v1.10i от 8 сентября 2026 года](https://github.com/andrewinsidelazarev/Wild-Commander-Improved/releases/tag/v1.10i-2026-09-08)
+перечитываются обе панели с сохранением активной. Табличный CRC16 сохранён;
+версия прошивки остаётся `.91`. Подробности и команды проверки — в
+[описании плагина](SMB%20Server/README.md).
+
+Прошивка
 `s3-native-0.6.91` с выключенным диагностическим кольцевым журналом
 подтверждает READ и WRITE только после полного сетевого запроса: Windows
 CopyFile не повторяет остаток короткого успешного ответа ни для чтения, ни для
@@ -251,7 +260,7 @@ FLUSH. Поэтому запись начинается сразу и индик
 останавливает 90-секундный watchdog. Для позиционных операций требуется
 `WildCommander Improved/exe/WC/FILEX.WMF` первой активной строкой
 `[PLUGINS]`. Готовые параметры — порт `445`,
-ресурс `SD`, имя `ZX-Evo`, группа `WORKGROUP`, логин и пароль `zx` / `zx`.
+ресурс по номеру устройства WC, имя `ZX-Evo`, группа `WORKGROUP`, логин и пароль `zx` / `zx`.
 Финальные время и атрибуты, пришедшие во время write-back, сохраняются вместе
 с SMB-handle и применяются после данных на CLOSE/FLUSH: SET_INFO не держит
 Windows без ответа. Статические FILE_FS_ATTRIBUTE/DEVICE/CONTROL возвращаются

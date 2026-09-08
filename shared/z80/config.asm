@@ -7,7 +7,8 @@
 ; Wild Commander читает FAT через состояние выбранного STREAM. Поток 0 служит
 ; текущим каталогом FTP, поток 1 — независимой опорой выбранного тома. Поиск INI
 ; перебирает допустимые SD-устройства, а после успеха переводит оба потока в их
-; корень. Это важно: прямого доступа к портам SD в плагине нет.
+; корень. CONFIG_ACTIVE_VOLUME оставляет SMB на исходном томе активной панели,
+; даже когда INI найден на другой карте. Прямого доступа к портам SD здесь нет.
 
 CONFIG_SECTOR_SIZE equ 512
 
@@ -27,14 +28,19 @@ CONFIG_INI_BUFFER_SIZE equ CONFIG_SECTOR_SIZE
 Config_Load:
         call Config_Defaults
 
-        ; STREAM #FE разрешено вызывать только для начального клонирования
-        ; активной панели. Повторный вызов вернул бы нас из корня в каталог панели.
+        ; STREAM #FE клонирует сохранённый контекст активной панели.
+        ; После каждого клонирования оба потока переводятся в корень тома.
         ld d,STREAM_CLONE
         call WC_STREAM
 
-        ; Сначала проверить SD активной панели, затем SD1 и SD2 Z-Controller.
-        ; Корень FTP останется на томе с найденным INI.
+        ; SMB сначала ищет INI на любом томе активной панели. Другие плагины
+        ; сохраняют прежний поиск только на SD. Затем проверяются SD1 и SD2.
+        IFDEF CONFIG_ACTIVE_VOLUME
+        call Config_RootBothStreams
+        call Config_OpenOnRoot
+        ELSE
         call Config_TryActiveSd
+        ENDIF
         jr nc,.file_open
         ld b,0                         ; SD1 Z-Controller в интерфейсе STREAM
         call Config_TryDevice
@@ -129,11 +135,18 @@ Config_Load:
         scf
         ret
 
-; После любой попытки поиска вернуть рабочие потоки в корень найденного тома.
+; После поиска SMB заново клонирует сохранённую при входе страницу панели:
+; STREAM #FE берёт её из FEP2, а не из последнего потока поиска INI. Так
+; сохраняется и выбранный раздел устройства; повторного монтирования нет.
 Config_RestoreRoot:
+        IFDEF CONFIG_ACTIVE_VOLUME
+        ld d,STREAM_CLONE
+        call WC_STREAM
+        ELSE
         ld a,(ConfigHaveRoot)
         or a
         ret z
+        ENDIF
         jp Config_RootBothStreams
 
 ; Установить фиксированные параметры FTP и очистить строки Wi-Fi.
@@ -148,6 +161,7 @@ Config_Defaults:
 
 ; Клонировать активную SD-панель Wild Commander. Номера 1, 2 и 6 обозначают
 ; соответственно SD1 Z-Controller, SD NeoGS и SD2 Z-Controller.
+        IFNDEF CONFIG_ACTIVE_VOLUME
 Config_TryActiveSd:
         ld a,(ConfigPanelDevice)
         cp 1
@@ -159,6 +173,7 @@ Config_TryActiveSd:
 .accepted:
         call Config_RootBothStreams
         jp Config_OpenOnRoot
+        ENDIF
 
 ; B — номер устройства интерфейса STREAM, раздел C в WC не используется.
 Config_TryDevice:
