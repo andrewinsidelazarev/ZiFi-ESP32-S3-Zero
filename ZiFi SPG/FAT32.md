@@ -21,8 +21,8 @@ git clone https://github.com/andrewinsidelazarev/FAT32-Driver-ZX-Evolution.git "
 Существующий файл сохраняется; при ошибке запись может остаться частичной,
 о чём ZiFi сообщает в журнале.
 
-API и сборка описаны в [README драйвера](<../../FAT32 Driver/README.md>).
-Результаты тестов и хеш готового SPG — в [отчёте проверки](<../../FAT32 Driver/VALIDATION.md>).
+API и сборка описаны в [README драйвера](https://github.com/andrewinsidelazarev/FAT32-Driver-ZX-Evolution#readme).
+Результаты тестов — в [отчёте проверки](https://github.com/andrewinsidelazarev/FAT32-Driver-ZX-Evolution/blob/main/VALIDATION.md).
 Проверены выполнение Z80, автономный драйвер и сквозная загрузка сетевого
 клиента в отдельной исправленной сборке Unreal: HTTP → UART → Z80 → FAT32 →
 образ SD на файлах до 640 КиБ с побайтной сверкой. Проверка на физическом
