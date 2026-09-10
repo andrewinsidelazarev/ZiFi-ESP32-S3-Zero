@@ -1,6 +1,14 @@
 # Самостоятельный FAT32
 
-`zifi.spg` использует драйвер из соседней папки `../../FAT32 Driver`.
+`zifi.spg` использует драйвер из отдельного репозитория
+[FAT32-Driver-ZX-Evolution](https://github.com/andrewinsidelazarev/FAT32-Driver-ZX-Evolution)
+(лицензия MIT). Его клонируют рядом с этим репозиторием, в папку `FAT32 Driver`:
+
+```
+git clone https://github.com/andrewinsidelazarev/FAT32-Driver-ZX-Evolution.git "FAT32 Driver"
+```
+
+От `ZiFi SPG` это путь `../../FAT32 Driver`.
 Сборка `build.bat` сначала собирает драйвер, затем включает его код на
 страницу `#0E`, рабочую RAM и SD-ZC — на `#0F`. Другой путь к драйверу
 задаётся переменной `FAT32_DRIVER_DIR`.
