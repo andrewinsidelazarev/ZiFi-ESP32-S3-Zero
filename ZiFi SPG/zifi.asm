@@ -112,6 +112,14 @@ load_sw		ld a,0
 		or a
 		jp z,main_ex
 		call modem_load_file
+		; Попытка через онлайн-распаковщик не удалась, а ссылка — .zip: вопрос,
+		; сохранить ли исходный ZIP (страница окон). «Y» готовит запрос на
+		; исходную ссылку — остаётся скачать.
+		ld hl,win_unzip_check
+		call win_error_call
+		ld a,l
+		or a
+		call nz,modem_load_file
 	
 		ld a,(do_after_load+1)
 		cp save_file
@@ -210,6 +218,10 @@ sync_clock_failed
 		ld hl,msg_time_failed
 		ld b,1
 		call zifi_echo
+		; Без NTP дата каталога — из RTC, если она правдоподобна, иначе 2026-01-01
+		; (страница окон). Прежде оставалось «0000-00-00».
+		ld hl,aux_download_date
+		call win_error_call
 		jp set_download_dir
 
 ; ГГГГММДДЧЧММСС (HL) -> ДД_ММ_ГГГГЧЧММ (DE): именно такой порядок разбирает
@@ -383,9 +395,9 @@ create_filename_ext_ready
 
 ; Если online-unzip вернул обычный распакованный файл, create_filename уже
 ; снял четырёхбайтовый префикс .ext и заменил расширение имени. Если же ответ
-; остался .zip, но за префиксом нет ZIP-сигнатуры, один раз повторить загрузку
-; напрямую по исходной ссылке из каталога. Это сохраняет рабочий raw-ZIP путь
-; при очередной поломке серверного распаковщика и не создаёт цикл повторов.
+; остался .zip, но за префиксом нет ZIP-сигнатуры, спросить пользователя и по
+; «Y» один раз загрузить исходный ZIP напрямую по ссылке из каталога. Это
+; сохраняет рабочий raw-ZIP путь при поломке серверного распаковщика.
 retry_online_unzip_if_bad
 		ld a,(online_unzip_attempt)
 		or a
@@ -394,9 +406,11 @@ retry_online_unzip_if_bad
 		ld (online_unzip_attempt),a
 		call zip_body_is_valid
 		ret nc
-		ld hl,net_unzip_fallback_msg
-		ld b,1
-		call zifi_log
+		ld hl,win_unzip_ask	; «Online unpacker is damaged. Save zip archive?»
+		call win_error_call
+		ld a,l
+		or a
+		jr z,retry_online_unzip_failed
 		ld hl,zip_url_buffer_data
 		call parse_url
 		call modem_load_file
@@ -417,8 +431,7 @@ validate_zip_body
 		call zip_body_is_valid
 		ret nc
 		ld hl,net_bad_zip_msg
-		ld b,1
-		call zifi_log
+		call win_error_call
 		scf
 		ret
 
@@ -679,28 +692,41 @@ zifi_get_open_timeout
 zifi_get_open_failed
 		ld hl,net_open_failed_msg
 		jr zifi_get_failed
+zifi_get_http_status_failed
+		ld hl,net_http_status_msg
+		jr zifi_get_failed
+zifi_get_too_large
+		ld hl,net_too_large_msg
+		jr zifi_get_failed
 zifi_get_recv_failed
 		ld hl,net_recv_failed_msg
 
-; Ошибка остаётся видна во встроенной консоли zifi.spg: под названием операции
-; печатается её причина.
+; Любой отказ загрузки — модальное окно; у сбоя связи вторая строка окна —
+; причина от ESP. Строки в консоли мало: индикатор после отказа стирается, а в
+; режиме списка строка консоли ложится поверх ссылок, поэтому в консоль окно
+; ничего не пишет.
 zifi_get_failed
-		ld b,1
-		call zifi_log
-		call net_report_reason
+		call win_error_call
 		call Net_Close
 		jp zifi_get_discard
 
-zifi_get_http_status_failed
-		ld hl,net_http_status_msg
-		jr zifi_get_rejected
-zifi_get_too_large
-		ld hl,net_too_large_msg
-zifi_get_rejected
-		ld b,1
-		call zifi_log
-		call Net_Close
-		jp zifi_get_discard
+; Окно сообщения живёт в отдельной странице WINDOW_PAGE, подключаемой в окно
+; #C000. Номер пишется через set_page3: обработчики музыки, анализатора и
+; подсветки ссылок в прерывании возвращают окно #C000 вызовом restore_page3,
+; то есть именно на неё. Прокрутка списка из прерывания ставит свою страницу
+; — её код окна выключает первым делом; до этого прерывания запрещены.
+; Вход: HL — текст ошибки. Флаги вызывающего сохраняются (push/pop af).
+win_error_call
+		ld a,(restore_page3+1)
+		push af
+		ld a,WINDOW_PAGE
+		di
+		call set_page3
+		call win_error
+		pop af
+		call set_page3
+		ei
+		ret
 
 ; Причина отказа: если ESP присылала пакет #EE, печатается её текст, например
 ; "recv:104"; иначе спрашиваем GET_STEP — метку шага, на котором встал
@@ -784,13 +810,11 @@ zifi_get_length_ok
 		or l
 		jr nz,zifi_get_return
 		ld hl,net_empty_body_msg
-		ld b,1
-		call zifi_log
+		call win_error_call
 		jr zifi_get_return
 zifi_get_length_failed
 		ld hl,net_short_body_msg
-		ld b,1
-		call zifi_log
+		call win_error_call
 zifi_get_discard
 		xor a
 		ld (readed_len_high+1),a
@@ -808,7 +832,6 @@ net_http_status_msg	db "HTTP status is not 2xx",0,0
 net_short_body_msg	db "HTTP body length mismatch",0,0
 net_too_large_msg	db "ZIP exceeds 640 KiB buffer",0,0
 net_bad_zip_msg		db "Rejected: .zip body is not ZIP",0,0
-net_unzip_fallback_msg	db "Online unzip failed, loading ZIP",0,0
 net_empty_body_msg	db "NET EOF: empty HTTP body",0,0
 net_diag_no_reply_msg	db "GET_STEP: no reply",0,0
 net_diag_empty_msg	db "GET_STEP: no error text",0,0
@@ -1524,18 +1547,24 @@ text_down	ld hl,(text_up_line_adr+1)
 ; text_scroll_up. Строки 1..23 уезжают в 3..25; две верхние вызывающий тут же
 ; перерисовывает сам (show_text_line, b=2). Прежний DMA-цикл дочитывал строки
 ; за пределами окна — 0 и #FF, — здесь этого больше нет.
-text_dma_down	call set_Textpage_lite
+		; Текстовую страницу ставим сохранённой (set_Textpage, не lite): копия
+		; идёт около 10 мс, и прервавший её обработчик музыки
+		; (restore_music_pages_lite) возвращает в окно #0000 именно сохранённую
+		; страницу. Прежнюю сохранённую возвращаем в конце.
+text_dma_down	ld a,(restore_page0+1)
+		push af
+		call set_Textpage
 		ld hl,(window_start_Y+window_height*2-4)*256+255
 		ld de,(window_start_Y+window_height*2-2)*256+255
 		ld bc,(window_height*2-3)*256
 		lddr
-		call set_Textpage_lite
 		ld hl,#180
 		ld a,7
 		ld (hl),a
 		inc l
 		jr nz,$-2
-		jp restore_page0
+		pop af
+		jp set_page0
 
 ; 	in hl - adress:
 ;	http://zxaaa.untergrund.net/get.php?f=DEMO6/a_brief_history_of_vacuum_cleaner_nozzle_attachments.zip
@@ -2073,12 +2102,19 @@ scan_0d		ld a,(hl)
 ; та же замена: тот же сдвиг на строку консоли (две строки текста), тот же
 ; объём (DMANUM = window_height*2-1 задаёт 26 блоков по 256 байт), но DMA не
 ; запускается вовсе.
-text_scroll_up	call set_Textpage_lite
+		; Текстовую страницу ставим сохранённой (set_Textpage, не lite): копия
+		; идёт около 10 мс, и прервавший её обработчик музыки
+		; (restore_music_pages_lite) возвращает в окно #0000 именно сохранённую
+		; страницу. Прежнюю сохранённую возвращаем в конце.
+text_scroll_up	ld a,(restore_page0+1)
+		push af
+		call set_Textpage
 		ld hl,(window_start_Y+2)*256
 		ld de,window_start_Y*256
 		ld bc,window_height*2*256
 		ldir
-		jp restore_page0
+		pop af
+		jp set_page0
 
 clear_text_line	ld d,h
 		inc d
@@ -2240,25 +2276,40 @@ frame		ld a,0
 		inc a
 		ld (frame+1),a
 
+		; Цепочку растровых прерываний взводим до работы с мышью и сразу
+		; разрешаем прерывания. Прокрутка списка колесом копирует экран
+		; процессором (LDIR/LDDR, около 10 мс — дольше 84 строк растра). Пока
+		; строку 84 взводил конец int_main, такой кадр оставался без текстовой
+		; полосы и сквозь консоль мелькала заставка. Вложенные int_text_cor и
+		; int_text_on окно #0000 не трогают, а int_text_off со страницами музыки
+		; приходит только на строке 287.
+		ld hl,56+4*8-4
+		ld bc,VSINTL
+		out (c),l
+		ld b,high VSINTH
+		out (c),h
+		ld hl,int_text_cor
+		ld (#beff),hl
+		ei
+
 save_mode	ld a,1
 		or a
-		jr z,int_ex2
+		jr z,int_ex_regs
 mouse_sw	ld a,1
 		or a
 		call nz,mouse_proc
 link_highlight	ld a,0
 		or a
 		call nz,link_highlight_view
+		jr int_ex_regs	; цепочка уже взведена, повторно не трогаем
 
-int_ex2		ld hl,56+4*8-4
-		ld de,int_text_cor
 int_ex		ld bc,VSINTL
 		out (c),l
 		ld b,high VSINTH
 		out (c),h
 		ex de,hl
 		ld (#beff),hl
-		exa
+int_ex_regs	exa
 		pop af
 		exa
 		exx
@@ -4505,7 +4556,7 @@ put_octet_digit
 		ret
 
 put_octet_seen		db 0
-
+
 ; Показать статус HTTP-прокси (CMD_NET_PROXY_STATUS).
 show_proxy_status:
 		call Net_ProxyStatus
@@ -4543,7 +4594,7 @@ show_proxy_status:
 proxy_enabled_msg	db "Proxy enabled: "
 proxy_enabled_field	ds 32
 proxy_disabled_msg	db "Proxy disabled",0,0
-proxy_unreach_msg	db "Proxy disabled (server unreachable)",0,0
+proxy_unreach_msg	db "Proxy disabled (server unreachable)",0,0
 
 esp_ip_msg		db "ESP IP: "
 esp_ip_field		ds 16
@@ -4725,4 +4776,714 @@ music_setup_vars	equ music_player+#55
 	LABELSLIST "build/zifi.l"
 
 		SAVEBIN "build/zifi.bin",start, end-start
+
+; ---------------------------------------------------------------------------
+; Окна сообщений поверх консоли. Код собирается для окна #C000 и грузится
+; в страницу WINDOW_PAGE отдельным блоком SPG (build/zifi_win.bin): в
+; странице программы до #BE00 свободно 16 байт, а памяти у Evo 4 МБ.
+; Страница виртуального устройства 1 нужна только для сборки.
+WINDOW_PAGE	equ #11
+WIN_ROW		equ 10		; верхняя строка рамки (видны строки 0..24)
+WIN_W		equ 44		; ширина с рамкой
+WIN_HMAX	equ 6		; наибольшая высота с рамкой
+WIN_COL		equ (80-WIN_W)/2
+WIN_TEXT	equ WIN_W-4	; самая длинная строка внутри рамки
+WIN_ATTR	equ #2f		; ярко-белый по красному (ZX-палитра текста)
+
+		MMU 3,1,#c000
+win_start
+
+; Окно ошибки загрузки. HL — текст ошибки в памяти программы. Вход и выход —
+; при запрещённых прерываниях (см. win_error_call).
+; Код HTTP вне 2xx показывается как «Error NNN - причина», прочие ошибки —
+; своим текстом, а для сбоев связи второй строкой идёт причина от ESP.
+win_error
+		ld (win_msg+1),hl
+		; Входы-вопросы: в HL адрес процедуры вместо текста ошибки (тексты ошибок
+		; лежат в странице программы, ниже #C000, спутать нельзя).
+		ld de,win_unzip_check
+		or a
+		sbc hl,de
+		jp z,win_unzip_check
+		add hl,de
+		ld de,win_unzip_ask
+		or a
+		sbc hl,de
+		jp z,win_unzip_ask
+		add hl,de
+		ld de,aux_download_date
+		or a
+		sbc hl,de
+		jp z,aux_download_date
+		call win_quiet
+		ld hl,win_hint_text
+		ld (win_hint+1),hl
+		ld hl,win_wait_any
+		ld (win_wait+1),hl
+win_msg		ld hl,0
+		ld de,net_http_status_msg
+		or a
+		sbc hl,de
+		jr nz,.plain
+		call win_http_title
+		ld hl,win_line1
+		ld de,0
+		jr .out
+
+.plain
+		; В консоль ничего не печатается: в режиме списка её строки ложатся
+		; поверх ссылок и остаются серыми буквами после закрытия окна. Текст и
+		; причина видны в самом окне.
+		; Отказ записи на SD: второй строкой код драйвера FAT32 — по нему видно,
+		; что именно не так (нет места, нет каталога, неверный буфер…).
+		ld hl,(win_msg+1)
+		ld de,fat_save_error_msg
+		or a
+		sbc hl,de
+		jr nz,.link
+		ld de,win_line2
+		ld hl,win_fat_word
+		call win_strcpy
+		ld a,(fat_last_error)
+		call win_hex2
+		xor a
+		ld (de),a
+		ld de,win_line2
+		jr .show
+.link
+		ld hl,(win_msg+1)
+		call win_is_link_error
+		ld de,0
+		jr nz,.show
+		; Сбой связи: вторая строка окна — причина от ESP.
+		call win_reason
+		ld de,0
+		ld a,(ProtoErr)
+		or a
+		jr z,.show
+		ld de,ProtoErrText
+.show		ld hl,(win_msg+1)
+.out		; Сбой попытки через онлайн-распаковщик для ссылки .zip: окна нет —
+		; после загрузки будет вопрос о сохранении ZIP (win_unzip_check).
+		push hl
+		push de
+		call win_in_unzip
+		pop de
+		pop hl
+		jp nz,win_show
+		jp win_exit
+
+; Причина от ESP без печати в консоль: текст отказа, если ESP его прислала,
+; иначе метка шага GET_STEP. Результат — ProtoErr и ProtoErrText.
+win_reason	ld a,(ProtoErr)
+		or a
+		ret nz
+		jp Net_GetStep
+
+; Z — сбой связи (открытие, тайм-аут, приём): у него есть причина от ESP.
+win_is_link_error
+		ld de,net_open_timeout_msg
+		call .same
+		ret z
+		ld de,net_open_failed_msg
+		call .same
+		ret z
+		ld de,net_recv_failed_msg
+.same		push hl
+		or a
+		sbc hl,de
+		pop hl
+		ret
+
+; «Error NNN - причина» в win_line1 по NetHttpCode.
+win_http_title
+		ld de,win_line1
+		ld hl,win_error_word
+		call win_strcpy
+		ld hl,(NetHttpCode)
+		call win_dec3
+		ld hl,win_dash
+		call win_strcpy
+		ld hl,win_http_reasons
+1		ld c,(hl)
+		inc hl
+		ld b,(hl)
+		inc hl
+		ld a,b
+		or c
+		jr z,3f		; конец таблицы: общий текст идёт следом
+		push hl
+		ld hl,(NetHttpCode)
+		or a
+		sbc hl,bc
+		pop hl
+		jr z,3f
+2		ld a,(hl)
+		inc hl
+		or a
+		jr nz,2b
+		jr 1b
+3		call win_strcpy
+		xor a
+		ld (de),a
+		ret
+
+; Скопировать строку HL (без завершающего нуля) в DE; DE — за последним байтом.
+win_strcpy	ld a,(hl)
+		or a
+		ret z
+		ld (de),a
+		inc hl
+		inc de
+		jr win_strcpy
+
+; A — двумя шестнадцатеричными цифрами в DE.
+win_hex2	push af
+		rrca
+		rrca
+		rrca
+		rrca
+		call .nibble
+		pop af
+.nibble		and #0f
+		add a,"0"
+		cp "9"+1
+		jr c,1f
+		add a,"A"-"9"-1
+1		ld (de),a
+		inc de
+		ret
+
+; HL (до 999) — тремя десятичными цифрами в DE.
+win_dec3	ld bc,100
+		call .digit
+		ld bc,10
+		call .digit
+		ld a,l
+		add a,"0"
+		ld (de),a
+		inc de
+		ret
+.digit		ld a,"0"-1
+1		inc a
+		or a
+		sbc hl,bc
+		jr nc,1b
+		add hl,bc
+		ld (de),a
+		inc de
+		ret
+
+; Прокрутка из прерывания переключает окно #C000 на свою страницу, а
+; подсветка ссылок пишет атрибуты в текстовую страницу: на время окна обе
+; выключены. После этого прерывания разрешаются — без них не идут тайм-ауты
+; обмена с ESP (net_report_reason) и не двигается курсор.
+win_quiet	ld a,(scroll_sw+1)
+		ld (win_scroll+1),a
+		ld a,(link_highlight+1)
+		ld (win_highlight+1),a
+		xor a
+		ld (scroll_sw+1),a
+		ld (link_highlight+1),a
+		ei
+		ret
+
+; Показать окно. HL — первая строка, DE — вторая (0 — её нет). Под окном
+; текстовая страница сохраняется и после закрытия возвращается. Закрывается
+; любой клавишей или кнопкой мыши. Выход — при запрещённых прерываниях.
+win_show	ld (win_first+1),hl
+		ld (win_second+1),de
+		ld a,d
+		or e
+		ld a,WIN_HMAX-1
+		jr z,1f
+		inc a
+1		ld (win_height+1),a
+		; Текстовая страница — сохранённая: обработчик музыки вернёт в окно
+		; #0000 именно её. Прежний номер возвращается при выходе.
+		ld a,(restore_page0+1)
+		ld (win_page0+1),a
+		call set_Textpage
+
+		; Сохранить область под окном: строка текста — 128 байтов символов,
+		; следом 128 байтов атрибутов.
+		ld hl,WIN_ROW*256+WIN_COL
+		ld de,win_save
+		call win_height_b
+2		push bc
+		push hl
+		ld bc,WIN_W
+		ldir
+		pop hl
+		push hl
+		set 7,l
+		ld bc,WIN_W
+		ldir
+		pop hl
+		inc h
+		pop bc
+		djnz 2b
+
+		; Рамка
+		ld hl,WIN_ROW*256+WIN_COL
+		ld bc,#c9cd
+		ld d,#bb
+		call win_row
+		call win_height_b
+		dec b
+		dec b
+3		push bc
+		ld bc,#ba20
+		ld d,#ba
+		call win_row
+		pop bc
+		djnz 3b
+		ld bc,#c8cd
+		ld d,#bc
+		call win_row
+
+		; Текст по центру: строки сообщения и подсказка
+win_first	ld hl,0
+		ld d,WIN_ROW+1
+		call win_center
+win_second	ld hl,0
+		ld a,h
+		or l
+		ld d,WIN_ROW+2
+		call nz,win_center
+win_hint	ld hl,win_hint_text
+		call win_height_b
+		ld a,WIN_ROW-2
+		add a,b
+		ld d,a
+		call win_center
+
+		; Ожидание: для ошибки — любая клавиша или кнопка, для вопроса — Y/N.
+win_wait	call win_wait_any
+
+		; Вернуть область под окном
+		call set_Textpage
+		ld hl,win_save
+		ld de,WIN_ROW*256+WIN_COL
+		call win_height_b
+5		push bc
+		push de
+		ld bc,WIN_W
+		ldir
+		pop de
+		push de
+		set 7,e
+		ld bc,WIN_W
+		ldir
+		pop de
+		inc d
+		pop bc
+		djnz 5b
+win_page0	ld a,0
+		call set_page0
+win_exit	di
+win_scroll	ld a,0
+		ld (scroll_sw+1),a
+win_highlight	ld a,0
+		ld (link_highlight+1),a
+		ret
+
+; Ожидание для окна ошибки: сначала всё отпущено, затем нажатие, затем снова
+; отпущено — иначе закрывшая окно клавиша дошла бы до главного цикла.
+win_wait_any	call win_wait_release
+1		call win_input
+		jr z,1b
+		call win_wait_release
+		jp win_settle
+
+; Ожидание ответа на вопрос: клавиша Y или N. Ответ — в win_answer (1 — «Y»).
+; Щелчок мыши здесь ничего не значит и, как в win_input, гасится.
+win_wait_yn	call win_wait_release
+1		xor a
+		ld (lmb_counter+1),a
+		ld a,#df		; ряд P O I U Y: Y — бит 4
+		in a,(#fe)
+		ld c,1
+		bit 4,a
+		jr z,2f
+		ld a,#7f		; ряд Space Sym M N B: N — бит 3
+		in a,(#fe)
+		ld c,0
+		bit 3,a
+		jr nz,1b
+2		ld a,c
+		ld (win_answer),a
+		call win_wait_release
+		jp win_settle
+
+; NZ — это не попытка через онлайн-распаковщик для ссылки .zip.
+win_in_unzip	ld a,(online_unzip_attempt)
+		or a
+		jr nz,win_url_is_zip
+		inc a
+		ret
+
+; Z — исходная ссылка (zip_url_buffer_data, конец — #0D) оканчивается на .zip.
+win_url_is_zip	ld hl,zip_url_buffer_data
+		ld bc,237
+		ld a,#0d
+		cpir
+		ret nz
+		dec hl
+		dec hl
+		ld a,(hl)
+		or #20
+		cp "p"
+		ret nz
+		dec hl
+		ld a,(hl)
+		or #20
+		cp "i"
+		ret nz
+		dec hl
+		ld a,(hl)
+		or #20
+		cp "z"
+		ret nz
+		dec hl
+		ld a,(hl)
+		cp "."
+		ret
+
+; Вопрос «Online unpacker is damaged. Save zip archive? (Y/N)». Вход и выход —
+; при запрещённых прерываниях. Выход: A=1 — «Y».
+win_ask_unpacker
+		call win_quiet
+		ld hl,win_question_text
+		ld (win_hint+1),hl
+		ld hl,win_wait_yn
+		ld (win_wait+1),hl
+		xor a
+		ld (win_answer),a
+		ld hl,win_unpacker_text
+		ld de,0
+		call win_show
+		ld a,(win_answer)
+		ret
+
+; После загрузки (главный цикл). Если попытка через онлайн-распаковщик не
+; удалась, а исходная ссылка — .zip, спросить, сохранить ли ZIP; «Y» готовит
+; запрос на исходную ссылку. Выход: HL=1 — скачать заново, HL=0 — нет.
+win_unzip_check
+		ld hl,0
+		ld a,(online_unzip_attempt)
+		or a
+		ret z
+		ld a,(do_after_load+1)
+		cp save_file
+		ret nc			; удалась: дальше решит retry_online_unzip_if_bad
+		xor a
+		ld (online_unzip_attempt),a	; неудачная попытка закончена в любом случае
+		call win_url_is_zip
+		ld hl,0
+		ret nz
+		call win_ask_unpacker
+		ld hl,0
+		or a
+		ret z
+		ld a,save_file
+		ld (do_after_load+1),a
+		ld hl,zip_url_buffer_data
+		call parse_url
+		ld hl,1
+		ret
+
+; Распаковщик вернул для ссылки .zip не архив (retry_online_unzip_if_bad).
+; Выход: HL=1 — «Y», скачать исходный ZIP.
+win_unzip_ask	call win_ask_unpacker
+		ld l,a
+		ld h,0
+		ret
+
+; Дата каталога загрузок, когда NTP не ответил (sync_clock_failed): дата из
+; RTC, если она правдоподобна, иначе 2026-01-01. Строкой в консоль — откуда
+; взята дата: на старте консоль и есть экран, список ещё не показан.
+aux_download_date
+		call win_quiet
+		call aux_rtc_date
+		ld hl,aux_rtc_msg
+		jr z,1f
+		ld hl,aux_default_date
+		ld de,DIR_date+1
+		ld bc,10
+		ldir
+		ld hl,aux_default_msg
+1		ld b,1
+		call zifi_echo
+		jp win_exit
+
+; Дата RTC (часы Evo: регистры 9, 8, 7 — год, месяц, день) в DIR_date+1
+; строкой «20ГГ-ММ-ДД». Z — дата правдоподобна: цифры BCD 0..9, год 2026..2099,
+; месяц 1..12, день 1..31. Двоичный режим часов (регистр B, бит 2) тоже понят.
+aux_rtc_date	ld bc,#eff7
+		ld a,#80		; доступ к часам, как в write_rtc
+		out (c),a
+		ld a,#0b
+		call aux_rtc_read
+		and 4
+		ld (aux_rtc_bin+1),a
+		ld a,9
+		call aux_rtc_bcd
+		ld (aux_rtc_ymd),a
+		ld a,8
+		call aux_rtc_bcd
+		ld (aux_rtc_ymd+1),a
+		ld a,7
+		call aux_rtc_bcd
+		ld (aux_rtc_ymd+2),a
+		ld bc,#eff7
+		xor a
+		out (c),a
+		ld hl,aux_rtc_ymd
+		ld de,aux_rtc_limits
+		ld b,3
+1		ld a,(hl)
+		call aux_bcd_ok
+		ret nz
+		ld a,(de)		; наименьшее
+		ld c,a
+		ld a,(hl)
+		cp c
+		jr c,aux_rtc_bad
+		inc de
+		ld a,(de)		; наибольшее
+		ld c,a
+		ld a,(hl)
+		cp c
+		jr z,2f
+		jr nc,aux_rtc_bad
+2		inc de
+		inc hl
+		djnz 1b
+		ld de,DIR_date+1
+		ld a,"2"
+		ld (de),a
+		inc de
+		ld a,"0"
+		ld (de),a
+		inc de
+		ld hl,aux_rtc_ymd
+		ld b,3
+3		ld a,(hl)
+		call aux_put_bcd
+		inc hl
+		dec b
+		ret z			; Z — дата записана
+		ld a,"-"
+		ld (de),a
+		inc de
+		jr 3b
+aux_rtc_bad	or 1			; NZ
+		ret
+
+; A — номер регистра часов; выход: A — его значение.
+aux_rtc_read	ld bc,#dff7
+		out (c),a
+		ld b,#bf
+		in a,(c)
+		ret
+
+; A — номер регистра; выход: A — значение в BCD (из двоичного — переводом).
+aux_rtc_bcd	call aux_rtc_read
+aux_rtc_bin	ld c,0			; 4 — часы в двоичном режиме
+		inc c
+		dec c
+		ret z
+		ld c,0
+1		sub 10
+		jr c,2f
+		inc c
+		jr 1b
+2		add a,10
+		ld b,a
+		ld a,c
+		rlca
+		rlca
+		rlca
+		rlca
+		or b
+		ret
+
+; Z — обе цифры BCD в A не больше 9.
+aux_bcd_ok	ld c,a
+		and #0f
+		cp #0a
+		jr nc,1f
+		ld a,c
+		and #f0
+		cp #a0
+		jr nc,1f
+		xor a
+		ret
+1		or 1
+		ret
+
+; A — BCD; две цифры ASCII в (DE), DE += 2.
+aux_put_bcd	push af
+		rrca
+		rrca
+		rrca
+		rrca
+		and #0f
+		add a,"0"
+		ld (de),a
+		inc de
+		pop af
+		and #0f
+		add a,"0"
+		ld (de),a
+		inc de
+		ret
+
+aux_rtc_limits	db #26,#99,#01,#12,#01,#31
+aux_rtc_ymd	ds 3
+aux_default_date	db "2026-01-01"
+aux_rtc_msg	db "Download folder date from RTC",0,0
+aux_default_msg	db "RTC date invalid, folder 2026-01-01",0,0
+
+; B — высота окна с рамкой.
+win_height_b
+win_height	ld b,0
+		ret
+
+; Строка рамки: HL — начало, B — левый символ, C — заполнитель, D — правый.
+; Выход: HL на следующей строке.
+win_row		push hl
+		ld (hl),b
+		inc l
+		ld a,WIN_W-2
+1		ld (hl),c
+		inc l
+		dec a
+		jr nz,1b
+		ld (hl),d
+		pop hl
+		push hl
+		set 7,l
+		ld b,WIN_W
+2		ld (hl),WIN_ATTR
+		inc l
+		djnz 2b
+		pop hl
+		inc h
+		ret
+
+; Строка HL (0 в конце) по центру окна в строке экрана D; длиннее WIN_TEXT —
+; обрезается (причина от ESP может быть длинной).
+win_center	push hl
+		ld b,0
+1		ld a,(hl)
+		or a
+		jr z,2f
+		inc hl
+		inc b
+		ld a,b
+		cp WIN_TEXT
+		jr c,1b
+2		ld a,WIN_W
+		sub b
+		srl a
+		add a,WIN_COL
+		ld e,a
+		pop hl
+		ld a,b
+		or a
+		ret z
+3		ld a,(hl)
+		ld (de),a
+		inc hl
+		inc e
+		djnz 3b
+		ret
+
+; NZ — нажата клавиша или кнопка мыши.
+; Счётчик нажатия lmb_counter обнуляется на каждом опросе: обработчик мыши в
+; прерывании увидит отпускание кнопки, закрывшей окно, с нулевым счётчиком, а
+; это для него «не щелчок» — ни по ссылке под окном, ни по меню. Переключатель
+; lmb_click_sw (щелчки по списку разрешены) окно не трогает: прежняя версия
+; его выключала, и до перезагрузки каталога ссылки переставали нажиматься.
+win_input	xor a
+		ld (lmb_counter+1),a
+		in a,(#fe)
+		cpl
+		and #1f
+		ret nz
+		ld bc,#fadf
+		in a,(c)
+		cpl
+		and 3
+		ret
+
+win_wait_release
+		call win_input
+		jr nz,win_wait_release
+		ret
+
+; Обработчик мыши в прерывании разбирает кнопку по состоянию, прочитанному
+; в прошлом кадре (mouse_buttons раньше mouse_pos). Окно же видит отпускание
+; сразу — и без этой паузы следующий кадр ещё раз засчитал бы нажатие, а ещё
+; через кадр отпускание сработало бы как щелчок по тому, что под курсором.
+; Две смены кадра со сбросом счётчика — отпускание придёт с нулём.
+win_settle	ld a,(frame+1)
+		ld c,a
+		ld b,2
+1		xor a
+		ld (lmb_counter+1),a
+		ld a,(frame+1)
+		cp c
+		jr z,1b
+		ld c,a
+		djnz 1b
+		xor a
+		ld (lmb_counter+1),a
+		ret
+
+win_fat_word	db "FAT32 code #",0
+win_error_word	db "Error ",0
+win_dash	db " - ",0
+; Частые коды HTTP: слово кода, текст. Нулевое слово — конец, за ним общий текст.
+win_http_reasons
+		dw 400
+		db "bad request",0
+		dw 401
+		db "unauthorized",0
+		dw 403
+		db "forbidden",0
+		dw 404
+		db "page not found",0
+		dw 405
+		db "method not allowed",0
+		dw 408
+		db "request timeout",0
+		dw 410
+		db "gone",0
+		dw 429
+		db "too many requests",0
+		dw 500
+		db "internal server error",0
+		dw 501
+		db "not implemented",0
+		dw 502
+		db "bad gateway",0
+		dw 503
+		db "service unavailable",0
+		dw 504
+		db "gateway timeout",0
+		dw 0
+		db "HTTP error",0
+win_hint_text	db "Press any key",0
+win_unpacker_text	db "Online unpacker is damaged.",0
+win_question_text	db "Save zip archive? (Y/N)",0
+win_answer	db 0
+win_line1	ds WIN_TEXT+1
+win_line2	ds WIN_TEXT+1
+win_end
+win_save	equ win_end		; WIN_W*WIN_HMAX*2 байтов, в SPG не входит
+		ASSERT win_save+WIN_W*WIN_HMAX*2 <= #10000, окно не помещается в страницу
+		SAVEBIN "build/zifi_win.bin",win_start,win_end-win_start
 		

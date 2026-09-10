@@ -167,8 +167,8 @@ save_downloaded_file:
 fat_save_failed:
         LD (fat_last_error),A
         CALL sd_exit
-        LD HL,fat_save_error_msg,B,1
-        CALL zifi_log
+        LD HL,fat_save_error_msg
+        CALL win_error_call     ; окно, как у ошибок загрузки
         LD A,(fat_last_error)
         OR A
         SCF
