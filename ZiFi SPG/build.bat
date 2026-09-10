@@ -1,10 +1,12 @@
 @echo off
 setlocal
 chcp 65001 >nul
-rem Build ZiFi SPG: sjasmplus creates build\zifi.bin, then spgbld packs zifi.spg.
+rem Сборка ZiFi: самостоятельный FAT32, основной код, затем упаковка SPG.
 
 for %%I in ("%~dp0.") do set "SPG_DIR=%%~sI"
 for %%I in ("%~dp0..\shared\z80") do set "SHARED_Z80=%%~sI"
+if not defined FAT32_DRIVER_DIR set "FAT32_DRIVER_DIR=%~dp0..\..\FAT32 Driver"
+for %%I in ("%FAT32_DRIVER_DIR%") do set "FAT32_DIR=%%~sI"
 
 if not exist "%SPG_DIR%\build" mkdir "%SPG_DIR%\build"
 if not exist "%SHARED_Z80%\proto.asm" (
@@ -27,7 +29,15 @@ if not defined SJASM (
   exit /b 1
 )
 
-"%SJASM%" --nologo --inc="%SHARED_Z80%" zifi.asm
+set "SJASMPLUS=%SJASM%"
+python "%FAT32_DIR%\build.py"
+if errorlevel 1 exit /b 1
+copy /y "%FAT32_DIR%\build\fat32.bin" "%SPG_DIR%\build\fat32.bin" >nul
+if errorlevel 1 exit /b 1
+copy /y "%FAT32_DIR%\build\fat32-work.bin" "%SPG_DIR%\build\fat32-work.bin" >nul
+if errorlevel 1 exit /b 1
+
+"%SJASM%" --nologo --inc="%SHARED_Z80%" --inc="%FAT32_DIR%\include" --sym="build\zifi.sym" zifi.asm
 if errorlevel 1 exit /b 1
 
 set "PATH=%SPG_DIR%\_spg;%PATH%"

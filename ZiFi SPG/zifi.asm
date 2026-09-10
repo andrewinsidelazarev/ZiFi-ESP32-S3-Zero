@@ -10,7 +10,19 @@ Vid_page		equ #e0
 Sprite_page		equ #f0
 Mouse_pal_num		equ #f0
 
+; Бордюр один на весь кадр, записи BORDER посреди кадра не нужны. В 256c FPGA
+; выводит бордюр индексом BORDER как есть, а в текстовом режиме — как
+; {GPAL, BORDER[3:0]} (video_render.v, video_out.v). Младший полубайт 0 даёт
+; в текстовой полосе CRAM[#F0] — чёрный фон консоли, а в графических полосах
+; CRAM[#10], куда палитра кладёт цвет прежнего бордюра #34. Режим FPGA
+; защёлкивает в начале строки, поэтому цвет бордюра меняется ровно на границе
+; полос. Прежняя запись #34 посреди строки 287, пока режим ещё текстовый,
+; красила правый бордюр этой строки в CRAM[#F4] — зелёный цвет ZX-палитры.
+GFX_BORDER		equ #10
+
 sd_driver_page		equ #0f
+fat32_code_page		equ #0e
+		INCLUDE "fat32.inc"
 cursor_adr		equ #c000
 cursor_page		equ #10	
 
@@ -51,6 +63,15 @@ start
 		ld sp,#bfff
 		call all_init
  		call set_256c_mode		
+		ld bc,TSCONFIG
+		ld a,TSU_SEN
+		out (c),a
+		IFNDEF PALSEL_FIXED
+PALSEL_FIXED	equ #3f	; GPAL=15 нужен тексту; графика 256c PALSEL не использует
+		ENDIF
+		ld bc,PALSEL
+		ld a,PALSEL_FIXED
+		out (c),a
 		call sd_init
 		ei
  		ld b,60
@@ -65,6 +86,10 @@ start
 		ld (#beff),hl
 		ei
 		call load_ini
+		; Диагностическая сборка (--define ZIFI_NO_ESP) не трогает ZiFi вовсе:
+		; ни инициализации платы, ни NTP. Нужна, чтобы отделить тракт ESP от
+		; остальной инициализации машины при поиске причины пропажи мыши.
+		IFNDEF ZIFI_NO_ESP
 		call init_zifi
 		ld a,(mouse_button)
 		cpl
@@ -73,6 +98,7 @@ start
 		; Текущая дата нужна каталогу загрузок всегда. Поле time:none запрещает
 		; только запись RTC; запрос NTP и каталог ГГГГ-ММ-ДД остаются рабочими.
 		call sync_clock
+		ENDIF
 		call set_Textpage
 		ld hl,ready_message
 		ld b,1
@@ -103,6 +129,10 @@ do_after_load	ld a,0
 		jr c,1f
 		push af
 		call save_downloaded_file
+		jr nc,save_action_ready
+		pop af
+		jp main_ex
+save_action_ready:
 		pop af
 1		cp view_downloaded_list
 		call z,create_link_list
@@ -613,6 +643,10 @@ zifi_get	call wait_frame
 		sbc hl,de
 		jr nc,zifi_get_http_status_failed
 
+		; Длина тела известна только теперь, из ответа сервера.
+		call bar_reset
+
+
 ; Тянуть данные до Content-Length либо пока сервер не закроет соединение.
 zifi_get_pump	call Net_Recv
 		jr c,zifi_get_recv_failed	; молчание/ошибка прошивки — обрыв
@@ -634,9 +668,7 @@ zifi_get_store	ld a,(hl)
 		or c
 		jr nz,zifi_get_store
 
-		ld hl,(NetChunkLen)
-		ld b,h
-		call view_progress_bar
+		call bar_advance
 		call zifi_get_content_complete
 		jp z,zifi_get_done	; известная длина принята: TLS FIN не нужен
 		jr zifi_get_pump
@@ -869,8 +901,7 @@ zifi_echo	ld de,#1000
 		ld a,d
 		cp 24
 		jr c,1f
-		ld hl,text_up_copy
-		call set_ports
+		call text_scroll_up
 		ld hl,24*256
 		call clear_text_line
 		ld a,22
@@ -1251,6 +1282,11 @@ gfx_border	ld a,0
 		ld b,high TSCONFIG
 		ld a,TSU_SEN
 		out (c),a
+		; Просмотр ставил свой PALSEL (gfx_vpal), а растровые обработчики его
+		; больше не пишут: общий PALSEL возвращаем здесь.
+		ld b,high PALSEL
+		ld a,PALSEL_FIXED
+		out (c),a
 		ld hl,all_pals
 		call set_ports
 		ld hl,zx_pals
@@ -1419,8 +1455,7 @@ text_up		ld a,1
 
 		ld a,download_page
 		call set_page1
-		ld hl,text_up_copy
-		call set_ports
+		call text_scroll_up	; без DMA, см. text_scroll_up
 		ld hl,window_start_Yl+((window_height-1)*2*256)
 		push hl
 		call clear_text_line
@@ -1485,27 +1520,15 @@ text_down	ld hl,(text_up_line_adr+1)
 		ld b,2	; rows
 		jp show_text_line
 		
-text_dma_down	ld hl,text_down_copy
-		call set_ports
-		ld d,window_start_Y+window_height*2-4
-		ld e,window_start_Y+window_height*2-2
-		ld a,window_height*2-1
-td1		exa
-		ld b,high DMASADDRH 
-		out (c),d
-		ld b,high DMADADDRH 
-		out (c),e
-		dec d
-		dec e
-;		dec d
-;		dec e
-		ld b,#27
-		ld a,DMA_RAM
-		out (c),a
-		call dma_stats
-		exa
-		dec a
-		jr nz,td1
+; Прокрутка списка вниз без DMA: та же копия внутри одной страницы, что и в
+; text_scroll_up. Строки 1..23 уезжают в 3..25; две верхние вызывающий тут же
+; перерисовывает сам (show_text_line, b=2). Прежний DMA-цикл дочитывал строки
+; за пределами окна — 0 и #FF, — здесь этого больше нет.
+text_dma_down	call set_Textpage_lite
+		ld hl,(window_start_Y+window_height*2-4)*256+255
+		ld de,(window_start_Y+window_height*2-2)*256+255
+		ld bc,(window_height*2-3)*256
+		lddr
 		call set_Textpage_lite
 		ld hl,#180
 		ld a,7
@@ -1857,8 +1880,7 @@ all_lines_counter
 		ld (link_num+1),a		
 		add window_height-1
 		call calc_link_num
-		ld hl,text_up_copy
-		call set_ports
+		call text_scroll_up	; без DMA, см. text_scroll_up
 		ld hl,window_start_Yl+((window_height-1)*2*256)
 		push hl
 		call clear_text_line
@@ -2045,6 +2067,19 @@ scan_0d		ld a,(hl)
 ;		inc hl		; #0a
 		ret
 
+; Прокрутка консоли без DMA. Копия идёт внутри одной страницы: source page и
+; destination page у text_up_copy оба равны Text_page — ровно тот случай, что
+; уже оказался ненадёжным в set_text_colors и был там заменён на LDIR. Здесь
+; та же замена: тот же сдвиг на строку консоли (две строки текста), тот же
+; объём (DMANUM = window_height*2-1 задаёт 26 блоков по 256 байт), но DMA не
+; запускается вовсе.
+text_scroll_up	call set_Textpage_lite
+		ld hl,(window_start_Y+2)*256
+		ld de,window_start_Y*256
+		ld bc,window_height*2*256
+		ldir
+		jp restore_page0
+
 clear_text_line	ld d,h
 		inc d
 		ld e,l
@@ -2184,7 +2219,9 @@ int_gfx_view	push af,hl,de,bc,ix
 		ret
 
 int_main	push af,hl,de,bc,ix,iy
-		ld a,#34
+		; Строка 0 лежит в кадровом гасящем интервале; запись каждый кадр
+		; возвращает бордюр после просмотра картинки.
+		ld a,GFX_BORDER
 		ld bc,BORDER
 		out (c),a
 		exx
@@ -2252,32 +2289,32 @@ int_text_cor_ex	ld a,0
 		pop af
 		ret
 
-int_text_on	push af,hl,de,bc,ix,iy
-txt_border	ld a,#f0
-		ld bc,BORDER
+int_text_on	push af,hl,de,bc
+		; VCONFIG, VPAGE и GYOFFS FPGA применяет с начала следующей строки
+		; (video_ports.v, защёлка по line_start), поэтому записи должны успеть
+		; до конца текущей строки — отсюда запись режима первым делом. BORDER же
+		; меняется сразу, и здесь его не трогаем: см. GFX_BORDER.
+		; Порядок push менять нельзя — общий эпилог int_ex снимает их как есть.
+		ld a,(click_offset+1)
+		ld bc,GYOFFSL
 		out (c),a
+		ld b,high VCONFIG
+		ld a,VID_TEXT+VID_320X240
+		out (c),a
+		ld b,high VPAGE
+		ld a,Text_page
+		out (c),a
+		; PALSEL общий для обеих полос и выставлен на старте; ненулевой A
+		; отпускает ожидание в int_text_cor.
+		ld a,#3f
+		ld (int_text_cor_ex+1),a
+		push ix,iy
 		exx
 		push hl,de,bc
 		exx
 		exa
 		push af
 		exa
-		ld a,(click_offset+1)
-		ld b,high GYOFFSL
-		out (c),a
-		ld b,high VCONFIG
-		ld a,VID_TEXT+VID_320X240
-		out (c),a
-;		ld b,high TSCONFIG
-;		ld a,TSU_SEN
-;		out (c),a
-		ld b,high VPAGE
-		ld a,Text_page
-		out (c),a
-		ld b,high PALSEL
-		ld a,#3f
-		out (c),a
-		ld (int_text_cor_ex+1),a
 		ld hl,47+240-1-2
 		ld de,int_text_ofcor
 		jp int_ex
@@ -2303,22 +2340,27 @@ int_text_ofcor_ex	ld a,0
 		pop af
 		ret
 
-int_text_off	push af,hl,de,bc,ix,iy
-		ld a,#34
-		ld bc,BORDER
-		out (c),a
+int_text_off	push af,hl,de,bc
+		; VCONFIG, VPAGE и GYOFFS FPGA применяет с начала следующей строки
+		; (video_ports.v, защёлка по line_start), поэтому записи должны успеть
+		; до конца текущей строки — отсюда запись режима первым делом. BORDER же
+		; меняется сразу, и здесь его не трогаем: см. GFX_BORDER.
+		; Порядок push менять нельзя — общий эпилог int_ex снимает их как есть.
+		call set_256c_mode
+		IFNDEF SKIP_GYOFFS
+		ld hl,47+240-1
+		ld bc,GYOFFSL
+		out (c),l
+		inc b
+		out (c),h
+		ENDIF
+		push ix,iy
 		exx
 		push hl,de,bc
 		exx
 		exa
 		push af
 		exa
-		call set_256c_mode
-		ld hl,47+240-1
-		ld b,high GYOFFSL
-		out (c),l
-		inc b
-		out (c),h
 music_sw	ld a,0
 		or a
 		call nz,pt_play
@@ -2342,6 +2384,10 @@ int_ex3		ld hl,0
 
 pt_play		call set_music_pages_lite
 		call music_player_play
+		; Во время FAT32 нельзя менять сохранённые банки из автоперехода музыки.
+		ld a,(fat_active)
+		or a
+		jp nz,pt_play_ex
 
 show_now_play_link	ld a,0
 		or a
@@ -2421,15 +2467,15 @@ set_256c_mode
 		ld bc,VCONFIG
 		ld a,VID_256C+VID_320X240 ;VID_NOGFX+
 		out (c),a
+		IFNDEF SKIP_VPAGE
 		ld b,high VPAGE
 		ld a,Vid_page
 		out (c),a
-		ld b,high PALSEL
-		xor a
-		out (c),a
-		ld b,high TSCONFIG
-		ld a,TSU_SEN
-		out (c),a
+		ENDIF
+		; PALSEL здесь не трогаем: он один на обе полосы, см. старт.
+		; TSCONFIG здесь не трогаем: эту процедуру зовут растровые обработчики,
+		; а перезапуск спрайтового движка внутри строки гасит спрайт на ней.
+		; Спрайты включены один раз при старте.
 		ret
 
 link_highlight_view
@@ -3243,7 +3289,7 @@ koorp		ld a,c
 
 
 im2_init	
-		xor a	
+		xor a
 		ld bc,HSINT
 		out (c),a
 		ld bc,VSINTL
@@ -3742,11 +3788,141 @@ list_search_db
 		edup
 list_search_db_end
 
+; Подготовка индикатора к новой загрузке. Отсутствие длины или длина больше
+; 16 МиБ дают ноль в bar_total — это и есть признак режима активности.
+BAR_CELLS	equ 100
+bar_reset	ld hl,0
+		ld (bar_acc),hl
+		xor a
+		ld (bar_acc+2),a
+		ld (progress_mark+1),a
+		ld a,(NetHttpLen+3)
+		or a
+		jr nz,1f
+		ld hl,(NetHttpLen)
+		ld a,(NetHttpLen+2)
+		jr 2f
+1		ld hl,0
+		xor a
+2		ld (bar_total),hl
+		ld (bar_total+2),a
+		ret
+
+; Прежний режим: одна ячейка на каждые 256 принятых байтов.
+bar_activity	ld a,(readed_len_low+2)
+progress_mark	ld b,0
+		ld (progress_mark+1),a
+		sub b
+		ld b,a
+		jp view_progress_bar
+
+bar_total	ds 3
+bar_acc		ds 3
+
+
 
 		align 256
-all_pal_bin	incbin "_spg/menu.tga.pal"
+all_pal_bin	incbin "_spg/menu.tga.pal",0,GFX_BORDER*2
+		; Индекс #10 не встречается ни в картинках, ни в коде рисования: кладём
+		; туда цвет прежнего бордюра — тот же, что у индекса #34. См. GFX_BORDER.
+		incbin "_spg/menu.tga.pal",#34*2,2
+		incbin "_spg/menu.tga.pal",GFX_BORDER*2+2
 		incbin "_spg/pal_zx.tga.pal"
 search_url	ds 64
+
+; Подмена скачанного файла через временный. Код лежит здесь, в простое
+; выравнивания перед mouse_step: страница ZiFi упирается в #BE00, а тут до
+; align 256 всё равно простаивало 160 байт.
+;
+; Если файла с таким именем ещё нет — создаём сразу. Если есть — пишем во
+; временный и подменяем только после полной записи: отказ на середине не
+; должен уничтожить то, что уже было скачано раньше.
+; Выход: CF=1 — ошибка носителя, иначе Z/NZ от создания файла.
+fat_prepare_target
+		xor a
+		ld (fat_overwrite),a
+		ld hl,FILE
+		call FAT32_CREATE
+		ret z			; имени не было — обычный путь, как и раньше
+		; Имя занято: пишем во временный файл и подменяем только после полной
+		; записи, чтобы отказ на середине не уничтожил уже скачанное.
+		ld a,1
+		ld (fat_overwrite),a
+		ld hl,FILE_TMP+4
+		call FAT32_DELETE	; хвост прерванной прошлой попытки, если он есть
+		ld hl,FILE_TMP
+		jp FAT32_CREATE
+
+; Отдать временному файлу имя целевого. Вызывается только после успешного
+; закрытия: до этой точки старый файл остаётся целым.
+; Выход: Z — сделано или подмена не требовалась, NZ — код ошибки в A.
+fat_commit_replace
+		ld a,(fat_overwrite)
+		or a
+		ret z
+		ld hl,FILE+4
+		call FAT32_DELETE
+		ret nz
+		ld hl,FILE_TMP+4
+		ld de,FILE+5
+		jp FAT32_RENAME
+
+fat_overwrite	db 0
+; Блок CREATE временного файла. FILE_TMP+4 — это уже [флаг 0][имя][0] для
+; FIND/DELETE/RENAME, потому что четыре байта длины нулевые.
+FILE_TMP	db 0
+		dw 0,0
+		db "ZIFITMP.$$$",0
+
+; Пропорциональный индикатор загрузки. Сервер называет длину тела в заголовке,
+; ESP разбирает заголовок и отдаёт её командой NET_HTTP_GET, а Z80 держит её в
+; NetHttpLen — значит полосу можно заполнять по-настоящему, а не крутить как
+; индикатор активности. Деления не нужно: копим принятое, умноженное на число
+; ячеек, и сдвигаем ячейку, когда накопитель перевалил полную длину.
+bar_advance	ld hl,(bar_total)
+		ld a,(bar_total+2)
+		or h
+		or l
+		jp z,bar_activity	; сервер длины не назвал
+		ld a,(NetChunkLen)	; порция протокола не длиннее 255 байт
+		ld c,BAR_CELLS
+		ld hl,0
+		ld b,8
+1		add hl,hl
+		rlca
+		jr nc,2f
+		ld d,0
+		ld e,c
+		add hl,de
+2		djnz 1b
+		ld de,(bar_acc)
+		add hl,de
+		ld (bar_acc),hl
+		ld a,(bar_acc+2)
+		adc a,0
+		ld (bar_acc+2),a
+		ld b,0
+3		ld hl,(bar_acc)
+		ld de,(bar_total)
+		or a
+		sbc hl,de
+		ld a,(bar_acc+2)
+		ld d,a
+		ld a,(bar_total+2)
+		ld e,a
+		ld a,d
+		sbc a,e
+		jr c,4f
+		ld (bar_acc),hl
+		ld (bar_acc+2),a
+		inc b
+		jr 3b
+4		ld a,b
+		or a
+		ret z
+		jp view_progress_bar
+
+
 
 		align 256
 mouse_step	ds 256
@@ -3755,41 +3931,6 @@ parsed_link		ds #080
 ; Тело команды NET_HTTP_GET: адрес,0,порт,путь,0. Собирает Net_HttpGet.
 httpget_payload		ds 256+128
 current_paging_url	ds 150
-
-sd_init
-		call init_sd_card
-		
-		CALL DOS_SWP; DEPACK Driver
-		CALL DEV_INI
-		JP NZ,ER0
-		CALL HDD
-		JP NZ,ER1
-		CALL SETROOT; SET ROOT DIR
-		jp sd_exit
-
-/*
-[17:37:51] Koshi: ну вначале зайди в папко
-[17:37:55] Koshi: где файло настроек
-[17:38:02] Koshi: чтобы зайти в папко ннадо сделать
-[17:38:08] Koshi: LD HL,DIR1
-        CALL FENTRY
-[17:38:13] Koshi: затем CALL SETDIR
-[17:38:35] Koshi: затем запустить LD HL,FILE_INI:CALL FENTRY
-[17:38:40] Koshi: и тока потом уже можна LOAD512
-[17:38:48] Koshi: если конечно файл нашелся
-[17:39:23] Koshi: FENTRY ищет файлы/каталоги
-[17:39:29] Koshi: и выдает длину оных в ответ
-[17:39:43] Koshi: плюс позиционирует на них
-[17:39:58] Koshi: но LOAD512 сразу после FENTRY, када искали дир
-[17:40:03] Koshi: буит читать САМ дир
-[17:40:10] Koshi: аля содержимое низкоуровневое дира
-[17:40:20] Koshi: чтобы перейти на дир
-[17:40:23] Koshi: надо сетнуть его
-[17:40:26] Koshi: и потом уже в НЕМ
-[17:40:28] Koshi: искать файло
-[17:40:34] Koshi: по то му же FENTRY
-*/
-
 
 on_int_dma	ld a,1
 		jr sw_int_dma
@@ -3801,138 +3942,20 @@ sw_int_dma	ld (save_mode+1),a
 		ret
 
 
-save_downloaded_file	; ld de,10884	; file lenght 
-		call init_sd_card
-		ld de,disk_icon
-		call set_icon
-		ld ix,read_threads
-		ld de,(ix+thread.full_len)
-		ld hl,FILE+1
-		ld (hl),e
-		inc hl
-		ld (hl),d
-		inc hl
-		ld a,(ix+thread.full_len_high)
-		ld (hl),a
-;		ld (save_over_64+1),a
-;		ld c,a
-		ex de,hl
-		ld d,0
-		ld e,a
-		call DEL512  ;расчёт длины в секторах: i:[DE,HL]/512 	
-/*
-		ld a,e
-		or a
-		jr z,1f
-		inc d
-1		bit 0,d
-		jr z,1f
-		inc d
-1		srl c
-		rr d		; d= sectors (512bytes)
-*/
-		push hl
-;Create File (flag,size,name,0):
+		INCLUDE "fat32_adapter.asm"
 
-		LD HL,FILE
-		CALL MKFILE
-		pop bc		; bc= num sectors
-		JP Z,1f
-				;File Creation Failed
-/*
-[15:50:27] Way Be: если файло есть, то ;File Creation Failed получаем, так?
-[15:50:55] Koshi: и смотрим в A код ошибке
-[15:51:01] Koshi: если 3 - то имя уже занято
-
-;i: HL - flag(1),ln(4),name(1-255),0
-;   NZ - ERROR (NO ENOUGHT SPACE)
-;        A: 1 - ln not valid
-;           2 - index fatality
-;           3 - ln already exists
-;         255 - unknown error
-;    Z - SUCCESS
-MKFILE  EQU CORE+57
-*/
-		cp 3
-		jr z,2f
-		cp 4
-		jr z,2f
-		LD A,5:OUT (254),a
-		jr 2f
-1
-; check size>64kb
-/*
-save_over_64	ld a,0
-		or a
-		jr z,save_64
-*/
-		ld a,b
-		or a
-		jr z,save_64
-;Save data into new file >128kb:
-		ld a,c
-		push af
-		ld c,(ix+thread.page)
-		ld hl,(ix+thread.adress)
-		ld a,b
-3		push af
-		ld b,#80
-		call SAVE512
-		ld b,#80
-		call SAVE512		
-		pop af
-		dec a
-		jr nz,3b
-		pop af
-		or a
-		jr z,3f
-		ld b,a
-		jr 2f
-
-;Save data into new file <128kb:
-save_64		ld b,c
-		ld c,(ix+thread.page)
-		ld hl,(ix+thread.adress)
-2		call SAVE512
-3
-/*
-[11:50:29] Koshi: просто пишешь до посинения
-[11:50:35] Koshi: пока цепочка не кончиццо
-[11:50:59] Koshi: када цепочки конец - сейв512 и лоад512 выдадут в А=#0F
-*/
-		ld hl,status_copy		; clear statusbar gfx
-		call set_ports
-		jp sd_exit
-
-DEL512  ;i:[DE,HL]/512
-        LD A,L,L,H,H,E,E,D,D,0
-        LD BC,1:OR A:CALL NZ,ADD4B
-        LD A,2
-
-DELITX2 ;i:[DE,HL]/A
-;                A - Power of Two
-;        o:[DE,HL]
-
-        CP 2:RET C
-        LD C,0
-        SRL A
-L33T    SRL D:RR E,H,L,C
-        SRL A:JR NC,L33T
-
-        LD A,C:OR A:RET Z
-        LD BC,1:CALL ADD4B
-        RET
-
-ADD4B   ADD HL,BC:RET NC:INC DE
-        RET
 ; читаем настройки:
 load_ini	
 		call init_sd_card
 		LD HL,DIR_zifi
 		CALL FENTRY
+		JP C,ini_not_found
+		JP Z,ini_not_found
 		CALL SETDIR
+		JP C,ini_not_found
 		LD HL,FILE_INI
 		CALL FENTRY
+		JP C,ini_not_found
 		JP Z,ini_not_found
 		; FENTRY отдаёт длину файла в [DE,HL]. Файл целиком уходит на ESP
 		; командой WIFI_INI, а в один пакет протокола больше PROTO_MAX не
@@ -3946,10 +3969,19 @@ load_ini
 		jr c,2f
 1		ld hl,511
 2		ld (ini_length),hl
-		LD C,download_page	; page ini
-		LD HL,#0000
-		LD B,#32
-		CALL LOAD512
+		ld a,h
+		or l
+		jp z,ini_not_found
+		ld a,download_page
+		call set_page3
+		LD HL,#c000
+		LD B,1
+		CALL FAT32_READ
+		JP C,ini_not_found
+		ld hl,(ini_length)
+		ld de,#c000
+		add hl,de
+		ld (hl),0
 		CALL SETROOT; возвращаемся в коневой
 		call sd_exit
 
@@ -4025,6 +4057,7 @@ find_next_line
 		inc hl
 		ret
 ini_not_found
+		call sd_exit
 		call set_Textpage
 		ld hl,ini_not_found_msg
 		ld b,1
@@ -4053,50 +4086,6 @@ ini_not_found_msg	db ' Error: zifi.ini not found',0,0
 ;LD B,1:CALL LOAD512
 
 ; переходим в папку
-set_download_dir
-		call init_sd_card
-		call SETROOT
-		LD HL,DIR_zifi
-		CALL FENTRY
-		jr nz,zifi_dir
-		LD HL,DIR_zifi+1
-		CALL MKDIR
-		JR Z,set_download_dir
-		JP ER3
-
-zifi_dir	call SETDIR		; we in "zifi" dir
-download_dir
-		LD HL,DIR_download
-		CALL FENTRY
-		jr nz,current_dir	; Set DIR found by FENTRY active
-		LD HL,DIR_download+1
-		CALL MKDIR
-		JR Z,download_dir
-		JP ER3
-
-current_dir	call SETDIR		; we in "zifi/downloads" dir
-		LD HL,DIR_date		; check current date dir
-		CALL FENTRY
-		jr nz,sd_exit_date		; Set DIR found by FENTRY active
-		LD HL,DIR_date+1
-		CALL MKDIR
-		JR Z,current_dir
-		jr sd_exit 
-
-init_sd_card	call off_int_dma
-		ld a,sd_driver_page
-		jp set_page0
-
-sd_exit_date	call SETDIR
-sd_exit		call on_int_dma
-		xor a
-		jp set_page0
-
-
-//		db "Your"
-//		DB "0000-00-00" ; date
-//		DB "0000"	; time
-
 write_rtc
 		ld a,#80
 		ld bc,#eff7
@@ -4287,83 +4276,10 @@ DIR_date		DB #10
 		DB "0000-00-00",0
 
 ;---------------------------------------
-CORE    EQU #2002
-DEV_INI EQU CORE+3
-HDD     EQU CORE+9
-;-------
-;i: CHL - Addres
-;     B - lenght (512b blocks)
-;o: CHL - New Value
-;     A - EndOfChain (#0F)
-LOAD512 EQU CORE+21
-
-;i: CHL - Addres
-;     B - lenght
-;o: CHL - New Value
-;     A - EndOfChain (#0F)
-SAVE512 EQU CORE+24
-
-DOS_SWP EQU CORE+27
-
-;i: HL - flag(1),ln(4),name(1-255),0
-;   NZ - ERROR (NO ENOUGHT SPACE)
-;        A: 1 - ln not valid
-;           2 - index fatality
-;           3 - ln already exists
-;         255 - unknown error
-;    Z - SUCCESS
-MKFILE  EQU CORE+57
-
-;i: HL - DirName(1-255,0)
-;o: NZ - ERROR
-;        A: 1 - ln not valid
-;           2 - index fatality
-;           3 - ln already exists
-;         255 - unknown error
-;    Z - SUCCESS
-MKDIR   EQU CORE+60
-
-;i: HL - flag(1),name(1-255),0
-;o:  Z - NOT FOUND
-;   NZ - FILE DELETED
-DELFL   EQU CORE+63
-
-;i: HL - flag(1),oldname(1-255),0
-;   DE - newname(1-255),0
-;o:  Z - NOT FOUND
-;   NZ - SUCCESS
-RENAM   EQU CORE+66
-
-;Search for entry in current DIR
-;i: HL - flag(1),name(1-255),0
-;o:  Z - NOT FOUND
-;   NZ - [DE,HL] - file length
-;        SEEK0 is automatically called
-FENTRY  EQU CORE+78
-
-;Seek/Skip N sectors
-;i: B - Number of sectors to process
-LOADNON EQU CORE+84
-
-;GetNextEntryFromActiveDir
-;i: DE - Addres
-;o: DE - New Value
-;    Z - EndOfDir
-;   NZ - OK
-;
-;STRUCTURE:
-;fclus(4),size(4),date(2),time(2),
-;!flag(1),name(1-255),#00
-NXTETY  EQU CORE+87
-
-;Set DIR found by ENTRY active
-SETDIR  EQU CORE+93
-
-;Set ROOT DIR active
-SETROOT EQU CORE+96
-
-SEEK0   EQU CORE+99
-
+; Имена прежних вызовов, сохранившиеся в чтении настроек.
+FENTRY  EQU FAT32_FIND
+SETDIR  EQU FAT32_SET_DIR
+SETROOT EQU FAT32_SET_ROOT
 
 	struct thread
 num		byte	; num thread -1
@@ -4794,6 +4710,7 @@ highlight_colors_buff	ds 80
 link_adreses		ds 101*6
 	
 end
+		ASSERT end <= #be00, код пересёк область векторов прерываний
 
 music_player		equ #c000
 music_player_init	equ @music_player+3
