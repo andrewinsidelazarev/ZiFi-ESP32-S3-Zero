@@ -13,12 +13,13 @@
 ; до перезагрузки — поэтому переменные плагина сохраняют значения между
 ; запусками заставки, и об этом надо помнить (см. Weather_Fetch).
 ;
-; Как читать исходник: main.asm — точка входа и общие переходники API WC;
-; saver.asm — главный цикл; video.asm — режим и страницы TS-Conf; gfx.asm —
-; заливки, панели, иконки, глифы; text.asm — вывод строк и форматирование
-; чисел; screen.asm — раскладка экрана; rtc.asm — часы; calendar.asm — дни
-; недели; weather.asm — обмен с ESP. Файлы *.inc в src генерирует
-; tools/gen_assets.py из tools/design.py.
+; Как читать исходник: main.asm — точка входа; video.asm — режим и страницы
+; TS-Conf; gfx.asm — заливки, панели, иконки, глифы; text.asm — вывод строк;
+; screen.asm — раскладка экрана. Общее с заставкой для VDAC2 лежит в
+; ../shared/weather: saver.asm — главный цикл, weather.asm — обмен с ESP,
+; rtc.asm — часы, calendar.asm — дни недели, fmt.asm — числа, wc.asm —
+; переходники API WC. Файлы *.inc в src генерирует tools/gen_assets.py из
+; tools/design.py.
 
         DEVICE ZXSPECTRUM128
         ; zifi.ini читается целиком, до 1024 байт, как в Online Update: ключи
@@ -27,14 +28,6 @@
         DEFINE CONFIG_FULL_INI
         INCLUDE "wc_api.inc"
         INCLUDE "layout.inc"
-
-; Функции WC, которых нет в общем wc_api.inc.
-FN_ANYK         equ 45                  ; нажата ли любая клавиша (NZ — да)
-FN_USPO         equ 46                  ; ждать отпускания всех клавиш
-FN_MNGV_PL      equ 64                  ; выбрать банк видеостраниц (0 — текст WC)
-FN_MNGCVPL      equ 65                  ; видеостраница A' -> окно #C000
-FN_GVMOD        equ 66                  ; задать видеорежим плагина
-FN_MNG0_PL      equ 78                  ; страница плагина A' -> окно #0000
 
 startCode:
         ORG #0000
@@ -55,57 +48,24 @@ Start:
         xor a
         ret
 
-        INCLUDE "saver.asm"
+        ; общие с заставкой для VDAC2 модули из ../shared/weather
+        INCLUDE "saver.asm"             ; главный цикл
+        INCLUDE "weather.asm"           ; обмен с ESP, таблица WMO
+        INCLUDE "rtc.asm"               ; часы Mr.Gluk
+        INCLUDE "calendar.asm"          ; дни недели, соседние даты
+        INCLUDE "fmt.asm"               ; числа и строки в TextBuf
+        INCLUDE "wc.asm"                ; переходники API WC, клавиатура
+        ; экран TS-Conf — только в этой заставке
         INCLUDE "video.asm"
         INCLUDE "gfx.asm"
         INCLUDE "text.asm"
         INCLUDE "screen.asm"
-        INCLUDE "rtc.asm"
-        INCLUDE "calendar.asm"
-        INCLUDE "weather.asm"
         INCLUDE "config.asm"            ; общие модули ZiFi из ../shared/z80
         INCLUDE "proto.asm"
         INCLUDE "zifi_uart.asm"
         INCLUDE "assets.inc"            ; сгенерированные данные и таблицы
         INCLUDE "palette.inc"
         INCLUDE "strings.inc"
-
-; --- переходники API Wild Commander ------------------------------------------------
-; Общий вход WC_API (#6006) получает номер функции в A. Там, где A уже занят
-; параметром, значение передаётся через альтернативный AF (EX AF,AF').
-; Эти пять переходников нужны общему config.asm (чтение zifi.ini).
-WC_STREAM:
-        ld a,FN_STREAM
-        jp WC_API
-WC_FENTRY:
-        ld a,FN_FENTRY
-        jp WC_API
-WC_GFILE:
-        ld a,FN_GFILE
-        jp WC_API
-WC_GDIR:
-        ld a,FN_GDIR
-        jp WC_API
-WC_LOAD512:
-        ld a,FN_LOAD512
-        jp WC_API
-
-; Нажата ли клавиша. Выход: NZ — нажата. Сохраняет HL/DE/BC.
-Keys_Any:
-        push hl
-        push de
-        push bc
-        ld a,FN_ANYK
-        call WC_API
-        pop bc
-        pop de
-        pop hl
-        ret
-
-; Дождаться отпускания клавиш (иначе Enter из меню F10 сразу закрыл бы нас).
-Keys_WaitRelease:
-        ld a,FN_USPO
-        jp WC_API
 
 ; --- переменные --------------------------------------------------------------------
 LaunchReason:   db 0                    ; A при входе: #02 таймер, #03 меню F10

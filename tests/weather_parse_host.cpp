@@ -1,11 +1,14 @@
 // Host-обёртка для tests/test_weather_parse.py: запускает разбор ответов
 // погодных сервисов из src/weather_parse.cpp на ПК и печатает результат.
+//   weather_parse_host city <файл json>           -> GEO <lat> <lon> <place utf-8>
+//                                                    (NOTFOUND <текст> — места нет)
 //   weather_parse_host zip <файл json>            -> GEO <lat> <lon> <place utf-8>
 //   weather_parse_host meteo <файл json> <место>  -> REC <hex записи>
 //   weather_parse_host cp866 <файл utf-8>         -> CP866 <hex>
+//   weather_parse_host ini <файл>                 -> UTF8 <hex> (значение zifi.ini в UTF-8)
 // Место с не-ASCII буквами передаётся как @<файл UTF-8>: аргументы командной
 // строки Windows приходят в main() в кодовой странице ANSI, а не в UTF-8.
-// Этим пользуется модель ESP стенда Unreal (Weather screensaver/tools).
+// Этим пользуется модель ESP стенда Unreal (shared/weather/esp_model.py).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +58,16 @@ int main(int argc, char** argv) {
   }
   const size_t length = data.size() - 1;
   char error[96] = {};
+  if (mode == "city") {
+    zifi::GeoResult geo = {};
+    bool notFound = false;
+    if (!zifi::parseCitySearch(data.data(), length, geo, notFound, error, sizeof(error))) {
+      printf("%s %s\n", notFound ? "NOTFOUND" : "ERR", error);
+      return 1;
+    }
+    printf("GEO %.4f %.4f %s\n", geo.latitude, geo.longitude, geo.place);
+    return 0;
+  }
   if (mode == "zip") {
     zifi::GeoResult geo = {};
     if (!zifi::parseZippopotam(data.data(), length, geo, error, sizeof(error))) {
@@ -62,6 +75,13 @@ int main(int argc, char** argv) {
       return 1;
     }
     printf("GEO %.4f %.4f %s\n", geo.latitude, geo.longitude, geo.place);
+    return 0;
+  }
+  if (mode == "ini") {
+    char out[256];
+    zifi::iniTextToUtf8(data.data(), out, sizeof(out));
+    printf("UTF8 ");
+    printHex(reinterpret_cast<const unsigned char*>(out), strlen(out));
     return 0;
   }
   if (mode == "meteo") {

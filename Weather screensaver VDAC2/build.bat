@@ -1,10 +1,10 @@
 @echo off
 setlocal
 chcp 65001 >nul
-rem Build order: tools/gen_assets.py (fonts, icons, palette, strings), then
-rem sjasmplus assembles WEATHER.WMF with INCBIN of the data pages.
-rem Shared Z80 modules (proto, config, uart) come from ../shared/z80, the
-rem weather saver core shared with the VDAC2 version from ../shared/weather.
+rem Build order: tools/gen_assets.py (fonts, icons, FT812 RAM_G image, tables,
+rem strings), then sjasmplus assembles WEATHER2.WMF with INCBIN of the data
+rem pages. Shared Z80 modules come from ../shared/z80 (proto, config, uart)
+rem and ../shared/weather (the weather saver core shared with WEATHER.WMF).
 if not exist "%~dp0build" mkdir "%~dp0build"
 set "SHARED_Z80=%~dp0..\shared\z80"
 set "SHARED_WEATHER=%~dp0..\shared\weather"
@@ -35,7 +35,12 @@ if not defined SJASM (
   exit /b 1
 )
 
-"%SJASM%" --inc="%SHARED_Z80%" --inc="%SHARED_WEATHER%" --sym=..\build\WEATHER.sym --lst=..\build\WEATHER.lst main.asm
+"%SJASM%" --inc="%SHARED_Z80%" --inc="%SHARED_WEATHER%" --sym=..\build\WEATHER2.sym --lst=..\build\WEATHER2.lst main.asm
+if errorlevel 1 exit /b 1
+rem sjasmplus saved the header and the code page; the four 16 KiB data
+rem pages do not fit into its 64 KiB address space and are appended here.
+cd /d "%~dp0build"
+copy /b WEATHER2.WMF+page1.bin+page2.bin+page3.bin+page4.bin WEATHER2.WMF >nul
 if errorlevel 1 exit /b 1
 
-echo Built: %~dp0build\WEATHER.WMF
+echo Built: %~dp0build\WEATHER2.WMF

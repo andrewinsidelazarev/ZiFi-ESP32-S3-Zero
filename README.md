@@ -20,9 +20,9 @@ ESP-01S через переходник и сохраняет двоичный U
 - прямой HTTPS на ESP32 с проверкой сервера по встроенному Mozilla CA-bundle;
   тело ответа передаётся Z80 без перекодирования и распаковки;
 - NTP-плагин Wild Commander с результатом `YYYYMMDDhhmmss`;
-- погода для заставки Wild Commander (`WEATHER_GET`): почтовый индекс места из
-  `zifi.ini` → координаты (zippopotam.us) → прогноз Open-Meteo, Z80 получает
-  готовую запись на 90 байт;
+- погода для заставок Wild Commander (`WEATHER_GET`): город (или почтовый
+  индекс) из `zifi.ini` → координаты (геокодер Open-Meteo, индекс — zippopotam.us)
+  → прогноз Open-Meteo, Z80 получает готовую запись на 90 байт;
 - совместимость с Native-версией `zifi.spg`: ESP сама выполняет DNS,
   HTTP-запрос и разбор заголовка, Z80 забирает тело командами `NET_RECV`;
 - FTP с тремя управляющими сессиями на задаваемом порту (обычно `21`),
@@ -64,7 +64,8 @@ WebDAV ещё не включён. Сетевой файловый listener за
 | **SMB-сервер (Windows)** | [**`ZIFISMB.WMF`**](SMB%20Server/build/ZIFISMB.WMF) | Плагин Wild Commander v0.5.9: доступ к текущему тому SD/IDE, например `\\ZX-Evo\0` |
 | **FTP-сервер** | [**`ZIFIFTP.WMF`**](FTP%20Server/build/ZIFIFTP.WMF) | Плагин Wild Commander: полнофункциональный FTP-сервер |
 | **Синхронизация времени** | [**`NTPTIME.WMF`**](NTP%20Time%20Sync/build/NTPTIME.WMF) | Плагин Wild Commander: синхронизация часов RTC через интернет |
-| **Заставка с погодой** | [**`WEATHER.WMF`**](Weather%20screensaver/build/WEATHER.WMF) | Заставка Wild Commander: часы, календарь, погода и прогноз на 5 дней (прошивка `s3-native-0.6.92` или новее) |
+| **Заставка с погодой** | [**`WEATHER.WMF`**](Weather%20screensaver/build/WEATHER.WMF) | Заставка Wild Commander: часы, календарь, погода и прогноз на 5 дней (прошивка `s3-native-0.6.93` или новее) |
+| **Заставка с погодой для VDAC2** | [**`WEATHER2.WMF`**](Weather%20screensaver%20VDAC2/build/WEATHER2.WMF) | Та же заставка в 1024×768 на видеочипе FT812 платы VDAC2 (прошивка `s3-native-0.6.93` или новее) |
 | **Браузер / Загрузчик** | [**`zifi.spg`**](ZiFi%20SPG/build/zifi.spg) ([пример `zifi.ini`](ZiFi%20SPG/build/zifi.ini)) | Программа ZiFi для ZX-Evolution (каталог сайтов, скачивание) |
 | **Печатная плата переходника** | [**`Manufacturing.zip`**](Zifi%20ESP32%20Zero%20Adapter/Zifi_ESP32_Zero_Adapter-Manufacturing.zip) | Готовый архив герберов для заказа платы переходника в производство |
 
@@ -121,9 +122,15 @@ credit target соединения до одного, поэтому Windows п�
 * **`Weather screensaver` (`Weather screensaver/build/WEATHER.WMF`):**
   Заставка Wild Commander (тип `#02`) на экране 360×288: место, крупные часы с
   мигающим двоеточием, дата, текущая погода, прогноз на 5 дней и лента недели.
-  Место — ключи `country:` и `zip:` в `/zifi/zifi.ini`; погоду раз в час
+  Место — город по-английски в `/zifi/zifi.ini` (`city: Kyiv`, можно с
+  `country:`) или, как раньше, `country:` и `zip:`; погоду раз в час
   запрашивает командой `WEATHER_GET`. Подробности — в
   [описании заставки](Weather%20screensaver/README.md).
+* **`Weather screensaver VDAC2` (`Weather screensaver VDAC2/build/WEATHER2.WMF`):**
+  Та же заставка для платы VDAC2: экран 1024×768 @ 59 Гц рисует видеочип
+  FT812, текст сглажен, панели полупрозрачные. Главный цикл и обмен с ESP —
+  общие с `WEATHER.WMF` ([`shared/weather`](shared/weather)). Подробности — в
+  [описании](Weather%20screensaver%20VDAC2/README.md).
 * **`Online Update` (`Online Update/build/ZIFIUPD.WMF`):**
   Ручной пользовательский обновлятор: читает `/zifi/zifi.ini`, подключает ESP к
   Wi-Fi, показывает установленную и опубликованную версии, затем по подтверждению
@@ -194,7 +201,7 @@ PlatformIO автоматически создаёт:
 [описании плагина](SMB%20Server/README.md).
 
 Прошивка
-`s3-native-0.6.92` с выключенным диагностическим кольцевым журналом
+`s3-native-0.6.93` с выключенным диагностическим кольцевым журналом
 подтверждает READ и WRITE только после полного сетевого запроса: Windows
 CopyFile не повторяет остаток короткого успешного ответа ни для чтения, ни для
 записи. При задержке свыше 30 секунд сервер посылает промежуточный
@@ -319,6 +326,16 @@ MS-SMB2, регрессия курсора/кэша и проверка FIFO в�
 Tahoma, Segoe UI Emoji), поэтому нужны Python 3 с Pillow. Машинные тесты
 исполняют плагин в эмуляторе Z80 и сравнивают кадр с эталоном попиксельно —
 см. [описание заставки](Weather%20screensaver/README.md).
+
+Заставка для VDAC2 собирается так же:
+
+```powershell
+& ".\Weather screensaver VDAC2\build.bat"
+```
+
+Результат: `Weather screensaver VDAC2/build/WEATHER2.WMF`. Её тесты рисуют кадр
+эмулятором FT812 `bt8xxemu.dll` (каталог задаёт `BT8XXEMU_DIR`) — см.
+[описание](Weather%20screensaver%20VDAC2/README.md).
 
 ## Первая прошивка через USB
 

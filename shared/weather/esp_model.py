@@ -8,12 +8,13 @@ MICROPY_UART_PIPE и запускает эту программу; байты к
   WIFI_INI (#03)    -> ACK, затем #83 [1][IPv4] и запоминает ключи ini;
   WEATHER_GET (#24) -> ACK, затем #A4 с записью погоды либо #EE + #A4 [0][1].
 
-Погода настоящая: те же два HTTP-запроса, что делает прошивка
-(api.zippopotam.us — индекс в координаты, api.open-meteo.com — прогноз), а
-ответы разбирает сам код прошивки src/weather_parse.cpp, собранный host-тестом
-в weather_parse_host.exe. Путь к нему модель берёт из esp_model.json рядом с
-собой (его пишет tools/prepare_unreal.py). Остальные команды получают доклад
-«unsupported», как в прошивке. Журнал — esp_model.log в каталоге запуска.
+Погода настоящая: те же запросы, что делает прошивка (место по city: —
+геокодер geocoding-api.open-meteo.com, по zip: — api.zippopotam.us, прогноз —
+api.open-meteo.com), а ответы и значения ini разбирает сам код прошивки
+src/weather_parse.cpp, собранный host-тестом в weather_parse_host.exe. Путь к
+нему модель берёт из esp_model.json рядом с собой (его пишет
+unreal_bench.py). Остальные команды получают доклад «unsupported», как в
+прошивке. Журнал — esp_model.log в каталоге запуска.
 """
 import json
 import os
@@ -22,6 +23,7 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -29,7 +31,10 @@ HERE = Path(__file__).resolve().parent
 LOG = HERE / 'esp_model.log'
 CONFIG = json.loads((HERE / 'esp_model.json').read_text(encoding='utf-8'))
 HOST_EXE = CONFIG['weather_parse_host']
-USER_AGENT = 'ZiFi (ZX Evo)'
+USER_AGENT = 'ZiFi (ZX Evo)'           # как у прошивки (src/net_client.cpp)
+CITY_URL = 'http://geocoding-api.open-meteo.com/v1/search?'
+ZIP_URL = 'http://api.zippopotam.us/'
+FORECAST_URL = 'http://api.open-meteo.com'
 FORECAST_PATH = ('/v1/forecast?latitude=%.4f&longitude=%.4f'
                  '&current=temperature_2m,weather_code,is_day,wind_speed_10m,'
                  'precipitation,surface_pressure'
@@ -54,9 +59,13 @@ def frame(command, payload=b''):
 
 def parse_ini(data):
     """Ключи zifi.ini как у IniConfig::parse: «ключ: значение», регистр ключа
-    не важен, ';' и '#' — комментарии, значение можно взять в кавычки."""
+    не важен, ';' и '#' — комментарии, значение можно взять в кавычки.
+    Значения — байты как есть (latin-1 без потерь): название города могло
+    быть в UTF-8, CP866 или CP1251, его переводит в UTF-8 код прошивки."""
     result = {}
-    text = data.decode('utf-8', 'replace').lstrip('﻿')
+    if data.startswith(b'\xef\xbb\xbf'):
+        data = data[3:]
+    text = data.decode('latin-1')
     for line in text.replace('\r', '\n').split('\n'):
         line = line.strip()
         if not line or line[0] in ';#' or ':' not in line:
@@ -69,50 +78,105 @@ def parse_ini(data):
     return result
 
 
-def http_get(host, path):
-    request = urllib.request.Request('http://' + host + path, headers={
+class HttpError(RuntimeError):
+    """Сервер ответил не 2xx; code — код ответа."""
+
+    def __init__(self, code):
+        super().__init__('http %d' % code)
+        self.code = code
+
+
+def http_get(url):
+    request = urllib.request.Request(url, headers={
         'User-Agent': USER_AGENT, 'Accept': '*/*', 'Accept-Encoding': 'identity'})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             return response.read()
     except urllib.error.HTTPError as error:
-        raise RuntimeError('http %d' % error.code) from None
+        raise HttpError(error.code) from None
+
+
+class HostError(RuntimeError):
+    """Разбор прошивки отверг ответ; not_found — места нет (NOTFOUND)."""
+
+    def __init__(self, text, not_found=False):
+        super().__init__(text)
+        self.not_found = not_found
 
 
 def run_host(*args):
     result = subprocess.run([HOST_EXE, *args], capture_output=True)
     output = result.stdout.decode('utf-8', 'replace').strip()
     if result.returncode != 0 or output.startswith('ERR'):
-        raise RuntimeError(output[4:] if output.startswith('ERR ') else output)
+        kind, _, text = output.partition(' ')
+        raise HostError(text or output, not_found=kind == 'NOTFOUND')
     return output
 
 
 class Model:
     def __init__(self):
         self.ini = {}
-        self.coordinates = {}          # «страна/индекс» -> (широта, долгота, место)
+        self.coordinates = {}          # ключ места -> (широта, долгота, место UTF-8)
+        self.unknown = set()           # места, которых справочник не знает
+        self.work = Path(tempfile.gettempdir())
+
+    def find_city(self, city, country):
+        """Название -> место, как WeatherService::geocodeCity в прошивке."""
+        raw = self.work / 'esp_model_city.txt'
+        raw.write_bytes(city.encode('latin-1'))          # байты значения из ini
+        name = bytes.fromhex(run_host('ini', str(raw))[5:]).decode('utf-8')
+        cyrillic = any(0x400 <= ord(ch) <= 0x4FF for ch in name)   # кириллица — ищем по-русски
+        query = ('name=' + urllib.parse.quote(name, safe='-') + '&count=1&language=' +
+                 ('ru' if cyrillic else 'en') + '&format=json')
+        if country:
+            query += '&countryCode=' + urllib.parse.quote(country, safe='-')
+        try:
+            body = http_get(CITY_URL + query)
+        except Exception as error:
+            raise RuntimeError('city: %s' % error) from None
+        source = self.work / 'esp_model_geo.json'
+        source.write_bytes(body)
+        return run_host('city', str(source)).split(' ', 3)
+
+    def find_zip(self, country, zip_code):
+        """Почтовый индекс -> место, как WeatherService::geocodeZip."""
+        try:
+            body = http_get(ZIP_URL + urllib.parse.quote(country, safe='-') + '/' +
+                            urllib.parse.quote(zip_code, safe='-'))
+        except HttpError as error:
+            if error.code == 404:
+                raise HostError('zip: not found', not_found=True) from None
+            raise RuntimeError('zip: %s' % error) from None
+        except Exception as error:
+            raise RuntimeError('zip: %s' % error) from None
+        source = self.work / 'esp_model_geo.json'
+        source.write_bytes(body)
+        return run_host('zip', str(source)).split(' ', 3)
 
     def weather(self):
+        city = self.ini.get('city', '')
         country = self.ini.get('country', '')
         zip_code = self.ini.get('zip', '')
-        if not country or not zip_code:
-            raise RuntimeError('no country/zip in ini')
-        key = country + '/' + zip_code
-        work = Path(tempfile.gettempdir())
+        if not city and not (zip_code and country):
+            raise RuntimeError('no city in ini')
+        key = ('city:%s/%s' % (country, city)) if city else ('zip:%s/%s' % (country, zip_code))
+        if key in self.unknown:
+            # как прошивка: этот справочник место уже не нашёл — без запроса
+            raise RuntimeError('city: not found' if city else 'zip: not found')
         if key not in self.coordinates:
             try:
-                body = http_get('api.zippopotam.us', '/' + urllib.request.quote(country) +
-                                '/' + urllib.request.quote(zip_code))
-            except Exception as error:
-                raise RuntimeError('zip: %s' % error) from None
-            source = work / 'esp_model_zip.json'
-            source.write_bytes(body)
-            geo = run_host('zip', str(source)).split(' ', 3)
+                geo = self.find_city(city, country) if city else self.find_zip(country, zip_code)
+            except HostError as error:
+                if error.not_found:
+                    self.unknown.add(key)
+                raise
             self.coordinates[key] = (float(geo[1]), float(geo[2]), geo[3])
-            log('geo %s -> %s %s %s' % ((key,) + self.coordinates[key]))
+            log('geo %s -> %s %s %s' % ((key.encode('latin-1').decode('utf-8', 'replace'),) +
+                                        self.coordinates[key]))
+        work = self.work
         latitude, longitude, place = self.coordinates[key]
         try:
-            body = http_get('api.open-meteo.com', FORECAST_PATH % (latitude, longitude))
+            body = http_get(FORECAST_URL + FORECAST_PATH % (latitude, longitude))
         except Exception as error:
             raise RuntimeError('meteo: %s' % error) from None
         source = work / 'esp_model_meteo.json'

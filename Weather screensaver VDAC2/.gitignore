@@ -1,0 +1,8 @@
+# Генерирует tools/gen_assets.py при каждой сборке (build.bat).
+/src/assets.inc
+/src/layout.inc
+/src/strings.inc
+
+# Промежуточные файлы сборки и тестов; в git — только готовый WEATHER2.WMF.
+/build/*
+!/build/WEATHER2.WMF

@@ -121,7 +121,7 @@ const char* findKey(const char* begin, const char* end, const char* key) {
   }
 }
 
-// Число (возможно в кавычках, как у zippopotam); null считается нулём.
+// Число (возможно в кавычках, как lat/lon у Nominatim); null считается нулём.
 bool parseNumber(const char* p, const char* end, double& out, const char** next) {
   p = skipSpaces(p, end);
   if (p >= end) {
@@ -327,6 +327,98 @@ char latinBase(uint32_t code) {
   return '?';
 }
 
+// Знаки вне А..я и Ё ё, у которых есть замена в CP866; 0 — замены нет.
+// Украинские и белорусские Є є Ї ї Ў ў в CP866 есть (#F2..#F7). І і там
+// нет — пишем латинские I i, они выглядят так же; Ґ ґ заменяем на Г г.
+// Типографские апостроф, тире и кавычки бывают в названиях OpenStreetMap
+// («Кам’янець-Подільський») — их заменяют знаки ASCII.
+char cp866Extra(uint32_t code) {
+  static const struct {
+    uint16_t code;
+    uint8_t cp866;
+  } kExtra[] = {
+      {0x404, 0xF2}, {0x454, 0xF3}, {0x407, 0xF4}, {0x457, 0xF5},   // Є є Ї ї
+      {0x40E, 0xF6}, {0x45E, 0xF7},                                 // Ў ў
+      {0x406, 'I'}, {0x456, 'i'}, {0x490, 0x83}, {0x491, 0xA3},     // І і Ґ ґ
+      {0xB0, 0xF8},                                                 // °
+      {0xA0, ' '},                                                  // неразрывный пробел
+      {0x2BC, '\''}, {0x2018, '\''}, {0x2019, '\''},                // апострофы
+      {0x2013, '-'}, {0x2014, '-'},                                 // тире
+      {0xAB, '"'}, {0xBB, '"'}, {0x201C, '"'}, {0x201D, '"'}, {0x201E, '"'},
+  };
+  for (const auto& extra : kExtra) {
+    if (code == extra.code) {
+      return static_cast<char>(extra.cp866);
+    }
+  }
+  return 0;
+}
+
+// --- кодировки значений zifi.ini ----------------------------------------------------------
+// Буква кириллицы по коду CP866 (#80..#FF); 0 — не буква (псевдографика, знаки).
+uint32_t cp866Letter(uint8_t code) {
+  static const uint16_t kF0[] = {0x401, 0x451, 0x404, 0x454, 0x407, 0x457, 0x40E, 0x45E};
+  if (code >= 0x80 && code <= 0xAF) {
+    return 0x410 + (code - 0x80);                  // А..п
+  }
+  if (code >= 0xE0 && code <= 0xEF) {
+    return 0x440 + (code - 0xE0);                  // р..я
+  }
+  if (code >= 0xF0 && code <= 0xF7) {
+    return kF0[code - 0xF0];                       // Ё ё Є є Ї ї Ў ў
+  }
+  return 0;
+}
+
+// Буква кириллицы по коду CP1251 (#80..#FF); 0 — не буква.
+uint32_t cp1251Letter(uint8_t code) {
+  static const struct {
+    uint8_t code;
+    uint16_t letter;
+  } kExtra[] = {
+      {0xA8, 0x401}, {0xB8, 0x451}, {0xAA, 0x404}, {0xBA, 0x454},   // Ё ё Є є
+      {0xAF, 0x407}, {0xBF, 0x457}, {0xB2, 0x406}, {0xB3, 0x456},   // Ї ї І і
+      {0xA5, 0x490}, {0xB4, 0x491}, {0xA1, 0x40E}, {0xA2, 0x45E},   // Ґ ґ Ў ў
+  };
+  if (code >= 0xC0) {
+    return 0x410 + (code - 0xC0);                  // А..я
+  }
+  for (const auto& extra : kExtra) {
+    if (code == extra.code) {
+      return extra.letter;
+    }
+  }
+  return 0;
+}
+
+// Длина правильной последовательности UTF-8 с первого байта p (1..4);
+// 0 — это не UTF-8 (одиночный байт продолжения, обрыв, «длинная» запись).
+size_t utf8SequenceLength(const unsigned char* p) {
+  if (p[0] < 0x80) {
+    return 1;
+  }
+  size_t count;
+  if (p[0] >= 0xC2 && p[0] <= 0xDF) {
+    count = 2;
+  } else if (p[0] >= 0xE0 && p[0] <= 0xEF) {
+    count = 3;
+  } else if (p[0] >= 0xF0 && p[0] <= 0xF4) {
+    count = 4;
+  } else {
+    return 0;
+  }
+  for (size_t i = 1; i < count; ++i) {
+    if ((p[i] & 0xC0) != 0x80) {
+      return 0;                                    // в том числе конец строки
+    }
+  }
+  if ((p[0] == 0xE0 && p[1] < 0xA0) || (p[0] == 0xED && p[1] >= 0xA0) ||
+      (p[0] == 0xF0 && p[1] < 0x90) || (p[0] == 0xF4 && p[1] >= 0x90)) {
+    return 0;                                      // «длинная» запись или суррогат
+  }
+  return count;
+}
+
 }  // namespace
 
 void utf8ToCp866(const char* text, char* out, size_t capacity) {
@@ -363,14 +455,124 @@ void utf8ToCp866(const char* text, char* out, size_t capacity) {
       c = static_cast<char>(0xF0);                        // Ё
     } else if (code == 0x451) {
       c = static_cast<char>(0xF1);                        // ё
-    } else if (code == 0xB0) {
-      c = static_cast<char>(0xF8);                        // °
     } else {
-      c = latinBase(code);
+      c = cp866Extra(code);
+      if (c == 0) {
+        c = latinBase(code);
+      }
     }
     out[length++] = c;
   }
   out[length] = 0;
+}
+
+void iniTextToUtf8(const char* text, char* out, size_t capacity) {
+  if (capacity == 0) {
+    return;
+  }
+  const unsigned char* src = reinterpret_cast<const unsigned char*>(text);
+  size_t length = 0;
+  // Уже UTF-8 (или чистый ASCII) — копируем целыми буквами.
+  bool utf8 = true;
+  for (const unsigned char* p = src; *p != 0;) {
+    const size_t count = utf8SequenceLength(p);
+    if (count == 0) {
+      utf8 = false;
+      break;
+    }
+    p += count;
+  }
+  if (utf8) {
+    for (const unsigned char* p = src; *p != 0;) {
+      const size_t count = utf8SequenceLength(p);
+      if (length + count >= capacity) {
+        break;
+      }
+      memcpy(out + length, p, count);
+      length += count;
+      p += count;
+    }
+    out[length] = 0;
+    return;
+  }
+  // Однобайтовая кириллица: CP866 или CP1251 — какая даёт больше букв.
+  // В CP866 прописные CP1251 (#C0..#DF) — псевдографика, а в CP1251 почти
+  // все буквы CP866 #80..#AF — знаки, поэтому ошибиться трудно. Поровну —
+  // CP866, родная кодировка Спектрума.
+  size_t letters866 = 0;
+  size_t letters1251 = 0;
+  for (const unsigned char* p = src; *p != 0; ++p) {
+    if (*p >= 0x80) {
+      letters866 += cp866Letter(*p) != 0 ? 1 : 0;
+      letters1251 += cp1251Letter(*p) != 0 ? 1 : 0;
+    }
+  }
+  const bool cp1251 = letters1251 > letters866;
+  for (const unsigned char* p = src; *p != 0; ++p) {
+    uint32_t code = *p;
+    if (code >= 0x80) {
+      code = cp1251 ? cp1251Letter(*p) : cp866Letter(*p);
+      if (code == 0) {
+        code = '?';
+      }
+    }
+    const size_t count = code < 0x80 ? 1 : 2;      // кириллица в UTF-8 — два байта
+    if (length + count >= capacity) {
+      break;
+    }
+    appendUtf8(out, capacity, length, code);
+  }
+  out[length] = 0;
+}
+
+bool parseCitySearch(const char* json, size_t length, GeoResult& out, bool& notFound,
+                     char* error, size_t errorSize) {
+  const char* end = json + length;
+  notFound = false;
+  const char* p = skipSpaces(json, end);
+  if (p >= end || *p != '{') {
+    setError(error, errorSize, "city: broken json");
+    return false;
+  }
+  // Ничего не нашёл — в ответе нет results: {"generationtime_ms":0.4}.
+  const char* results = findKey(json, end, "results");
+  if (results == nullptr) {
+    notFound = true;
+    setError(error, errorSize, "city: not found");
+    return false;
+  }
+  if (*results != '[') {
+    setError(error, errorSize, "city: broken json");
+    return false;
+  }
+  p = skipSpaces(results + 1, end);
+  if (p < end && *p == ']') {
+    notFound = true;
+    setError(error, errorSize, "city: not found");
+    return false;
+  }
+  // count=1: первое место списка — самое крупное из одноимённых.
+  const char* placeEnd = (p < end && *p == '{') ? skipValue(p, end) : nullptr;
+  if (placeEnd == nullptr) {
+    setError(error, errorSize, "city: broken json");
+    return false;
+  }
+  double latitude = 0.0;
+  double longitude = 0.0;
+  if (!objectNumber(p, placeEnd, "latitude", latitude) ||
+      !objectNumber(p, placeEnd, "longitude", longitude)) {
+    setError(error, errorSize, "city: no coordinates");
+    return false;
+  }
+  GeoResult result = {};
+  result.latitude = static_cast<float>(latitude);
+  result.longitude = static_cast<float>(longitude);
+  const char* name = findKey(p, placeEnd, "name");
+  if (name == nullptr || !parseString(name, placeEnd, result.place, sizeof(result.place))) {
+    result.place[0] = 0;                           // без названия — только погода
+  }
+  out = result;
+  return true;
 }
 
 bool parseZippopotam(const char* json, size_t length, GeoResult& out,
@@ -418,7 +620,7 @@ bool parseZippopotam(const char* json, size_t length, GeoResult& out,
   return found;
 }
 
-bool parseOpenMeteo(const char* json, size_t length, const char* placeCp866,
+bool parseOpenMeteo(const char* json, size_t length, const char* placeUtf8,
                     uint8_t* record, char* error, size_t errorSize) {
   const char* end = json + length;
   memset(record, 0, kWeatherRecordSize);
@@ -484,7 +686,7 @@ bool parseOpenMeteo(const char* json, size_t length, const char* placeCp866,
   }
 
   record[kWrStatus] = 1;
-  utf8ToCp866(placeCp866 == nullptr ? "" : placeCp866,
+  utf8ToCp866(placeUtf8 == nullptr ? "" : placeUtf8,
               reinterpret_cast<char*>(record + kWrPlace), kWeatherPlaceLength);
   record[kWrTemp] = static_cast<uint8_t>(clampI8(temperature));
   record[kWrCode] = clampU8(code);

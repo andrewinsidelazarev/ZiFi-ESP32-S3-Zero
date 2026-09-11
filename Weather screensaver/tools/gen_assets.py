@@ -38,8 +38,10 @@ FONT_HEADER = 8
 def charset(spec):
     """Список кодов CP866 для набора символов шрифта."""
     if spec == 'ascii+cyr+extra':
+        # #F2..#F7 — Є є Ї ї Ў ў: названия мест Украины и Беларуси
+        # («Київ»); І і прошивка присылает латинскими I i
         codes = (list(range(0x20, 0x7F)) + list(range(0x80, 0xB0)) +
-                 list(range(0xE0, 0xF2)) + [0xF8, 0xF9, 0xFA])
+                 list(range(0xE0, 0xF8)) + [0xF8, 0xF9, 0xFA])
     elif spec == 'ascii+cyrupper+extra':
         codes = list(range(0x20, 0x7F)) + list(range(0x80, 0xA0)) + [0xF0, 0xF8]
     else:

@@ -1,4 +1,16 @@
-; Главный цикл заставки.
+; Главный цикл заставки — общий для TS-Conf (WEATHER.WMF) и VDAC2 (WEATHER2.WMF).
+;
+; Как рисовать, решает сама заставка. Главный цикл только говорит, ЧТО
+; поменялось, вызывая процедуры экрана, которые каждая заставка обязана иметь:
+;   Video_Begin  — подготовить экран; CF=1 — экрана нет (у VDAC2: нет чипа
+;                  FT812), тогда заставка сразу выходит;
+;   Video_Show   — включить экран заставки; Video_End — вернуть экран WC;
+;   Screen_Static, Screen_ForecastTitle — неизменная часть;
+;   Screen_Clock (часы целиком), Screen_Colon (только двоеточие), Screen_Date,
+;   Screen_Calendar, Screen_Location, Screen_Current, Screen_Forecast;
+;   Screen_Present — вызывается после каждой группы перерисовок: у TS-Conf
+;                  картинка уже в видеопамяти (пустая процедура), у VDAC2
+;                  здесь собирается и показывается дисплей-лист FT812.
 ;
 ; Порядок: часы и календарь рисуются сразу и показываются, пока ESP ходит в
 ; интернет; потом дорисовывается погода. Дальше каждый кадр (1/50 секунды):
@@ -19,6 +31,7 @@ REFETCH_MINUTES equ 60
 Saver_Run:
         call Keys_WaitRelease           ; Enter из меню F10 не должен закрыть нас
         call Video_Begin                ; палитра, сброс кэша страниц
+        jr c,.exit                      ; экрана нет — показывать нечего
         call Rtc_Open
         call Rtc_Read
         ; «показанные» значения — чтобы Saver_Tick замечал изменения
@@ -46,6 +59,7 @@ Saver_Run:
         ld hl,Str_LOADING
         ld (StatusText),hl
         call Screen_Current             ; «Запрос погоды…», пока нет данных
+        call Screen_Present
         call Video_Show                 ; только теперь включаем графику
         call Weather_Fetch
         ld a,(AbortFlag)
@@ -53,6 +67,7 @@ Saver_Run:
         jr nz,.exit                     ; клавишу нажали, пока ждали ESP
         call Saver_Schedule             ; когда спросить погоду в следующий раз
         call Screen_Weather
+        call Screen_Present
 .loop:
         call Saver_Frame                ; ждать следующий кадр
         call Keys_Any
@@ -87,6 +102,7 @@ Saver_Refetch:
         ld hl,Str_LOADING
         ld (StatusText),hl
         call Screen_Current
+        call Screen_Present
 .keep_screen:
         ld a,(WifiReady)
         or a
@@ -100,7 +116,8 @@ Saver_Refetch:
         or a
         ret nz
         call Saver_Schedule
-        jp Screen_Weather
+        call Screen_Weather
+        jp Screen_Present
 
 ; Запланировать следующий запрос по итогу последнего (FetchOk).
 ; Удача: повторы сбрасываются, дальше — раз в час. Неудача: через
@@ -179,7 +196,8 @@ Saver_Tick:
         ret z                           ; та же секунда — ничего не менялось
         ld (hl),a
         call Saver_RetryTick            ; новая секунда — отсчёт повтора
-        jp Screen_Colon                 ; та же минута — только двоеточие
+        call Screen_Colon               ; та же минута — только двоеточие
+        jp Screen_Present
 .new_minute:
         ld (hl),a                       ; HL всё ещё указывает на ShownMin
         ld a,(RtcSec)
@@ -197,12 +215,13 @@ Saver_Tick:
         ld a,(RtcDay)
         ld hl,ShownDay
         cp (hl)
-        ret z
+        jp z,Screen_Present             ; тот же день — показать новые часы
         ld (hl),a
         ld a,1
         ld (RefetchDue),a               ; новый день — сдвинулся и прогноз
         call Screen_Date
-        jp Screen_Calendar
+        call Screen_Calendar
+        jp Screen_Present
 
 ; Всё, что зависит от записи погоды.
 Screen_Weather:

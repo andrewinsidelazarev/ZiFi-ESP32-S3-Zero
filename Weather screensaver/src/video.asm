@@ -18,11 +18,14 @@ VID_BANK        equ 1                   ; первый видеобуфер WC
 VID_LINES_PAGE  equ 32                  ; строк на одной странице
 
 ; Подготовка: сброс кэша подключённых страниц и палитра в CRAM.
+; Выход: CF=0 — экран TS-Conf есть всегда (главному циклу, см. saver.asm).
 Video_Begin:
         ld a,#FF                        ; «ничего не подключено»
         ld (VidCurPage),a
         ld (DataCurPage),a
-        jp Video_LoadPalette
+        call Video_LoadPalette
+        or a                            ; CF=0
+        ret
 
 ; Показать кадр: режим и банк применятся на ближайшем прерывании WC.
 ; У функций WC параметр — в A' (альтернативном A), а номер функции — в A.

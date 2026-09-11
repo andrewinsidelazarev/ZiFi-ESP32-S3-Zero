@@ -40,20 +40,40 @@ constexpr size_t kWeatherRecordSize = kWrDays + kWeatherDaySize * kWeatherMaxDay
 struct GeoResult {
   float latitude;
   float longitude;
-  char place[64];     // UTF-8, последнее место списка (для CAP Италии — коммуна)
+  char place[64];     // UTF-8, название места для экрана
 };
 
-// Ответ api.zippopotam.us/<страна>/<индекс>: координаты и название места.
+// Ответ геокодера Open-Meteo на поиск по названию
+// (geocoding-api.open-meteo.com/v1/search?name=…&count=1&language=en|ru):
+// координаты и название места на языке запроса («Kyiv», «Рим»; у маленьких
+// мест без перевода — местное название). notFound=true — в ответе
+// нет results: такого названия геокодер не знает, повтор не поможет.
+bool parseCitySearch(const char* json, size_t length, GeoResult& out, bool& notFound,
+                     char* error, size_t errorSize);
+
+// Ответ api.zippopotam.us/<страна>/<индекс> (поиск по почтовому индексу,
+// ключ zip:): координаты и название места (берётся последнее место списка —
+// для итальянских CAP это коммуна).
 bool parseZippopotam(const char* json, size_t length, GeoResult& out,
                      char* error, size_t errorSize);
 
+// Значение из zifi.ini -> UTF-8 (в out, с нулём в конце). Файл могли
+// сохранить в UTF-8 (редактор на ПК), в CP866 (редактор Wild Commander) или
+// в CP1251 (Блокнот Windows «ANSI»). Правильный UTF-8 остаётся как есть,
+// иначе берётся та из CP866 и CP1251, в которой больше кириллических букв.
+void iniTextToUtf8(const char* text, char* out, size_t capacity);
+
 // Ответ api.open-meteo.com/v1/forecast (current + daily, timeformat=unixtime,
-// timezone=auto) -> запись kWeatherRecordSize байт. place уже в CP866.
-bool parseOpenMeteo(const char* json, size_t length, const char* placeCp866,
+// timezone=auto) -> запись kWeatherRecordSize байт. placeUtf8 — название
+// места в UTF-8, как его дал справочник; в CP866 оно переводится только
+// здесь, один раз (повторный перевод CP866 превращал кириллицу в «??»).
+bool parseOpenMeteo(const char* json, size_t length, const char* placeUtf8,
                     uint8_t* record, char* error, size_t errorSize);
 
-// UTF-8 -> CP866: кириллица переводится, латиница с диакритикой упрощается до
-// базовой буквы, остальное заменяется '?'. Строка обрезается по capacity.
+// UTF-8 -> CP866: кириллица переводится (с украинскими и белорусскими
+// буквами), латиница с диакритикой упрощается до базовой буквы, типографские
+// апостроф, тире и кавычки — до знаков ASCII, остальное заменяется '?'.
+// Строка обрезается по capacity.
 void utf8ToCp866(const char* text, char* out, size_t capacity);
 
 }  // namespace zifi
