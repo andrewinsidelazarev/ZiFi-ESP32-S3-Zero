@@ -15,11 +15,14 @@ ESP-01S через переходник и сохраняет двоичный U
 - команды `ECHO`, `WIFI_CONNECT`, `WIFI_INI`, `PING`, `SYS_INFO`, `GET_STEP`,
   `FTP_START/STOP`, `FTP_RAM_STATS`, `SMB_START/STOP`, `NET_OPEN/SEND/RECV/CLOSE`,
   `NET_HTTP_GET`, `NET_PING`, `NET_IP_CONFIG`, `NET_NTP`, `NET_PROXY_STATUS`,
-  `UPDATE_START/STOP` и `SYS_RESET`;
+  `WEATHER_GET`, `UPDATE_START/STOP` и `SYS_RESET`;
 - прозрачный HTTP-прокси для обхода блокировок ретро-архивов (`vtrd.in`, `zxart.ee` и др.) с проверкой доступности и фиксированной авторизацией;
 - прямой HTTPS на ESP32 с проверкой сервера по встроенному Mozilla CA-bundle;
   тело ответа передаётся Z80 без перекодирования и распаковки;
 - NTP-плагин Wild Commander с результатом `YYYYMMDDhhmmss`;
+- погода для заставки Wild Commander (`WEATHER_GET`): почтовый индекс места из
+  `zifi.ini` → координаты (zippopotam.us) → прогноз Open-Meteo, Z80 получает
+  готовую запись на 90 байт;
 - совместимость с Native-версией `zifi.spg`: ESP сама выполняет DNS,
   HTTP-запрос и разбор заголовка, Z80 забирает тело командами `NET_RECV`;
 - FTP с тремя управляющими сессиями на задаваемом порту (обычно `21`),
@@ -61,6 +64,7 @@ WebDAV ещё не включён. Сетевой файловый listener за
 | **SMB-сервер (Windows)** | [**`ZIFISMB.WMF`**](SMB%20Server/build/ZIFISMB.WMF) | Плагин Wild Commander v0.5.9: доступ к текущему тому SD/IDE, например `\\ZX-Evo\0` |
 | **FTP-сервер** | [**`ZIFIFTP.WMF`**](FTP%20Server/build/ZIFIFTP.WMF) | Плагин Wild Commander: полнофункциональный FTP-сервер |
 | **Синхронизация времени** | [**`NTPTIME.WMF`**](NTP%20Time%20Sync/build/NTPTIME.WMF) | Плагин Wild Commander: синхронизация часов RTC через интернет |
+| **Заставка с погодой** | [**`WEATHER.WMF`**](Weather%20screensaver/build/WEATHER.WMF) | Заставка Wild Commander: часы, календарь, погода и прогноз на 5 дней (прошивка `s3-native-0.6.92` или новее) |
 | **Браузер / Загрузчик** | [**`zifi.spg`**](ZiFi%20SPG/build/zifi.spg) ([пример `zifi.ini`](ZiFi%20SPG/build/zifi.ini)) | Программа ZiFi для ZX-Evolution (каталог сайтов, скачивание) |
 | **Печатная плата переходника** | [**`Manufacturing.zip`**](Zifi%20ESP32%20Zero%20Adapter/Zifi_ESP32_Zero_Adapter-Manufacturing.zip) | Готовый архив герберов для заказа платы переходника в производство |
 
@@ -114,6 +118,12 @@ credit target соединения до одного, поэтому Windows п�
   Плагин для Wild Commander v0.13 (команда `FTP_START`), запускающий FTP-сервер с поддержкой активного и пассивного режимов и отдельной шкалой Wi-Fi.
 * **`NTP Time Sync` (`NTP Time Sync/build/NTPTIME.WMF`):**
   Плагин для Wild Commander для сетевой синхронизации часов реального времени RTC.
+* **`Weather screensaver` (`Weather screensaver/build/WEATHER.WMF`):**
+  Заставка Wild Commander (тип `#02`) на экране 360×288: место, крупные часы с
+  мигающим двоеточием, дата, текущая погода, прогноз на 5 дней и лента недели.
+  Место — ключи `country:` и `zip:` в `/zifi/zifi.ini`; погоду раз в час
+  запрашивает командой `WEATHER_GET`. Подробности — в
+  [описании заставки](Weather%20screensaver/README.md).
 * **`Online Update` (`Online Update/build/ZIFIUPD.WMF`):**
   Ручной пользовательский обновлятор: читает `/zifi/zifi.ini`, подключает ESP к
   Wi-Fi, показывает установленную и опубликованную версии, затем по подтверждению
@@ -180,11 +190,11 @@ PlatformIO автоматически создаёт:
 При выходе в
 [WC v1.10i от 8 сентября 2026 года](https://github.com/andrewinsidelazarev/Wild-Commander-Improved/releases/tag/v1.10i-2026-09-08)
 перечитываются обе панели с сохранением активной. Табличный CRC16 сохранён;
-версия прошивки остаётся `.91`. Подробности и команды проверки — в
+прошивку для этого менять не пришлось. Подробности и команды проверки — в
 [описании плагина](SMB%20Server/README.md).
 
 Прошивка
-`s3-native-0.6.91` с выключенным диагностическим кольцевым журналом
+`s3-native-0.6.92` с выключенным диагностическим кольцевым журналом
 подтверждает READ и WRITE только после полного сетевого запроса: Windows
 CopyFile не повторяет остаток короткого успешного ответа ни для чтения, ни для
 записи. При задержке свыше 30 секунд сервер посылает промежуточный
@@ -297,6 +307,18 @@ MS-SMB2, регрессия курсора/кэша и проверка FIFO в�
 тестов.
 Подробная пошаговая инструкция и ограничения текущей версии находятся в
 [`SMB Server/README.md`](SMB%20Server/README.md).
+
+## Сборка заставки погоды
+
+```powershell
+& ".\Weather screensaver\build.bat"
+```
+
+Результат: `Weather screensaver/build/WEATHER.WMF`. Шрифты, иконки и палитру
+генерирует `tools/gen_assets.py` из системных шрифтов Windows (Segoe UI,
+Tahoma, Segoe UI Emoji), поэтому нужны Python 3 с Pillow. Машинные тесты
+исполняют плагин в эмуляторе Z80 и сравнивают кадр с эталоном попиксельно —
+см. [описание заставки](Weather%20screensaver/README.md).
 
 ## Первая прошивка через USB
 

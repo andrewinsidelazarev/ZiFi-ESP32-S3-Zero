@@ -35,6 +35,9 @@ enum Command : uint8_t {
   kNetIpConfig = 0x21,
   kNetNtp = 0x22,
   kNetProxyStatus = 0x23,
+  // Запись погоды для заставки WC: место из zifi.ini (country:, zip:),
+  // payload пуст. Ответ kRespWeatherGet, формат в weather_parse.hpp.
+  kWeatherGet = 0x24,
 
   kVfsStat = 0x40,
   kVfsOpenDir = 0x41,
@@ -92,6 +95,7 @@ enum Command : uint8_t {
   kRespNetPing = 0xA1,
   kRespNetNtp = 0xA2,
   kRespNetProxyStatus = 0xA3,
+  kRespWeatherGet = 0xA4,
   kReady = 0xF0,
   kError = 0xEE,
   kAck = 0xFE,

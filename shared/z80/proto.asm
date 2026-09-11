@@ -32,6 +32,7 @@ CMD_SYS_INFO    equ #02
 CMD_NET_IPCONFIG equ #21               ; текущие IP, маска, шлюз, DNS
 CMD_NET_NTP     equ #22                ; точное время; ESP уже учла time: из ini
 CMD_NET_PROXY_STATUS equ #23           ; статус HTTP-прокси (0=выкл, 1=вкл, 2=недоступен)
+CMD_WEATHER_GET equ #24                ; запись погоды для заставки, без payload
 ; TCP-клиент: подключиться, отправить, забрать порцию, закрыть. Данные тянет
 ; Z80 — приёмная очередь ZiFi всего 256 байт, и непрошеный поток её переполнит.
 CMD_NET_OPEN    equ #10                ; адрес,0,порт LE16 (без порта — 80)
@@ -70,6 +71,7 @@ RESP_NET_IPCONFIG equ #A0
 RESP_NET_PING   equ #A1
 RESP_NET_NTP    equ #A2                ; ГГГГММДДЧЧММСС, 14 символов ASCII
 RESP_NET_PROXY_STATUS equ #A3          ; [status(1B)][endpoint(ASCII)]
+RESP_WEATHER    equ #A4                 ; запись погоды (см. Weather screensaver/src/weather.asm)
 RESP_NET_OPEN   equ #90
 RESP_NET_SEND   equ #91
 ; Первый байт: 0 — порция (пустая значит «данных пока нет, спроси снова»),

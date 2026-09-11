@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Weather Dashboard 4:3</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --panel-bg: rgba(255, 255, 255, 0.05);
+            --panel-border: rgba(255, 255, 255, 0.1);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #38bdf8;
+            --rain: #60a5fa;
+        }
+
+        body {
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(circle at top left, #1e293b, #0f172a); 
+            color: var(--text-main);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+        }
+
+        .dashboard {
+            width: 100%;
+            max-width: 1024px; 
+            aspect-ratio: 4 / 3;
+            display: grid;
+            /* Правая колонка теперь чуть шире под длинный прогноз */
+            grid-template-columns: 1fr 1.2fr; 
+            gap: 2rem;
+            padding: 2rem;
+            box-sizing: border-box;
+        }
+
+        .panel {
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 24px;
+            padding: 2.5rem;
+            display: flex;
+            flex-direction: column;
+            backdrop-filter: blur(12px);
+        }
+
+        /* --- ЛЕВАЯ ПАНЕЛЬ: Текущее состояние --- */
+        .left-panel {
+            justify-content: space-between;
+        }
+        
+        .location {
+            color: var(--accent);
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .time-widget h1 {
+            font-size: 5.5rem; /* Чуть уменьшили для баланса */
+            margin: 0;
+            line-height: 1;
+            font-weight: 300;
+            letter-spacing: -2px;
+        }
+        .time-widget p {
+            font-size: 1.3rem;
+            color: var(--text-muted);
+            margin: 0.8rem 0 0 0;
+        }
+
+        .current-weather {
+            margin-bottom: 1rem;
+        }
+        .weather-main {
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .weather-icon {
+            font-size: 4.5rem;
+            line-height: 1;
+        }
+        .temperature {
+            font-size: 4rem;
+            font-weight: bold;
+            line-height: 1;
+        }
+        .weather-desc {
+            font-size: 1.3rem;
+            margin: 0 0 1.5rem 0;
+        }
+        .weather-details {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            font-size: 1.2rem;
+        }
+        .weather-details div {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        .weather-details span {
+            width: 24px;
+            text-align: center;
+            opacity: 0.8;
+        }
+
+        /* --- ПРАВАЯ ПАНЕЛЬ: Прогноз и лента дней --- */
+        .right-panel {
+            justify-content: space-between;
+        }
+        
+        .panel-title {
+            font-size: 1.2rem;
+            color: var(--text-muted);
+            margin: 0 0 1.5rem 0;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* Список на 5 дней */
+        .forecast-list {
+            display: flex;
+            flex-direction: column;
+            gap: 1.2rem;
+        }
+        .forecast-item {
+            display: grid;
+            grid-template-columns: 2fr 1fr 2fr 1fr;
+            align-items: center;
+            font-size: 1.3rem;
+            padding-bottom: 1.2rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .forecast-item:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+        .f-day { font-weight: 500; }
+        .f-icon { font-size: 1.8rem; text-align: center; }
+        .f-temp { text-align: center; color: var(--text-muted); }
+        .f-temp strong { color: var(--text-main); }
+        .f-rain { text-align: right; color: var(--rain); font-size: 1.1rem; }
+
+        /* Компактный календарь (лента) */
+        .week-strip {
+            display: flex;
+            justify-content: space-between;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 16px;
+            padding: 1rem;
+            margin-top: 2rem;
+        }
+        .w-day {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1.1rem;
+            color: var(--text-muted);
+        }
+        .w-date {
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+        .w-day.active .w-date {
+            background: var(--accent);
+            color: #0f172a;
+            box-shadow: 0 0 15px rgba(56, 189, 248, 0.3);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="dashboard">
+        
+        <!-- ЛЕВАЯ ПОЛОВИНА: Текущая локация, время и погода -->
+        <div class="panel left-panel">
+            <div class="header-info">
+                <div class="location">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>
+                    Roma
+                </div>
+                <div class="time-widget">
+                    <h1 id="clock">00:00</h1>
+                    <p id="date-text">Загрузка...</p>
+                </div>
+            </div>
+            
+            <div class="current-weather">
+                <div class="weather-main">
+                    <div class="weather-icon">⛈️</div> 
+                    <div class="temperature">14°C</div>
+                </div>
+                <p class="weather-desc">Гроза • Закат в 19:38</p>
+                
+                <div class="weather-details">
+                    <div><span>💧</span> 23.9 мм осадков</div>
+                    <div><span>💨</span> 13.5 км/ч (ветер)</div>
+                    <div><span>🧭</span> 675 мм рт. ст.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ПРАВАЯ ПОЛОВИНА: Многодневный прогноз + Компактный календарь -->
+        <div class="panel right-panel">
+            
+            <div class="forecast-widget">
+                <h2 class="panel-title">Прогноз на 5 дней</h2>
+                <div class="forecast-list">
+                    <div class="forecast-item">
+                        <span class="f-day">ПТ, 11 сент</span>
+                        <span class="f-icon">☁️</span>
+                        <span class="f-temp">10° ... <strong>19°</strong></span>
+                        <span class="f-rain">0 мм</span>
+                    </div>
+                    <div class="forecast-item">
+                        <span class="f-day">СБ, 12 сент</span>
+                        <span class="f-icon">☁️</span>
+                        <span class="f-temp">9° ... <strong>19°</strong></span>
+                        <span class="f-rain">0 мм</span>
+                    </div>
+                    <div class="forecast-item">
+                        <span class="f-day">ВС, 13 сент</span>
+                        <span class="f-icon">☁️</span>
+                        <span class="f-temp">11° ... <strong>19°</strong></span>
+                        <span class="f-rain">0 мм</span>
+                    </div>
+                    <div class="forecast-item">
+                        <span class="f-day">ПН, 14 сент</span>
+                        <span class="f-icon">⛅</span>
+                        <span class="f-temp">14° ... <strong>21°</strong></span>
+                        <span class="f-rain">0 мм</span>
+                    </div>
+                    <div class="forecast-item">
+                        <span class="f-day">ВТ, 15 сент</span>
+                        <span class="f-icon">⛅</span>
+                        <span class="f-temp">12° ... <strong>22°</strong></span>
+                        <span class="f-rain">0 мм</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mini-calendar">
+                <h2 class="panel-title" style="margin-bottom: 1rem;">Сентябрь 2026</h2>
+                <div class="week-strip">
+                    <div class="w-day"><span>ПН</span><div class="w-date">7</div></div>
+                    <div class="w-day"><span>ВТ</span><div class="w-date">8</div></div>
+                    <div class="w-day"><span>СР</span><div class="w-date">9</div></div>
+                    <div class="w-day active"><span>ЧТ</span><div class="w-date">10</div></div>
+                    <div class="w-day"><span>ПТ</span><div class="w-date">11</div></div>
+                    <div class="w-day"><span>СБ</span><div class="w-date">12</div></div>
+                    <div class="w-day"><span>ВС</span><div class="w-date">13</div></div>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+    <script>
+        function updateTime() {
+            const now = new Date();
+            
+            const timeString = now.toLocaleTimeString('ru-RU', { 
+                hour: '2-digit', minute: '2-digit' 
+            });
+            
+            // Теперь дата включает год явно
+            let dateString = now.toLocaleDateString('ru-RU', { 
+                weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
+            });
+            
+            dateString = dateString.charAt(0).toUpperCase() + dateString.slice(1);
+            
+            document.getElementById('clock').textContent = timeString;
+            document.getElementById('date-text').textContent = dateString;
+        }
+
+        setInterval(updateTime, 1000);
+        updateTime();
+    </script>
+</body>
+</html>

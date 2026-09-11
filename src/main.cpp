@@ -19,6 +19,7 @@
 #include "zifi/ftp_server.hpp"
 #include "zifi/net_client.hpp"
 #include "zifi/ntp_client.hpp"
+#include "zifi/weather_service.hpp"
 #include "zifi/online_updater.hpp"
 #include "zifi/ota_server.hpp"
 #include "zifi/protocol.hpp"
@@ -191,6 +192,7 @@ class Application {
   void processWifiConnect();
   void processWifiIni();
   void processNtp();
+  void processWeather();
   void processFtpStart();
   void processFtpStop();
   void processFtpRamStats();
@@ -237,6 +239,7 @@ class Application {
   VfsBridge vfsBridge_;
   NetClient netClient_;
   OnlineUpdater onlineUpdater_;
+  WeatherService weather_;
   FtpServer ftp_;
   SmbServer smb_;
   OtaServer ota_;
@@ -270,6 +273,7 @@ Application::Application()
       vfsBridge_(transport_),
       netClient_(),
       onlineUpdater_(netClient_),
+      weather_(netClient_),
       ftp_(vfsBridge_, networkEventEntry, this),
       smb_(vfsBridge_, networkEventEntry, this),
       ota_(),
@@ -689,6 +693,28 @@ void Application::processNtp() {
   memcpy(exchange_->response, result, 14);
 }
 
+// WEATHER_GET: запись погоды для заставки Wild Commander. Место берётся из
+// сохранённого zifi.ini (country:, zip:). При ошибке ответ короткий
+// [0][версия], а причина уходит докладом #EE перед ним.
+void Application::processWeather() {
+  char error[64] = {};
+  exchange_->responseCommand = kRespWeatherGet;
+  bool ok = false;
+  if (ota_.running()) {
+    snprintf(error, sizeof(error), "ota active");
+  } else {
+    ok = weather_.get(config_, exchange_->response, error, sizeof(error));
+  }
+  if (ok) {
+    exchange_->responseLength = static_cast<uint16_t>(kWeatherRecordSize);
+    return;
+  }
+  setNetworkError("weather:%s", error);
+  exchange_->response[0] = 0;
+  exchange_->response[1] = kWeatherRecordVersion;
+  exchange_->responseLength = 2;
+}
+
 void Application::processFtpStart() {
   exchange_->responseCommand = kRespFtpStart;
   exchange_->responseLength = 3;
@@ -1066,6 +1092,9 @@ void Application::processNetworkRequest() {
     case kNetNtp:
       processNtp();
       break;
+    case kWeatherGet:
+      processWeather();
+      break;
     case kFtpStart:
       processFtpStart();
       break;
@@ -1207,6 +1236,10 @@ void Application::sendNetworkFailure(uint8_t command) {
       break;
     case kNetProxyStatus:
       transport_.send(kRespNetProxyStatus, failed, 1);
+      break;
+    case kWeatherGet:
+      failed[1] = kWeatherRecordVersion;
+      transport_.send(kRespWeatherGet, failed, 2);
       break;
     case kNetNtp:
       sendNtpFailure();
@@ -1353,6 +1386,7 @@ void Application::handle(const PacketView& packet) {
     case kNetPing:
     case kNetIpConfig:
     case kNetProxyStatus:
+    case kWeatherGet:
       transport_.sendAck();
       if (!submitNetwork(packet.command, packet.data, packet.length)) {
         reportError("network busy");
