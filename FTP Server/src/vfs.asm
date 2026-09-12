@@ -458,6 +458,10 @@ Vfs_Open:
 
 .for_write:
         ; Запись: старый файл удалить, создать пустой, зафиксировать FENTRY.
+        ; С этого места диск меняется (даже если MKFILE потом откажет), и при
+        ; выходе из плагина WC должен перечитать панели.
+        ld a,1
+        ld (VfsChanged),a
         call Fs_SelectWork
         ld hl,FsEntry
         call WC_FENTRY
@@ -1431,16 +1435,57 @@ Vfs_LzCopyLiterals:
         ret
 
 ; CRC-16/CCITT-FALSE: poly #1021, init #FFFF. Вход HL/BC, выход DE.
+;
+; Считается по таблице, как в SMB-плагине. Побитовый вариант стоил около 500
+; тактов на байт: на окне 16 КиБ это 8 млн тактов, то есть 0,6 с при 14 МГц
+; при 1,4 с самой передачи по UART, и именно он ограничивал скорость в обе
+; стороны (Vfs_Crc16 вызывается и на чтении окна, и на записи). Табличный
+; проход стоит около 86 тактов на байт, то есть 0,1 с на окно.
+;
+; Значение то же самое: индекс равен старшему байту CRC, сложенному XOR с
+; байтом данных; новый старший байт — младший байт CRC XOR старшая половина
+; табличной записи, новый младший — её младшая половина. Таблицы строит
+; Vfs_Crc16Init при старте плагина.
 Vfs_Crc16:
         ld de,#FFFF
-.byte:
         ld a,b
         or c
         ret z
-        ld a,d
-        xor (hl)
-        ld d,a
-        inc hl
+        ; Конец данных держим в переменной: все три пары регистров заняты —
+        ; BC указателем, DE значением CRC, HL адресом в таблице.
+        push hl
+        add hl,bc
+        ld (VfsCrcEnd),hl
+        pop hl
+        ld b,h
+        ld c,l
+.byte:
+        ld a,(bc)
+        inc bc
+        xor d                            ; индекс = старший байт CRC XOR байт
+        ld l,a
+        ld h,VfsCrcHi/256
+        ld a,(hl)
+        xor e
+        ld d,a                           ; новый старший байт
+        ld h,VfsCrcLo/256
+        ld e,(hl)                        ; новый младший байт
+        ld a,(VfsCrcEnd)
+        cp c
+        jr nz,.byte
+        ld a,(VfsCrcEnd+1)
+        cp b
+        jr nz,.byte
+        ret
+
+; Построить обе таблицы: запись с номером i равна результату восьми сдвигов
+; значения i<<8 по тому же полиному. 256 проходов по восемь бит — около
+; 10 мс при 14 МГц, один раз за запуск плагина.
+Vfs_Crc16Init:
+        ld b,0                           ; 256 итераций: B пробегает 0..255
+.entry:
+        ld d,b
+        ld e,0
         push bc
         ld b,8
 .bit:
@@ -1456,8 +1501,14 @@ Vfs_Crc16:
 .next:
         djnz .bit
         pop bc
-        dec bc
-        jr .byte
+        ld l,b
+        ld h,VfsCrcHi/256
+        ld (hl),d
+        ld h,VfsCrcLo/256
+        ld (hl),e
+        inc b
+        jr nz,.entry
+        ret
 
 ; Page1 всегда заново отображается перед записью: UI/API могли сменить #C000.
 Vfs_MapData:
@@ -1588,6 +1639,8 @@ Vfs_Delete:
         call Vfs_Locate
         jp c,Vfs_Refuse
         jp z,Vfs_Refuse                 ; корень удалять нельзя
+        ld a,1
+        ld (VfsChanged),a               ; удаление меняет каталог: панели WC перечитать
         call Fs_SelectWork
         ld hl,FsEntry
         call WC_FENTRY
@@ -1609,6 +1662,8 @@ Vfs_Mkdir:
         call Vfs_SplitPath
         jp c,Vfs_Refuse
         jp z,Vfs_Refuse                 ; корень уже существует
+        ld a,1
+        ld (VfsChanged),a               ; новый каталог: панели WC перечитать
         call Fs_SelectWork
         ld hl,VfsName                   ; API 73: только имя с нулём
         call WC_MKDIR
@@ -1642,6 +1697,9 @@ VfsBlockNewReceived:
                 dw 0
 VfsBlockPart:   dw 0
 VfsBlockCrc:    dw 0
+; Адрес байта за концом данных для табличного CRC: свободной пары регистров
+; под счётчик не остаётся, поэтому конец сравнивается с указателем в BC.
+VfsCrcEnd:      dw 0
 VfsBlockNewCount:
                 dw 0
 VfsWindowActive:

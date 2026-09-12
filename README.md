@@ -116,7 +116,7 @@ credit target соединения до одного, поэтому Windows п�
 * **`SMB Server` (`SMB Server/build/ZIFISMB.WMF`):**
   Плагин для Wild Commander, открывающий текущий том SD/IDE по SMB2/SMB3. Имя ресурса совпадает с номером устройства в панели WC: например, `0:\` доступен как `\\ZX-Evo\0`.
 * **`FTP Server` (`FTP Server/build/ZIFIFTP.WMF`):**
-  Плагин для Wild Commander v0.13 (команда `FTP_START`), запускающий FTP-сервер с поддержкой активного и пассивного режимов и отдельной шкалой Wi-Fi.
+  Плагин для Wild Commander v0.14 (команда `FTP_START`), запускающий FTP-сервер с поддержкой активного и пассивного режимов и отдельной шкалой Wi-Fi; после записи по FTP панели WC перечитываются при выходе.
 * **`NTP Time Sync` (`NTP Time Sync/build/NTPTIME.WMF`):**
   Плагин для Wild Commander для сетевой синхронизации часов реального времени RTC.
 * **`Weather screensaver` (`Weather screensaver/build/WEATHER.WMF`):**
@@ -179,7 +179,9 @@ PlatformIO автоматически создаёт:
 & ".\FTP Server\build.bat"
 ```
 
-Результат: `FTP Server/build/ZIFIFTP.WMF`. Версия v0.13 объявляет прошивке
+Результат: `FTP Server/build/ZIFIFTP.WMF`. Версия v0.14 считает CRC-16 окна по
+таблице, как SMB-плагин, и после записи по FTP просит WC перечитать панели;
+как и v0.13, она объявляет прошивке
 поддержку окон записи и чтения до 16 КиБ, а поле `Status` после запуска
 показывает 16-сегментную шкалу Wi-Fi и точный процент. RSSI приходит отдельным
 событием `0x66`, без опроса `SYS_INFO`; общие ASM-файлы также берутся из

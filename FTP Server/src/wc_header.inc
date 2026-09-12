@@ -25,7 +25,7 @@
         dd 0                          ; инструмент меню, не привязанный к выбранному файлу
 
 .plugin_name
-        db "ZiFi FTP Server v0.13"
+        db "ZiFi FTP Server v0.14"
         ds 32-($-.plugin_name),' '
         db #03                        ; запуск из меню плагинов
         ds 6

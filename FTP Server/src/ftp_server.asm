@@ -13,8 +13,13 @@ PLUGIN:
         push ix
         ld a,(ix+29)
         ld (ConfigPanelDevice),a
+        ; Страница плагина живёт в памяти между запусками, поэтому признак
+        ; изменений на диске обнуляем здесь, а не полагаемся на db 0.
+        xor a
+        ld (VfsChanged),a
         ld a,1
         call WC_INT_PL                   ; WC не должен перерисовывать часы под окном
+        call Vfs_Crc16Init               ; таблицы CRC — до первого файлового обмена
         call WC_GEDPL
         call Ui_Open
 
@@ -93,8 +98,17 @@ PLUGIN:
         call Link_Stop                   ; попросить ESP закрыть FTP-сервер
         ld ix,FtpWindow
         call WC_RRESB
+        call WC_GEDPL                    ; вернуть основной экран WC, как SMB и UNZIP
         ; При возврате Wild Commander сам восстанавливает настройки прерываний.
-        xor a                            ; код возврата: обычный выход из плагина
+        ; Пока сервер работал, FTP-клиент мог записать, удалить или создать
+        ; файлы и каталоги. Панели WC об этом не знают, поэтому просим их
+        ; перечитать: код возврата 3 — обновить обе панели, сохранив активную.
+        ; Если клиент только читал, возвращаем 0 и панели не трогаем.
+        ld a,(VfsChanged)
+        or a
+        jr z,.leave
+        ld a,3
+.leave:
         pop ix
         ret
 
@@ -439,6 +453,7 @@ LinkNoReply:    db "no ESP reply",0
 LinkNativePrefix: db "Native C++ ",0
 LinkFailBuf:    ds 80
 VfsCount:       dw 0                     ; сколько файловых запросов обслужено
+VfsChanged:     db 0                     ; 1 — клиент менял диск: при выходе WC перечитает панели
 VfsCountMsg:    db "VFS requests: ",0
 VfsCountBuf:    ds 24
 LocalIp:        ds 4                     ; IP, выданный роутером (его печатает окно)
