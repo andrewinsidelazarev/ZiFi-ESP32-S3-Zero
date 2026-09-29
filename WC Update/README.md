@@ -1,5 +1,10 @@
 # ZiFi WC Update: проверка и обновление Wild Commander с GitHub
 
+<p align="center">
+  <img src="screenshot.png" alt="Окно ZiFi WC Update: файлы WC с состояниями NEW, DIFFERS, same и SD only, отмеченные для обновления" width="720">
+</p>
+<p align="center"><sub>Кадр эмулятора Unreal с Wild Commander v1.11i; список посчитан кодом прошивки для карты с WC v1.10i</sub></p>
+
 Плагин `build/WCUPDATE.WMF` сверяет файлы Wild Commander Improved на SD-карте
 с опубликованными на GitHub и обновляет те, что отличаются или отсутствуют, —
 аналог `sfc /scannow` в Windows. Источник эталона —
