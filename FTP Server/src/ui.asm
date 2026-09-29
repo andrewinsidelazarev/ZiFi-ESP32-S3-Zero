@@ -6,6 +6,9 @@
 ; с кодировкой экрана Wild Commander.
 
 UI_FIELD_STATUS equ 30
+; Байтов поля Status: видимая ширина и пять кодов цвета шкалы Wi-Fi
+; (wifi_signal.asm), которые места на экране не занимают.
+UI_STATUS_BYTES equ UI_FIELD_STATUS+5
 UI_FIELD_IP     equ 32
 UI_FIELD_FW     equ 30
 UI_FIELD_CLIENT equ 30
@@ -15,7 +18,21 @@ UI_FIELD_PORT   equ 5
 ; Создать окно, сохранить закрываемую им область экрана и заполнить динамические
 ; поля начальными значениями.
 Ui_Open:
+        ; Центрирует сам PRWOW: X/Y=#FF он заменяет серединой ТЕКУЩЕГО
+        ; текстового режима WC (80/90 колонок, 25/30/36 строк) — и записывает
+        ; вычисленное обратно в дескриптор. Поэтому #FF ставится перед каждым
+        ; показом: страница плагина живёт между запусками, и без этого окно
+        ; вставало бы по координатам прошлого режима. Прежде они были зашиты
+        ; (13,5), и окно стояло по центру только в 80x25.
+        ;
+        ; Буфер фона сбрасывается по той же причине: ненулевой адрес PRWOW
+        ; считает уже выделенным и фон не сохраняет, а адрес от прошлого
+        ; запуска к нынешнему экрану отношения не имеет.
         ld ix,FtpWindow
+        ld (ix+2),#FF
+        ld (ix+3),#FF
+        ld (ix+8),0
+        ld (ix+9),0
         call WC_PRWOW
         ld hl,UiClientNone
         call Ui_SetClient
@@ -33,8 +50,12 @@ Ui_Draw:
         ld de,#0101
         jp WC_TXTPR
 
-; HL — нуль-терминированная строка нового состояния.
+; HL — нуль-терминированная строка нового состояния. Поле очищается целиком,
+; вместе с местом под коды цвета шкалы Wi-Fi.
 Ui_SetStatus:
+        push hl
+        call Ui_ClearStatus
+        pop hl
         ld de,UiStatusField
         ld b,UI_FIELD_STATUS
         jp Ui_CopyField
@@ -141,7 +162,7 @@ Ui_BuildIp:
 FtpWindow:
         db #81                         ; тень и рамка стиля 1
         db 0
-        db 13,5                        ; координаты X,Y
+        db #FF,#FF                     ; X,Y: центр, см. Ui_Open
         db 52,19                       ; ширина и высота
         db #17                         ; синий фон, ярко-белые символы
         db 0
@@ -158,7 +179,7 @@ UiText:
         db #0E,"FTP server for ZX Evolution / TS-Config",#0D,#0D
         db "Status : "
 UiStatusField:
-        ds UI_FIELD_STATUS,' '
+        ds UI_STATUS_BYTES,' '
         db #0D
         db "IP     : "
 UiIpField:

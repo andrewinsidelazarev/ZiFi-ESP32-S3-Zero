@@ -160,7 +160,7 @@ def main():
     (out / 'probe4').mkdir(parents=True, exist_ok=True)
 
     includes = r'/Itests\stubs_host /Iinclude /Ilib\libsmb2\include /Ilib\libsmb2\include\smb2 /Itools\host_smb'
-    sources = r'tools\host_smb\main.cpp tools\host_smb\z80_sim.cpp tools\host_smb\crash_report.cpp src\smb_server.cpp src\vfs_bridge.cpp src\vfs_client.cpp src\directory_cache.cpp src\fat_allocation_cache.cpp src\spsc_ring.cpp src\protocol.cpp src\uart_transport.cpp src\ws_discovery.cpp src\ws_discovery_xml.cpp src\diagnostic_log.cpp'
+    sources = r'tools\host_smb\main.cpp tools\host_smb\z80_sim.cpp tools\host_smb\crash_report.cpp src\smb_server.cpp src\vfs_bridge.cpp src\vfs_client.cpp src\directory_cache.cpp src\fat_time.cpp src\fat_allocation_cache.cpp src\spsc_ring.cpp src\protocol.cpp src\uart_transport.cpp src\ws_discovery.cpp src\ws_discovery_xml.cpp src\diagnostic_log.cpp'
 
     libsmb2_files = [str(p) for p in Path('lib/libsmb2/lib').glob('*.c') if not any(k in p.name for k in ['krb5', 'aes_apple', 'dreamcast'])]
     libsmb2 = ' '.join(libsmb2_files)
@@ -320,11 +320,17 @@ echo Compilation SUCCESS!
     mkdir_share.mkdir(parents=True)
     mkdir_log_path = out / 'host_smb_mkdir_fifo.log'
     mkdir_test = None
+    # Тесту нужен ровно один физический FINDNEXT в полёте (250 мс), как в
+    # исходной трассе. Пачка READDIR держала бы мост 16 таких шагов подряд,
+    # поэтому эмулятор отвечает здесь по одной записи, как FTP-плагин.
+    mkdir_env = dict(os.environ)
+    mkdir_env['ZIFI_SIM_NO_DIR_BATCH'] = '1'
     with mkdir_log_path.open('w', encoding='utf-8') as mkdir_log:
         mkdir_server = subprocess.Popen(
             ['.test-build\host_smb\\host_smb.exe', str(mkdir_share),
              str(mkdir_port), '0', 'ZX-Evo', '250'],
-            stdout=mkdir_log, stderr=subprocess.STDOUT, text=True)
+            stdout=mkdir_log, stderr=subprocess.STDOUT, text=True,
+            env=mkdir_env)
         try:
             time.sleep(1.5)
             print('Running MKDIR/FINDNEXT FIFO regression...')

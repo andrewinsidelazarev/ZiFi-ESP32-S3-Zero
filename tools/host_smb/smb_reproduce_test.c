@@ -2033,6 +2033,121 @@ int main(int argc, char **argv) {
   }
   printf("SUCCESS: Connected to %s/%s\n", server, share);
 
+  /* Время перечисления каталога: первый проход и повтор. Только чтение, поэтому
+   * годится и для настоящей платы. Первый проход по ещё не открытому каталогу
+   * идёт мимо снимка ESP (холодный), повтор — из снимка. Подкаталоги
+   * печатаются, чтобы выбрать следующий холодный каталог для замера. */
+  if (only_test != NULL && strcmp(only_test, "dirtime") == 0) {
+    const char *directory = test_directory[0] == '\0' ? "" : test_directory;
+    int pass;
+    for (pass = 1; pass <= 2 && failures == 0; ++pass) {
+      DWORD started = GetTickCount();
+      struct smb2dir *listing = smb2_opendir(smb2, directory);
+      DWORD elapsed = GetTickCount() - started;
+      struct smb2dirent *item = NULL;
+      int count = 0;
+      int shown = 0;
+      size_t name_bytes = 0;
+      if (listing == NULL) {
+        printf("FAIL: opendir '%s': %s\n", directory, smb2_get_error(smb2));
+        failures = 1;
+        break;
+      }
+      while ((item = smb2_readdir(smb2, listing)) != NULL) {
+        if (strcmp(item->name, ".") == 0 || strcmp(item->name, "..") == 0) {
+          continue;
+        }
+        ++count;
+        name_bytes += strlen(item->name);
+        if (pass == 1 && item->st.smb2_type == SMB2_TYPE_DIRECTORY && shown < 40) {
+          printf("  dir: %s\n", item->name);
+          ++shown;
+        }
+      }
+      smb2_closedir(smb2, listing);
+      printf("  pass %d: entries=%d names=%lu B time=%lu ms (%.1f ms/entry)\n",
+             pass, count, (unsigned long)name_bytes, (unsigned long)elapsed,
+             count != 0 ? (double)elapsed / count : 0.0);
+    }
+    smb2_disconnect_share(smb2);
+    smb2_destroy_context(smb2);
+    WSACleanup();
+    return failures == 0 ? 0 : 1;
+  }
+
+  /* Даты записей FAT. Оркестратор заранее ставит файлу dates.bin время
+   * изменения 1710502220 (2024-03-15 11:30:20) — эмулятор WC отдаёт его как
+   * местное время карты. Сервер с поясом ZIFI_TEST_TZ_HOURS обязан показать
+   * клиенту UTC и в листинге (QUERY_DIRECTORY), и в свойствах (QUERY_INFO).
+   * Затем SET_INFO ставит 1700000000 UTC: оркестратор проверит, что на карту
+   * легло местное время, а листинг после этого показывает новое значение. */
+  if (only_test != NULL && strcmp(only_test, "dates") == 0) {
+    const char *timezone_text = getenv("ZIFI_TEST_TZ_HOURS");
+    const long long shift = timezone_text != NULL ? atoll(timezone_text) * 3600 : 0;
+    const unsigned long long expected = (unsigned long long)(1710502220LL - shift);
+    int test_ok = 1;
+    int seen = 0;
+    struct smb2dir *listing = smb2_opendir(smb2, "");
+    struct smb2dirent *item = NULL;
+    while (listing != NULL && (item = smb2_readdir(smb2, listing)) != NULL) {
+      if (strcmp(item->name, "dates.bin") == 0) {
+        seen = 1;
+        printf("  listing mtime=%llu expected=%llu\n",
+               (unsigned long long)item->st.smb2_mtime, expected);
+        test_ok = test_ok && item->st.smb2_mtime == expected;
+      }
+    }
+    if (listing != NULL) {
+      smb2_closedir(smb2, listing);
+    }
+    test_ok = test_ok && seen;
+
+    struct smb2_stat_64 st;
+    memset(&st, 0, sizeof(st));
+    if (smb2_stat(smb2, "dates.bin", &st) != 0) {
+      printf("  stat failed: %s\n", smb2_get_error(smb2));
+      test_ok = 0;
+    } else {
+      printf("  stat mtime=%llu\n", (unsigned long long)st.smb2_mtime);
+      test_ok = test_ok && st.smb2_mtime == expected;
+    }
+
+    struct smb2fh *handle = smb2_open(smb2, "dates.bin", O_RDWR);
+    if (handle == NULL || raw_set_basic_info(smb2, handle) != 0) {
+      printf("  SET_INFO basic failed: %s\n", smb2_get_error(smb2));
+      test_ok = 0;
+    }
+    if (handle != NULL) {
+      smb2_close(smb2, handle);
+    }
+    memset(&st, 0, sizeof(st));
+    if (smb2_stat(smb2, "dates.bin", &st) != 0 ||
+        st.smb2_mtime != 1700000000ULL) {
+      printf("  stat after SET_INFO mtime=%llu\n",
+             (unsigned long long)st.smb2_mtime);
+      test_ok = 0;
+    }
+    seen = 0;
+    listing = smb2_opendir(smb2, "");
+    while (listing != NULL && (item = smb2_readdir(smb2, listing)) != NULL) {
+      if (strcmp(item->name, "dates.bin") == 0) {
+        seen = 1;
+        printf("  listing after SET_INFO mtime=%llu\n",
+               (unsigned long long)item->st.smb2_mtime);
+        test_ok = test_ok && item->st.smb2_mtime == 1700000000ULL;
+      }
+    }
+    if (listing != NULL) {
+      smb2_closedir(smb2, listing);
+    }
+    test_ok = test_ok && seen;
+    printf("%s: dates\n", test_ok ? "SUCCESS" : "FAIL");
+    smb2_disconnect_share(smb2);
+    smb2_destroy_context(smb2);
+    WSACleanup();
+    return test_ok ? 0 : 1;
+  }
+
   /* Второй клиент для многоклиентской регрессии одним Open дочитывает холодный
    * каталог до конца. Так проверяется цепочка FINDNEXT, между звеньями которой
    * медленный WRITE раньше вклинивался снова. Точные compound Проводника
@@ -3317,8 +3432,10 @@ test_19:
   /* TEST 19: точная форма запроса Проводника при открытии каталога. Сервер
    * обязан вернуть CREATE + оба QUERY_DIRECTORY в одном составном ответе.
    * QD не содержат RETURN_SINGLE_ENTRY; первый предоставляет 65536 байт,
-   * второй — 1024. На медленном UART оба должны вернуть ограниченный пакет,
-   * а не ждать EOF всего каталога. Также проверяются связанный FileId и
+   * второй — 1024. На медленном UART оба должны вернуть ограниченный пакет
+   * (бюджет времени ответа), а не ждать EOF всего каталога; если первый уже
+   * дошёл до конца, второй честно отвечает NO_MORE_FILES. Также проверяются
+   * связанный FileId и
    * нулевое выравнивание. Запрос содержит MxAc и QFid. Ответ QFid обязан
    * содержать тот же DiskFileId, который последующий QUERY_INFO возвращает
    * как FileInternalInformation, и ненулевой идентификатор тома FAT. */
@@ -3396,18 +3513,22 @@ test_19:
     test_ok = test_ok && header_ok &&
         (uint32_t)state.status[0] == SMB2_STATUS_SUCCESS &&
         (uint32_t)state.status[1] == SMB2_STATUS_SUCCESS &&
-        (uint32_t)state.status[2] == SMB2_STATUS_SUCCESS &&
         state.oplock_level == SMB2_OPLOCK_LEVEL_NONE &&
         state.directory_payload_valid[0] &&
-        state.directory_payload_valid[1] &&
         state.directory_padding_zero[0] &&
-        state.directory_padding_zero[1] &&
-        /* Холодный FILEX-путь не должен удерживать compound ради пакетного
-         * чтения: по одной записи на каждый из двух QUERY_DIRECTORY. */
-        state.directory_entry_count[0] == 1 &&
-        state.directory_entry_count[1] == 1 &&
+        state.directory_entry_count[0] >= 1 &&
         state.directory_output_length[0] <= 65536 &&
-        state.directory_output_length[1] <= 1024 &&
+        /* Второй QD продолжает первый с соседнего индекса либо, если первая
+         * пачка дошла до конца каталога, отвечает NO_MORE_FILES. */
+        (((uint32_t)state.status[2] == SMB2_STATUS_SUCCESS &&
+          state.directory_payload_valid[1] &&
+          state.directory_padding_zero[1] &&
+          state.directory_entry_count[1] >= 1 &&
+          state.directory_output_length[1] <= 1024 &&
+          state.directory_first_index[1] ==
+              state.directory_first_index[0] +
+                  (uint32_t)state.directory_entry_count[0]) ||
+         (uint32_t)state.status[2] == SMB2_STATUS_NO_MORE_FILES) &&
         echo_elapsed_ms < 300;
 
     if (test_ok) {
@@ -4193,10 +4314,12 @@ test_27:
   /* ТЕСТ 27: чтение метаданных не является записью на EVO и не имеет права
    * сбрасывать курсор каталога. Первый полный физический проход должен создать
    * снимок, который переживает закрытие TCP-сеанса; следующее подключение
-   * получает пакет записей из PSRAM без нового FINDNEXT. */
+   * получает пакет записей из PSRAM без нового FINDNEXT. Холодные ответы
+   * идут пачками (до 64 записей), поэтому файлов больше, чем влезает в
+   * compound Проводника: STAT должен прийтись на середину обхода. */
   printf("\n--- TEST 27: read-only STAT keeps cursor and cache survives reconnect ---\n");
   {
-    enum { seed_count = 20 };
+    enum { seed_count = 90 };
     const char *directory = test_directory[0] == '\0' ? "" : test_directory;
     struct windows_compound_state cold;
     struct windows_compound_state cached;
@@ -4208,6 +4331,7 @@ test_27:
     struct smb2_stat_64 stat_result;
     char marker_path[512];
     uint32_t last_index = 0;
+    uint32_t after_stat_index = 0;
     int cursor_ok = 0;
     int enumeration_ok = 0;
     int cache_ok = 0;
@@ -4245,12 +4369,14 @@ test_27:
                 (uint32_t)cold.status[2] == SMB2_STATUS_SUCCESS &&
                 cold.directory_payload_valid[0] &&
                 cold.directory_payload_valid[1] &&
-                cold.directory_entry_count[0] == 1 &&
-                cold.directory_entry_count[1] == 1 &&
+                cold.directory_entry_count[0] >= 1 &&
+                cold.directory_entry_count[1] >= 1 &&
                 cold.directory_first_index[0] > 0 &&
                 cold.directory_first_index[1] ==
-                    cold.directory_first_index[0] + 1;
-      last_index = cold.directory_first_index[1];
+                    cold.directory_first_index[0] +
+                        (uint32_t)cold.directory_entry_count[0];
+      last_index = cold.directory_first_index[1] +
+                   (uint32_t)cold.directory_entry_count[1] - 1;
     }
 
     /* Именно этот read-only STAT раньше вызывал invalidateParent(), обнулял
@@ -4263,10 +4389,11 @@ test_27:
                     smb2, cold.file_id, 0, &next) == 0 &&
                 (uint32_t)next.status == SMB2_STATUS_SUCCESS &&
                 next.payload_valid && next.padding_zero &&
-                next.entry_count == 1;
+                next.entry_count >= 1;
+      after_stat_index = next.first_index;
       cursor_ok = test_ok && next.first_index == last_index + 1;
       test_ok = test_ok && cursor_ok;
-      last_index = next.first_index;
+      last_index = next.first_index + (uint32_t)next.entry_count - 1;
     }
 
     /* Доходим до STATUS_NO_MORE_FILES: только в этот момент снимок становится
@@ -4282,11 +4409,11 @@ test_27:
       }
       if ((uint32_t)next.status != SMB2_STATUS_SUCCESS ||
           !next.payload_valid || !next.padding_zero ||
-          next.entry_count != 1 || next.first_index != last_index + 1) {
+          next.entry_count < 1 || next.first_index != last_index + 1) {
         test_ok = 0;
         break;
       }
-      last_index = next.first_index;
+      last_index = next.first_index + (uint32_t)next.entry_count - 1;
     }
     test_ok = test_ok && enumeration_ok;
 
@@ -4322,11 +4449,11 @@ test_27:
       cached_handle = NULL;
     }
 
-    printf("  Cold indices=%lu,%lu then STAT -> %lu (%s)\n",
+    printf("  Cold indices=%lu+%d,%lu+%d then STAT -> %lu (%s)\n",
            (unsigned long)cold.directory_first_index[0],
+           cold.directory_entry_count[0],
            (unsigned long)cold.directory_first_index[1],
-           (unsigned long)(cursor_ok ? cold.directory_first_index[1] + 1 :
-                           next.first_index),
+           cold.directory_entry_count[1], (unsigned long)after_stat_index,
            cursor_ok ? "PASS" : "FAIL");
     printf("  Full enumeration=%s last-index=%lu requests=%d\n",
            enumeration_ok ? "PASS" : "FAIL", (unsigned long)last_index,
@@ -4356,10 +4483,13 @@ test_28:
   /* ТЕСТ 28: два холодных QUERY_DIRECTORY поставлены раньше READ. Первый QD
    * уже занимает физический FILEX, второй ждёт в очереди, а затем приходит
    * чтение файла. Более поздний READ не имеет права обогнать второй QD — это
-   * точная регрессия зависания каталога из трассы Проводника. */
+   * точная регрессия зависания каталога из трассы Проводника. Холодный
+   * compound Проводника теперь забирает пачку до 64 записей, поэтому файлов
+   * больше, а сами QD просят RETURN_SINGLE_ENTRY — по одному физическому
+   * шагу, как в исходной трассе. */
   printf("\n--- TEST 28: per-owner FIFO keeps older directory ahead of later READ ---\n");
   {
-    enum { seed_count = 10 };
+    enum { seed_count = 90 };
     const uint32_t read_length = 32768;
     const char *directory = test_directory[0] == '\0' ? "" : test_directory;
     struct windows_compound_state opened;
@@ -4446,6 +4576,7 @@ test_28:
 
       first_request.file_information_class =
           SMB2_FILE_ID_BOTH_DIRECTORY_INFORMATION;
+      first_request.flags = SMB2_RETURN_SINGLE_ENTRY;
       first_request.output_buffer_length = 65536;
       first_request.name = "*";
       memcpy(first_request.file_id, opened.file_id,
@@ -4481,7 +4612,9 @@ test_28:
               first.payload_valid && second.payload_valid &&
               first.padding_zero && second.padding_zero &&
               first.entry_count == 1 && second.entry_count == 1 &&
-              first.first_index == opened.directory_first_index[1] + 1 &&
+              first.first_index ==
+                  opened.directory_first_index[1] +
+                      (uint32_t)opened.directory_entry_count[1] &&
               second.first_index == first.first_index + 1 &&
               read_state.pending_count == 0 && read_state.final_count == 1 &&
               (uint32_t)read_state.final_status == SMB2_STATUS_SUCCESS &&

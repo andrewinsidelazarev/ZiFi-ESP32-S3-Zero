@@ -40,6 +40,9 @@ class Z80Simulator {
     writeDelayMs_ = milliseconds;
     writeDelayOffset_ = minimumOffset;
   }
+  // Плагин обновлятора WC: OPEN на запись занятое имя не берёт — прежний
+  // файл не удаляется, MKFILE отказывает.
+  void setWriteNewOnly(bool enabled) { writeNewOnly_ = enabled; }
 
 
  private:
@@ -47,6 +50,9 @@ class Z80Simulator {
     std::string name;
     uint32_t size = 0;
     bool directory = false;
+    // Штамп изменения FAT для хвоста READDIR; дата 0 — неизвестен.
+    uint16_t writeDate = 0;
+    uint16_t writeTime = 0;
   };
 
   // Состояния разбора кадра повторяют приёмник плагина: пакет принимается
@@ -77,10 +83,12 @@ class Z80Simulator {
   void handleSetMetadata(const std::vector<uint8_t>& payload);
   void handleClose();
   void handleOpenDir(const std::vector<uint8_t>& payload);
-  void handleReadDir();
+  void handleReadDir(const std::vector<uint8_t>& payload);
+  void sendDirectoryEntry();
   void handleFsInfo();
   void handleMkdir(const std::vector<uint8_t>& payload);
   void handleDelete(const std::vector<uint8_t>& payload);
+  void handleRename(const std::vector<uint8_t>& payload);
   void handleMoveRename(const std::vector<uint8_t>& payload);
 
   HardwareSerial& serial_;
@@ -119,6 +127,7 @@ class Z80Simulator {
   unsigned long long bytesServed_ = 0;
 
   bool windowActive_ = false;
+  bool writeNewOnly_ = false;
 };
 
 }  // namespace host

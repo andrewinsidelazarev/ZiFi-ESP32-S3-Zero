@@ -47,6 +47,7 @@ $sources = @(
   'src\vfs_bridge.cpp',
   'src\vfs_client.cpp',
   'src\directory_cache.cpp',
+  'src\fat_time.cpp',
   'src\fat_allocation_cache.cpp',
   'src\spsc_ring.cpp',
   'src\protocol.cpp',

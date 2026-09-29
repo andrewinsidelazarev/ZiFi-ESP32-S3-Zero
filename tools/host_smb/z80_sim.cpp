@@ -40,6 +40,7 @@ constexpr uint8_t kVfsOpen = 0x50;
 constexpr uint8_t kVfsClose = 0x53;
 constexpr uint8_t kVfsDelete = 0x54;
 constexpr uint8_t kVfsMkdir = 0x55;
+constexpr uint8_t kVfsRename = 0x59;
 constexpr uint8_t kVfsMoveRename = 0x5D;
 constexpr uint8_t kVfsWriteWindow = 0x57;
 constexpr uint8_t kVfsReadWindow = 0x58;
@@ -112,6 +113,48 @@ bool fatDateTimeToFileTime(uint16_t date, uint16_t timeValue,
   // трактует те же поля как UTC и не добавляет часовой пояс машины Windows.
   return SystemTimeToFileTime(&parts, &output) != FALSE;
 }
+
+// Обратный перевод: FILETIME файла Windows -> штамп FAT по тому же правилу
+// (поля FAT — UTC, пояс машины не участвует). Пояс ESP задаётся самому
+// серверу и сдвигает время уже при переводе FAT -> UTC.
+bool fileTimeToFatStamp(const FILETIME& value, uint16_t& date,
+                        uint16_t& timeValue, uint8_t* tenth = nullptr) {
+  SYSTEMTIME parts = {};
+  if (!FileTimeToSystemTime(&value, &parts) || parts.wYear < 1980 ||
+      parts.wYear > 2107) {
+    return false;
+  }
+  date = static_cast<uint16_t>(((parts.wYear - 1980) << 9) |
+                               (parts.wMonth << 5) | parts.wDay);
+  timeValue = static_cast<uint16_t>((parts.wHour << 11) |
+                                    (parts.wMinute << 5) |
+                                    (parts.wSecond / 2));
+  if (tenth != nullptr) {
+    *tenth = static_cast<uint8_t>((parts.wSecond & 1) * 100 +
+                                  parts.wMilliseconds / 10);
+  }
+  return true;
+}
+
+// Новые плагины (2026-09-26) отдают даты: STAT — структуру FILEX
+// GET_METADATA, READDIR — хвост за именем. ZIFI_SIM_NO_DATES=1 возвращает
+// прежние ответы старых плагинов: на них сервер обязан жить без дат и,
+// главное, не слать OPEN=3, который старый FTP-плагин понял бы как запись.
+bool datesEnabled() {
+  static const bool enabled = std::getenv("ZIFI_SIM_NO_DATES") == nullptr;
+  return enabled;
+}
+
+// Пакетный READDIR — у того же нового SMB-плагина, что и даты. Старые плагины
+// (ZIFI_SIM_NO_DATES) и FTP-плагин (ZIFI_SIM_NO_DIR_BATCH) его не объявляют.
+bool directoryBatchEnabled() {
+  static const bool enabled =
+      datesEnabled() && std::getenv("ZIFI_SIM_NO_DIR_BATCH") == nullptr;
+  return enabled;
+}
+
+constexpr uint8_t kDirectoryCapabilityBatch = 0x01;
+constexpr uint8_t kDirectoryBatchMore = 2;
 
 }  // namespace
 
@@ -241,7 +284,7 @@ void Z80Simulator::handle(uint8_t command,
       handleOpenDir(payload);
       break;
     case kVfsReadDir:
-      handleReadDir();
+      handleReadDir(payload);
       break;
     case kVfsFsInfo:
       handleFsInfo();
@@ -251,6 +294,9 @@ void Z80Simulator::handle(uint8_t command,
       break;
     case kVfsDelete:
       handleDelete(payload);
+      break;
+    case kVfsRename:
+      handleRename(payload);
       break;
     case kVfsMoveRename:
       handleMoveRename(payload);
@@ -291,10 +337,25 @@ void Z80Simulator::handle(uint8_t command,
   }
 }
 
+// ZIFI_SIM_REFUSE_STAT=<путь>: STAT ровно этого пути отвечает отказом, хотя
+// объект есть (ошибка чтения, которую WC отдаёт как «не найдено»);
+// ZIFI_SIM_REFUSE_STAT_COUNT=N — только первые N раз.
 void Z80Simulator::handleStat(const std::vector<uint8_t>& payload) {
   const std::string path(reinterpret_cast<const char*>(payload.data()),
                          strnlen(reinterpret_cast<const char*>(payload.data()),
                                  payload.size()));
+  static int refusedStats = 0;
+  static const int refuseStatLimit = [] {
+    const char* text = std::getenv("ZIFI_SIM_REFUSE_STAT_COUNT");
+    return text == nullptr ? 0 : std::atoi(text);
+  }();
+  const char* refuseStat = std::getenv("ZIFI_SIM_REFUSE_STAT");
+  if (refuseStat != nullptr && path == refuseStat &&
+      (refuseStatLimit == 0 || refusedStats < refuseStatLimit)) {
+    ++refusedStats;
+    replyStatus(kVfsStat, kStatusFail);
+    return;
+  }
   // У реального FILEX корень не имеет собственной записи в родительском FAT-
   // каталоге. Эмулятор должен честно отвергать STAT("/"), чтобы SMB сам
   // синтезировал корень, как требуется протоколом.
@@ -310,11 +371,41 @@ void Z80Simulator::handleStat(const std::vector<uint8_t>& payload) {
   }
   const bool directory = fs::is_directory(target, code);
   const uintmax_t size = directory ? 0 : fs::file_size(target, code);
-  uint8_t answer[6] = {};
+  uint8_t answer[6 + 16] = {};
   answer[0] = kStatusOk;
   answer[1] = directory ? 1 : 0;
   writeLe32(answer + 2, static_cast<uint32_t>(size));
-  reply(kVfsStat, answer, sizeof(answer));
+  size_t length = 6;
+  WIN32_FILE_ATTRIBUTE_DATA info = {};
+  if (datesEnabled() &&
+      GetFileAttributesExW(target.c_str(), GetFileExInfoStandard, &info)) {
+    // Раскладка SET_METADATA/GET_METADATA: size, маска и значение атрибута,
+    // маска времён, доли, create time/date, access date, write time/date,
+    // применённый атрибут.
+    uint8_t* metadata = answer + 6;
+    metadata[0] = 16;
+    metadata[1] = 0x27;
+    metadata[2] = static_cast<uint8_t>(info.dwFileAttributes & 0x27U);
+    metadata[3] = 0x07;
+    uint16_t date = 0;
+    uint16_t timeValue = 0;
+    uint8_t tenth = 0;
+    if (fileTimeToFatStamp(info.ftCreationTime, date, timeValue, &tenth)) {
+      metadata[4] = tenth;
+      writeLe16(metadata + 5, timeValue);
+      writeLe16(metadata + 7, date);
+    }
+    if (fileTimeToFatStamp(info.ftLastAccessTime, date, timeValue)) {
+      writeLe16(metadata + 9, date);
+    }
+    if (fileTimeToFatStamp(info.ftLastWriteTime, date, timeValue)) {
+      writeLe16(metadata + 11, timeValue);
+      writeLe16(metadata + 13, date);
+    }
+    metadata[15] = metadata[2];
+    length += 16;
+  }
+  reply(kVfsStat, answer, length);
 }
 
 // OPEN: [режим][путь,0]. Ответ — [статус][возможности][возможности FILEX].
@@ -346,6 +437,28 @@ void Z80Simulator::handleOpen(const std::vector<uint8_t>& payload) {
   windowActive_ = false;
   windowData_.clear();
 
+  // ZIFI_SIM_FAIL_READ=<путь>: OPEN на чтение этого пути отказывает (сбой
+  // чтения карты); ZIFI_SIM_FAIL_READ_COUNT=N — только первые N раз.
+  static int failedReads = 0;
+  static const int failReadLimit = [] {
+    const char* text = std::getenv("ZIFI_SIM_FAIL_READ_COUNT");
+    return text == nullptr ? 0 : std::atoi(text);
+  }();
+  const char* failRead = std::getenv("ZIFI_SIM_FAIL_READ");
+  if (mode == 0 && failRead != nullptr && path == failRead &&
+      (failReadLimit == 0 || failedReads < failReadLimit)) {
+    ++failedReads;
+    replyStatus(kVfsOpen, kStatusFail);
+    return;
+  }
+
+  if (mode == 1 && writeNewOnly_ && fs::exists(target, code)) {
+    // Плагин обновлятора: занятое имя — отказ MKFILE, прежний файл цел.
+    std::printf("[FILEX] OPEN refused: exists %s\n", path.c_str());
+    std::fflush(stdout);
+    replyStatus(kVfsOpen, kStatusFail);
+    return;
+  }
   if (mode == 1) {
     // Замена: создаём пустой файл, старое содержимое отбрасывается.
     std::FILE* file = nullptr;
@@ -494,9 +607,31 @@ void Z80Simulator::handleWriteWindow(const std::vector<uint8_t>& payload) {
   }
 
   uint8_t answer[4] = {kStatusOk, sequence, 0, 0};
+  // ZIFI_SIM_FAIL_WRITE=N: первые N окон записи (all — все) отвергаются, как
+  // при отказе записи SD; на «карту» они не ложатся.
+  static int failedWindows = 0;
+  static const int failWindows = [] {
+    const char* text = std::getenv("ZIFI_SIM_FAIL_WRITE");
+    if (text == nullptr) {
+      return 0;
+    }
+    return std::strcmp(text, "all") == 0 ? INT32_MAX : std::atoi(text);
+  }();
   const bool sane = windowData_.size() == windowTotal_ &&
-                    crc16(windowData_.data(), windowData_.size()) == sum;
+                    crc16(windowData_.data(), windowData_.size()) == sum &&
+                    failedWindows++ >= failWindows;
   if (sane) {
+    // ZIFI_SIM_CORRUPT_WRITE=N: N-е принятое окно ложится на «карту» с одним
+    // испорченным байтом, хотя по линии пришло верным и подтверждается. Так
+    // стенд изображает сбой записи SD, который ловит только чтение обратно.
+    static int windowsWritten = 0;
+    static const int corruptAt = [] {
+      const char* text = std::getenv("ZIFI_SIM_CORRUPT_WRITE");
+      return text == nullptr ? 0 : std::atoi(text);
+    }();
+    if (++windowsWritten == corruptAt && !windowData_.empty()) {
+      windowData_[windowData_.size() / 2] ^= 0x5A;
+    }
     if (writeDelayMs_ != 0 && offset_ >= writeDelayOffset_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(writeDelayMs_));
     }
@@ -647,6 +782,23 @@ void Z80Simulator::handleClose() {
   const bool rejectSequentialCommit =
       openValid_ && openMode_ == 1 && sequentialWriteSeen_ &&
       openPath_.filename() == "sequential_close_failure.bin";
+  // ZIFI_SIM_WRITE_TAIL=N: первый записанный файл получает N лишних байтов —
+  // верное начало с хвостом, как при сбое записи длины на карту.
+  static int tail = [] {
+    const char* text = std::getenv("ZIFI_SIM_WRITE_TAIL");
+    return text == nullptr ? 0 : std::atoi(text);
+  }();
+  if (openValid_ && openMode_ == 1 && tail > 0) {
+    std::FILE* file = nullptr;
+    fopen_s(&file, openPath_.string().c_str(), "ab");
+    if (file != nullptr) {
+      for (int index = 0; index < tail; ++index) {
+        std::fputc(0xEE, file);
+      }
+      std::fclose(file);
+    }
+    tail = 0;
+  }
   openValid_ = false;
   openMode_ = 0;
   sequentialWriteSeen_ = false;
@@ -656,6 +808,8 @@ void Z80Simulator::handleClose() {
               rejectSequentialCommit ? kStatusFail : kStatusOk);
 }
 
+// ZIFI_SIM_REFUSE_OPENDIR=<путь>: OPENDIR ровно этого пути отвечает отказом,
+// хотя каталог есть, — так опись обновлятора ошибочно сочтёт его пустым.
 void Z80Simulator::handleOpenDir(const std::vector<uint8_t>& payload) {
   const std::string path(reinterpret_cast<const char*>(payload.data()),
                          strnlen(reinterpret_cast<const char*>(payload.data()),
@@ -664,34 +818,86 @@ void Z80Simulator::handleOpenDir(const std::vector<uint8_t>& payload) {
   const fs::path target = resolve(path);
   entries_.clear();
   entryIndex_ = 0;
-  if (!fs::is_directory(target, code)) {
+  const char* refuse = std::getenv("ZIFI_SIM_REFUSE_OPENDIR");
+  if (!fs::is_directory(target, code) ||
+      (refuse != nullptr && path == refuse)) {
     replyStatus(kVfsOpenDir, kStatusFail);
     return;
   }
+  // ZIFI_SIM_HIDE_ENTRY=<имя>: READDIR это имя не отдаёт, хотя файл есть —
+  // опись сочтёт его отсутствующим (повреждённый каталог).
+  const char* hide = std::getenv("ZIFI_SIM_HIDE_ENTRY");
   for (const auto& entry : fs::directory_iterator(target, code)) {
     Entry item;
     item.name = entry.path().filename().string();
+    if (hide != nullptr && item.name == hide) {
+      continue;
+    }
     item.directory = entry.is_directory(code);
     item.size = item.directory
                     ? 0
                     : static_cast<uint32_t>(entry.file_size(code));
+    WIN32_FILE_ATTRIBUTE_DATA info = {};
+    if (GetFileAttributesExW(entry.path().c_str(), GetFileExInfoStandard,
+                             &info)) {
+      fileTimeToFatStamp(info.ftLastWriteTime, item.writeDate,
+                         item.writeTime);
+    }
     entries_.push_back(std::move(item));
+  }
+  if (directoryBatchEnabled()) {
+    const uint8_t answer[2] = {kStatusOk, kDirectoryCapabilityBatch};
+    reply(kVfsOpenDir, answer, sizeof(answer));
+    return;
   }
   replyStatus(kVfsOpenDir, kStatusOk);
 }
 
-void Z80Simulator::handleReadDir() {
-  if (entryIndex_ >= entries_.size()) {
-    // Конец каталога сервер узнаёт по ненулевому статусу — так же, как на Z80.
-    replyStatus(kVfsReadDir, kStatusFail);
+void Z80Simulator::handleReadDir(const std::vector<uint8_t>& payload) {
+  // Пустой запрос — одна запись; [число] — пачка отдельными кадрами и итог.
+  const size_t wanted = directoryBatchEnabled() && !payload.empty()
+                            ? payload[0]
+                            : 0;
+  if (wanted == 0) {
+    if (entryIndex_ >= entries_.size()) {
+      // Конец каталога сервер узнаёт по ненулевому статусу — так же, как на Z80.
+      replyStatus(kVfsReadDir, kStatusFail);
+      return;
+    }
+    sendDirectoryEntry();
     return;
   }
+  for (size_t sent = 0; sent < wanted; ++sent) {
+    if (entryIndex_ >= entries_.size()) {
+      replyStatus(kVfsReadDir, kStatusFail);
+      return;
+    }
+    // Задержка каталога имитирует FINDNEXT: в пачке — на каждую запись.
+    if (sent != 0 && directoryDelayMs_ != 0) {
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(directoryDelayMs_));
+    }
+    sendDirectoryEntry();
+  }
+  replyStatus(kVfsReadDir, kDirectoryBatchMore);
+}
+
+void Z80Simulator::sendDirectoryEntry() {
   const Entry& item = entries_[entryIndex_++];
-  std::vector<uint8_t> answer(6 + item.name.size());
+  // Новый плагин дописывает за именем [0][дата LE16][время LE16] — поля API 58
+  // с битом 6, время изменения.
+  const size_t tail = datesEnabled() ? 5 : 0;
+  std::vector<uint8_t> answer(6 + item.name.size() + tail);
   answer[0] = kStatusOk;
   answer[1] = item.directory ? 1 : 0;
   writeLe32(answer.data() + 2, item.size);
   std::memcpy(answer.data() + 6, item.name.data(), item.name.size());
+  if (tail != 0) {
+    uint8_t* end = answer.data() + 6 + item.name.size();
+    end[0] = 0;
+    writeLe16(end + 1, item.writeDate);
+    writeLe16(end + 3, item.writeTime);
+  }
   reply(kVfsReadDir, answer.data(), answer.size());
 }
 
@@ -754,16 +960,114 @@ void Z80Simulator::handleMkdir(const std::vector<uint8_t>& payload) {
   replyStatus(kVfsMkdir, created ? kStatusOk : kStatusFail);
 }
 
+// ZIFI_SIM_FAIL_DELETE=<имя>: удаление файла с этим именем (в любом каталоге)
+// отказывает, файл остаётся.
 void Z80Simulator::handleDelete(const std::vector<uint8_t>& payload) {
   const std::string path(reinterpret_cast<const char*>(payload.data()),
                          strnlen(reinterpret_cast<const char*>(payload.data()),
                                  payload.size()));
+  std::printf("[FILEX] DELETE path=%s\n", path.c_str());
+  std::fflush(stdout);
+  const fs::path target = resolve(path);
+  const char* failDelete = std::getenv("ZIFI_SIM_FAIL_DELETE");
+  if (failDelete != nullptr && target.filename().string() == failDelete) {
+    replyStatus(kVfsDelete, kStatusFail);
+    return;
+  }
   std::error_code code;
-  const bool removed = fs::remove(resolve(path), code);
+  const bool removed = fs::remove(target, code);
   replyStatus(kVfsDelete, removed ? kStatusOk : kStatusFail);
 }
 
+// RENAME API 74 Wild Commander: [атрибут][старый полный путь,0][новое имя,0].
+// Имя меняется внутри того же каталога; занятое имя WC не заменяет — стенд
+// тоже отказывает, чтобы клиент обязан был сначала удалить старый файл.
+// ZIFI_SIM_FAIL_RENAME=N: первые N переименований отвергаются, как при сбое SD;
+// ZIFI_SIM_FAIL_RENAME_AT=K — только K-е (с единицы). Ответ — код
+// ZIFI_SIM_RENAME_CODE (по умолчанию 1; 255 — у WC не удался и откат).
+// ZIFI_SIM_RENAME_LOSE_AT=K: K-е переименование теряет запись — ни старого,
+// ни нового имени (удаление прежней записи легло, откат убрал новую), а
+// ответ — тот же код отказа, как у WC Improved с A=0.
+void Z80Simulator::handleRename(const std::vector<uint8_t>& payload) {
+  static int renames = 0;
+  static const int failFirst = [] {
+    const char* text = std::getenv("ZIFI_SIM_FAIL_RENAME");
+    return text == nullptr ? 0 : std::atoi(text);
+  }();
+  static const int failAt = [] {
+    const char* text = std::getenv("ZIFI_SIM_FAIL_RENAME_AT");
+    return text == nullptr ? 0 : std::atoi(text);
+  }();
+  static const uint8_t failCode = [] {
+    const char* text = std::getenv("ZIFI_SIM_RENAME_CODE");
+    return static_cast<uint8_t>(text == nullptr ? kStatusFail : std::atoi(text));
+  }();
+  static const int loseAt = [] {
+    const char* text = std::getenv("ZIFI_SIM_RENAME_LOSE_AT");
+    return text == nullptr ? 0 : std::atoi(text);
+  }();
+  ++renames;
+  if (renames <= failFirst || renames == failAt) {
+    replyStatus(kVfsRename, failCode);
+    return;
+  }
+  if (renames == loseAt && payload.size() >= 4) {
+    const char* lost = reinterpret_cast<const char*>(payload.data() + 1);
+    std::error_code lostCode;
+    fs::remove(resolve(lost), lostCode);
+    replyStatus(kVfsRename, failCode);
+    return;
+  }
+  if (payload.size() < 4 || payload.back() != 0) {
+    replyStatus(kVfsRename, kStatusFail);
+    return;
+  }
+  const char* oldPath = reinterpret_cast<const char*>(payload.data() + 1);
+  const size_t oldLength = strlen(oldPath);
+  if (1 + oldLength + 1 >= payload.size()) {
+    replyStatus(kVfsRename, kStatusFail);
+    return;
+  }
+  const std::string newName(
+      reinterpret_cast<const char*>(payload.data() + 1 + oldLength + 1));
+  if (newName.empty() || newName.find('/') != std::string::npos ||
+      newName.find('\\') != std::string::npos) {
+    replyStatus(kVfsRename, kStatusFail);
+    return;
+  }
+  std::error_code code;
+  const fs::path source = resolve(oldPath);
+  const fs::path target = source.parent_path() / fs::path(newName);
+  if (!fs::exists(source, code) || fs::exists(target, code)) {
+    replyStatus(kVfsRename, kStatusFail);
+    return;
+  }
+  fs::rename(source, target, code);
+  replyStatus(kVfsRename, code ? kStatusFail : kStatusOk);
+}
+
+// Помехи для обновлятора WC (FILEX MOVE_RENAME в WC Improved):
+//   ZIFI_SIM_NO_FILEX_MOVE — у WC нет FILEX MOVE, плагин отвечает #FE;
+//   ZIFI_SIM_FAIL_MOVE=<статус> — первый MOVE отвечает этим статусом FILEX,
+//     ничего не делая; с ZIFI_SIM_FAIL_MOVE_AFTER — сделав перенос (ответ о
+//     сбое, хотя запись легла, или потерянный ответ).
 void Z80Simulator::handleMoveRename(const std::vector<uint8_t>& payload) {
+  static const bool unsupported = std::getenv("ZIFI_SIM_NO_FILEX_MOVE") != nullptr;
+  static int failStatus = [] {
+    const char* text = std::getenv("ZIFI_SIM_FAIL_MOVE");
+    return text == nullptr ? 0 : std::atoi(text);
+  }();
+  static const bool failAfter = std::getenv("ZIFI_SIM_FAIL_MOVE_AFTER") != nullptr;
+  if (unsupported) {
+    replyStatus(kVfsMoveRename, 0xFE);
+    return;
+  }
+  if (failStatus != 0 && !failAfter) {
+    const uint8_t status = static_cast<uint8_t>(failStatus);
+    failStatus = 0;
+    replyStatus(kVfsMoveRename, status);
+    return;
+  }
   if (payload.size() < 4) {
     replyStatus(kVfsMoveRename, kStatusFail);
     return;
@@ -796,6 +1100,12 @@ void Z80Simulator::handleMoveRename(const std::vector<uint8_t>& payload) {
     }
   }
   fs::rename(srcPath, dstPath, code);
+  if (!code && failStatus != 0 && failAfter) {
+    const uint8_t status = static_cast<uint8_t>(failStatus);
+    failStatus = 0;
+    replyStatus(kVfsMoveRename, status);
+    return;
+  }
   replyStatus(kVfsMoveRename, code ? kStatusFail : kStatusOk);
 }
 

@@ -48,6 +48,15 @@ struct VfsResult {
   uint8_t status = 0;
   uint8_t appliedAttributes = 0;
   uint32_t size = 0;
+  // Даты записи для kStat и kReadDirectory — см. VfsEntry.
+  uint16_t writeDate = 0;
+  uint16_t writeTime = 0;
+  bool hasMetadata = false;
+  uint8_t attributes = 0;
+  uint8_t createTenth = 0;
+  uint16_t createTime = 0;
+  uint16_t createDate = 0;
+  uint16_t accessDate = 0;
   uint32_t transferred = 0;
   char name[256] = {};
   char error[64] = {};
@@ -78,6 +87,9 @@ class VfsBridge {
                         bool directory, bool replace);
   bool submitMetadata(const VfsMetadata& metadata);
   bool takeResult(VfsResult& result);
+  // Пауза ожидающего ядра 0: до timeoutMs, но готовый результат будит сразу.
+  // Сам результат забирает takeResult.
+  void waitForResult(uint32_t timeoutMs);
   // Дождаться результата брошенного обмена и забрать его жетон. Пока core 1
   // не вернул результат, общий Exchange трогать нельзя: принудительный сброс
   // флага позволил бы следующему запросу перезаписать ещё используемую память.
@@ -95,6 +107,9 @@ class VfsBridge {
 
   // Интерфейс ядра 1. Вызывать часто из loopTask до обычного опроса UART.
   void pollCore1();
+  // Пауза цикла ядра 1: до timeoutMs, но заявка ядра 0 будит сразу. Прежний
+  // delay(1) добавлял к каждому VFS-обмену в среднем полмиллисекунды простоя.
+  void waitForRequest(uint32_t timeoutMs);
 
   bool buffersInPsram() const { return buffersInPsram_; }
   size_t ringCapacity() const { return networkToVfs_.capacity(); }
@@ -130,6 +145,7 @@ class VfsBridge {
   };
 
   bool allocateRings(bool psramAvailable);
+  static void copyDates(const VfsEntry& entry, VfsResult& result);
   void processCore1();
   void processRead();
   void processWrite();

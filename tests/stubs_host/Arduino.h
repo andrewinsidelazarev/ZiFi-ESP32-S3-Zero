@@ -142,6 +142,8 @@ class EspClass {
   // Стабильный «MAC» нужен для устойчивого WSD EndpointReference устройства.
   uint64_t getEfuseMac() const { return 0x00A1B2C3D4E5ULL; }
   uint32_t getFreeHeap() const { return 200u * 1024u; }
+  // FTP-сервер называет свободную PSRAM в приветствии.
+  uint32_t getFreePsram() const { return 2u * 1024u * 1024u; }
   void restart() { std::exit(0); }
 };
 

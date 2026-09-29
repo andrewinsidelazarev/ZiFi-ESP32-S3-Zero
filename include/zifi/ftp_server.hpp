@@ -30,6 +30,12 @@ class FtpServer {
   void stop();
   void poll();
 
+  // Пояс из zifi.ini (time:, целые часы). В FAT хранится местное время, а
+  // MDTM, MFMT и MLSD по RFC 3659 передают UTC: пояс нужен для перевода.
+  void setTimezoneHours(int8_t hours) {
+    timezoneSeconds_ = static_cast<int32_t>(hours) * 3600;
+  }
+
   bool running() const { return running_; }
   uint16_t port() const { return port_; }
   size_t makeRamStats(uint8_t* output, size_t capacity) const;
@@ -40,6 +46,9 @@ class FtpServer {
   static constexpr size_t kDataChunk = 1024;
 
   using WaitHook = void (*)(void* context);
+
+  // LIST — строки в духе «ls -l», NLST — только имена, MLSD — факты RFC 3659.
+  enum class ListFormat : uint8_t { kLong, kNames, kMachine };
 
   struct Session {
     Session();
@@ -102,12 +111,22 @@ class FtpServer {
   bool requestVfs(VfsOperation operation, const char* path, uint32_t value,
                   VfsResult& result, uint32_t timeoutMs,
                   WaitHook hook = nullptr, void* hookContext = nullptr);
+  bool awaitVfs(VfsOperation operation, VfsResult& result, uint32_t timeoutMs,
+                WaitHook hook = nullptr, void* hookContext = nullptr);
+  bool requestMetadata(const VfsMetadata& metadata, VfsResult& result);
   bool statPath(const char* path, VfsResult& result);
   bool resetBuffers();
 
   void changeDirectory(Session& session, const char* argument);
   void sendSize(Session& session, const char* argument);
-  void list(Session& session, bool namesOnly);
+  void list(Session& session, ListFormat format, const char* argument);
+  void listSingle(Session& session, const char* argument);
+  void sendModificationTime(Session& session, const char* argument);
+  void setModificationTime(Session& session, const char* argument);
+  void formatListDate(const VfsResult& entry, char* output,
+                      size_t capacity) const;
+  int formatFacts(const VfsResult& entry, const char* name, char* output,
+                  size_t capacity) const;
   void retrieve(Session& session, const char* argument);
   void store(Session& session, const char* argument);
   void deleteFile(Session& session, const char* argument);
@@ -125,6 +144,7 @@ class FtpServer {
 
   bool running_;
   uint16_t port_;
+  int32_t timezoneSeconds_;
 
   char user_[33];
   char password_[65];

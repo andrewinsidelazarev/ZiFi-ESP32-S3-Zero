@@ -4,7 +4,14 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include <new>
+
+#if defined(ESP_PLATFORM)
+#include <esp_heap_caps.h>
+#endif
 
 namespace zifi {
 namespace {
@@ -40,7 +47,12 @@ VfsClient::VfsClient(UartTransport& transport)
       writeFailed_(false),
       fatCache_(),
       fsInfoCache_(),
-      fsInfoValid_(false) {
+      fsInfoValid_(false),
+      directoryBatch_(false),
+      directoryEnded_(false),
+      directoryCount_(0),
+      directoryNext_(0),
+      directoryEntries_(nullptr) {
   snprintf(lastError_, sizeof(lastError_), "none");
 }
 
@@ -49,6 +61,20 @@ void VfsClient::beginFatCache(bool psramAvailable) {
   // счётчик свободных кластеров относятся к прежнему тому.
   fsInfoValid_ = false;
   fatCache_.begin(psramAvailable);
+  if (directoryEntries_ == nullptr && psramAvailable) {
+    const size_t bytes = sizeof(VfsEntry) * kDirectoryBatchEntries;
+#if defined(ESP_PLATFORM)
+    void* memory = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    void* memory = malloc(bytes);
+#endif
+    if (memory != nullptr) {
+      directoryEntries_ = static_cast<VfsEntry*>(memory);
+      for (size_t index = 0; index < kDirectoryBatchEntries; ++index) {
+        new (&directoryEntries_[index]) VfsEntry();
+      }
+    }
+  }
 }
 
 void VfsClient::setError(const char* format, ...) {
@@ -117,10 +143,37 @@ bool VfsClient::stat(const char* path, VfsEntry& entry) {
   entry.isDirectory = response.data[1] != 0;
   entry.size = readLe32(response.data + 2);
   entry.name[0] = 0;
+  entry.writeDate = 0;
+  entry.writeTime = 0;
+  entry.hasMetadata = false;
+  entry.attributes = 0;
+  entry.createTenth = 0;
+  entry.createTime = 0;
+  entry.createDate = 0;
+  entry.accessDate = 0;
+  // Новый плагин дописывает структуру FILEX GET_METADATA (16 байт, первый —
+  // её размер). Старый отвечает шестью байтами, и даты остаются неизвестными.
+  if (response.length >= 6 + kMetadataSize &&
+      response.data[6] == kMetadataSize) {
+    const uint8_t* metadata = response.data + 6;
+    entry.hasMetadata = true;
+    entry.attributes = metadata[2];
+    entry.createTenth = metadata[4];
+    entry.createTime = readLe16(metadata + 5);
+    entry.createDate = readLe16(metadata + 7);
+    entry.accessDate = readLe16(metadata + 9);
+    entry.writeTime = readLe16(metadata + 11);
+    entry.writeDate = readLe16(metadata + 13);
+  }
   return true;
 }
 
 bool VfsClient::openDirectory(const char* path) {
+  // Новый обход: записи прежней пачки к нему не относятся.
+  directoryBatch_ = false;
+  directoryEnded_ = false;
+  directoryCount_ = 0;
+  directoryNext_ = 0;
   PacketView response;
   if (!pathRequest(kVfsOpenDir, path, kNormalTimeoutMs, response)) {
     return false;
@@ -129,22 +182,104 @@ bool VfsClient::openDirectory(const char* path) {
     setError("opendir-%u", response.length ? response.data[0] : 255);
     return false;
   }
+  // Старый плагин отвечает одним статусом — тогда по одной записи за запрос.
+  directoryBatch_ = directoryEntries_ != nullptr && response.length >= 2 &&
+                    (response.data[1] & kDirectoryCapabilityBatch) != 0;
   return true;
 }
 
 bool VfsClient::readDirectory(VfsEntry& entry, bool& atEnd) {
   atEnd = false;
+  if (directoryBatch_) {
+    if (directoryNext_ >= directoryCount_) {
+      if (directoryEnded_) {
+        atEnd = true;
+        return true;
+      }
+      if (!fetchDirectoryBatch()) {
+        return false;
+      }
+      if (directoryNext_ >= directoryCount_) {
+        atEnd = true;
+        return true;
+      }
+    }
+    entry = directoryEntries_[directoryNext_++];
+    return true;
+  }
   PacketView response;
   if (!request(kVfsReadDir, nullptr, 0, kNormalTimeoutMs, response)) {
     return false;
   }
-  if (response.length < 6 || response.data[0] != 0) {
-    atEnd = true;
+  if (response.length >= 1 && response.data[0] != 0) {
+    atEnd = true;  // ненулевой статус — конец каталога
     return true;
   }
+  if (response.length < 6) {
+    // Запись короче заголовка — сбой обмена, а не конец каталога: иначе
+    // перечень молча обрезался бы.
+    setError("readdir-short");
+    return false;
+  }
+  parseDirectoryEntry(response, entry);
+  return true;
+}
+
+bool VfsClient::fetchDirectoryBatch() {
+  directoryCount_ = 0;
+  directoryNext_ = 0;
+  const uint8_t wanted = static_cast<uint8_t>(kDirectoryBatchEntries);
+  PacketView response;
+  if (!request(kVfsReadDir, &wanted, 1, kNormalTimeoutMs, response)) {
+    return false;
+  }
+  // Записи идут кадрами READDIR прежнего вида, за ними — кадр-итог: статус 2 —
+  // пачка кончилась, каталог нет; любой другой ненулевой — конец каталога.
+  for (;;) {
+    if (response.length >= 6 && response.data[0] == 0) {
+      if (directoryCount_ >= kDirectoryBatchEntries) {
+        setError("readdir-batch-overflow");
+        return false;
+      }
+      parseDirectoryEntry(response, directoryEntries_[directoryCount_++]);
+    } else {
+      // Итог пачки — только ненулевой статус. Пустой кадр или запись короче
+      // заголовка — сбой обмена: концом каталога его не считаем, иначе
+      // перечень молча обрезался бы.
+      if (response.length < 1 || response.data[0] == 0) {
+        setError("readdir-short");
+        return false;
+      }
+      // Пустая пачка без конца каталога была бы вечным циклом — считаем концом.
+      if (response.data[0] != kDirectoryBatchMore || directoryCount_ == 0) {
+        directoryEnded_ = true;
+      }
+      return true;
+    }
+    if (!transport_.waitFor(kVfsReadDir, kNormalTimeoutMs, response, nullptr,
+                            nullptr, handleUnexpected, this)) {
+      setError("timeout-%02x", kVfsReadDir);
+      return false;
+    }
+  }
+}
+
+void VfsClient::parseDirectoryEntry(const PacketView& response,
+                                    VfsEntry& entry) {
   entry.isDirectory = response.data[1] != 0;
   entry.size = readLe32(response.data + 2);
+  entry.writeDate = 0;
+  entry.writeTime = 0;
+  entry.hasMetadata = false;
   size_t nameLength = response.length - 6;
+  // Новый плагин дописывает за именем [0][дата LE16][время LE16]. У старого
+  // на месте этого нуля стоит буква имени: при длине ответа от 12 байт имя в
+  // нём не короче шести символов, а нулей в имени не бывает.
+  if (response.length >= 12 && response.data[response.length - 5] == 0) {
+    entry.writeDate = readLe16(response.data + response.length - 4);
+    entry.writeTime = readLe16(response.data + response.length - 2);
+    nameLength -= 5;
+  }
   if (nameLength >= sizeof(entry.name)) {
     nameLength = sizeof(entry.name) - 1;
   }
@@ -157,7 +292,6 @@ bool VfsClient::readDirectory(VfsEntry& entry, bool& atEnd) {
           entry.name[nameLength - 1] == ' ')) {
     entry.name[--nameLength] = 0;
   }
-  return true;
 }
 
 void VfsClient::resetWriteState(bool active) {

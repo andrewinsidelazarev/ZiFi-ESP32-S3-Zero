@@ -6,19 +6,43 @@
 WC_API      equ #6006
 WC_PAGE2    equ #6002
 WC_PAGE3    equ #6003
+WC_FRAMES   equ #6009                   ; кадровый таймер WC, +1 в каждом прерывании
+WC_HEI      equ #600E                   ; высота текстового экрана: 25, 30 или 36
 
 FN_MNGC_PL  equ #00                    ; отобразить страницу плагина в #C000
 FN_PRWOW    equ #01                    ; открыть окно и сохранить фон
 FN_RRESB    equ #02                    ; восстановить сохранённую область экрана
+FN_PRSRW    equ #03                    ; строка в окно: HL, BC длина, D/E = Y/X
+FN_PRIAT    equ #04                    ; сразу за PRSRW: цвет выведенной строки
 FN_TXTPR    equ #0B                    ; вывести текст в окно
+FN_TURBOPL  equ #0E                    ; частота Z80: B=0, C=0/1/2 — 3,5/7/14 МГц; B=#FF — как в WC
 FN_GEDPL    equ #0F                    ; получить параметры текущего дисплея
+; Клавиши 16..28: NZ — нажата. Автоповтор общий: первое нажатие, пауза
+; 25 кадров, затем повтор; каждую клавишу проверять не чаще раза за кадр.
+FN_SPACE    equ #10
+FN_UP       equ #11
+FN_DOWN     equ #12
+FN_ENTER    equ #16
 FN_ESC      equ #17                    ; проверить клавишу Esc
+FN_PGUP     equ #19
+FN_PGDN     equ #1A
+FN_HOME     equ #1B
+FN_END      equ #1C
+FN_KBSCN    equ #2A                    ; символ клавиши; A'=1 — сырая таблица
+FN_WAITUP   equ #2E                    ; ждать отпускания всех клавиш
 FN_LOAD512  equ #30                    ; прочитать сектор открытого файла
 FN_SAVE512  equ #31                    ; записать сектор открытого файла
 FN_TENTRY   equ #33                    ; скопировать текущую FAT ENTRY (32 байта)
 FN_STREAM   equ #39                    ; выбрать/создать файловый поток
 FN_ADIR     equ #38                    ; начать перечисление каталога
 FN_FINDNEXT equ #3A                    ; получить следующую запись каталога
+; Маска API 58 для FN_FINDNEXT. Бит 6 (WC Improved с 2026-09-26) отдаёт в
+; полях битов 4/3 время и дату ИЗМЕНЕНИЯ записи (+22/+24) вместо создания,
+; раскладка ответа та же. Старое ядро бит не знает и отдаёт дату создания.
+FINDNEXT_WRITE_TIME equ %01000000
+FINDNEXT_TIME       equ %00010000
+FINDNEXT_DATE       equ %00001000
+FINDNEXT_SIZE       equ %00000100
 FN_FENTRY   equ #3B                    ; найти FAT-запись файла или каталога
 FN_GFILE    equ #3E                    ; открыть найденный файл
 FN_GDIR     equ #3F                    ; войти в найденный каталог
@@ -60,6 +84,13 @@ FILEX_OP_GET_FS_INFO    equ 4
 FILEX_OP_MOVE_RENAME    equ 5
 FILEX_OP_SET_METADATA   equ 6
 FILEX_OP_READ_FAT       equ 7
+FILEX_CAP_MOVE_RENAME   equ %00010000   ; QUERY_CAPS, байт result_count
+FILEX_CAP_SET_METADATA  equ %00100000   ; QUERY_CAPS, байт result_count
+; С WC Improved 2026-09-26: атрибут и времена записи последнего FENTRY в той
+; же 16-байтовой структуре, что у SET_METADATA; на диск ничего не пишет.
+; Есть, если QUERY_CAPS ставит FILEX_CAP2_GET_METADATA в байт result_count+1.
+FILEX_OP_GET_METADATA   equ 8
+FILEX_CAP2_GET_METADATA equ %00000001
 
 FILEX_STATUS_OK         equ #00
 FILEX_STATUS_EOF        equ #01

@@ -73,6 +73,9 @@ WC_DELETE:
 WC_APPEND:
         ld a,FN_APPEND
         jp WC_API
+WC_FILEX:
+        ld a,FN_FILEX
+        jp WC_API
 WC_ADIR:
         ex af,af'
         ld a,FN_ADIR

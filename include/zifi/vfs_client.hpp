@@ -11,6 +11,18 @@ namespace zifi {
 struct VfsEntry {
   bool isDirectory = false;
   uint32_t size = 0;
+  // Штамп изменения записи FAT — местное время, как его пишут WC и Windows.
+  // Дата 0 — неизвестен: старый плагин или старое ядро WC.
+  uint16_t writeDate = 0;
+  uint16_t writeTime = 0;
+  // Остальные времена и атрибут есть только в ответе STAT нового плагина
+  // (FILEX GET_METADATA). В листинге каталога их нет.
+  bool hasMetadata = false;
+  uint8_t attributes = 0;
+  uint8_t createTenth = 0;
+  uint16_t createTime = 0;
+  uint16_t createDate = 0;
+  uint16_t accessDate = 0;
   char name[256] = {};
 };
 
@@ -109,6 +121,8 @@ class VfsClient {
 
  private:
   static constexpr size_t kBlockSize = 512;
+  // Структура FILEX SET_METADATA/GET_METADATA в ответе STAT.
+  static constexpr uint8_t kMetadataSize = 16;
   static constexpr size_t kFirstData = 248;
   static constexpr size_t kContinueData = 252;
   static constexpr size_t kWriteWindowHeader = 8;
@@ -138,6 +152,16 @@ class VfsClient {
   void resetWriteState(bool active);
   void setError(const char* format, ...);
   static void handleUnexpected(void* context, const PacketView& packet);
+  bool fetchDirectoryBatch();
+  static void parseDirectoryEntry(const PacketView& response, VfsEntry& entry);
+
+  // Пакетный READDIR: плагин объявляет его байтом возможностей в ответе
+  // OPENDIR. Один запрос приносит до kDirectoryBatchEntries записей отдельными
+  // кадрами — Z80 ищет следующую запись, пока предыдущая идёт по линии, — и
+  // вместо обмена «запрос — ответ» на каждую запись остаётся один на пачку.
+  static constexpr uint8_t kDirectoryCapabilityBatch = 0x01;
+  static constexpr uint8_t kDirectoryBatchMore = 2;
+  static constexpr size_t kDirectoryBatchEntries = 16;
 
   UartTransport& transport_;
   char lastError_[64];
@@ -160,6 +184,14 @@ class VfsClient {
   // свободное место поддерживается точным через noteFileResized.
   VfsFsInfo fsInfoCache_;
   bool fsInfoValid_;
+  // Пачка записей каталога, ещё не отданных мосту. Новый OPENDIR её сбрасывает.
+  // Сама пачка лежит в PSRAM: у Application жёсткий бюджет статической памяти.
+  // Без PSRAM каталог читается, как прежде, по одной записи.
+  bool directoryBatch_;
+  bool directoryEnded_;
+  uint8_t directoryCount_;
+  uint8_t directoryNext_;
+  VfsEntry* directoryEntries_;
 };
 
 }  // namespace zifi

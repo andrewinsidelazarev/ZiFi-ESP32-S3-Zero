@@ -7,7 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
+#include "zifi/fat_time.hpp"
 #include "zifi/protocol.hpp"
 
 namespace zifi {
@@ -50,6 +52,23 @@ size_t minimum(size_t left, size_t right) {
   return left < right ? left : right;
 }
 
+// Часы ESP идут от NTP; до синхронизации time() показывает 1970-й. Раньше
+// этой отметки «сейчас» считается неизвестным.
+constexpr time_t kClockValidSince = 1577836800;  // 2020-01-01
+// Строка LIST показывает время для файлов моложе полугода, как «ls -l».
+constexpr int64_t kListRecentSeconds = 183LL * 86400;
+// Небольшой разброс часов ПК и ZX не должен переводить свежий файл в «будущий».
+constexpr int64_t kListFutureSkewSeconds = 3600;
+// FILEX SET_METADATA: time_mask бит 2 — время и дата изменения.
+constexpr uint8_t kMetadataWriteTime = 0x04;
+
+FatStamp writeStamp(const VfsResult& entry) {
+  FatStamp stamp;
+  stamp.date = entry.writeDate;
+  stamp.time = entry.writeTime;
+  return stamp;
+}
+
 }  // namespace
 
 FtpServer::Session::Session()
@@ -84,6 +103,7 @@ FtpServer::FtpServer(VfsBridge& bridge, EventSink eventSink,
       vfsOwner_(nullptr),
       running_(false),
       port_(21),
+      timezoneSeconds_(0),
       user_{},
       password_{},
       lastVfsError_{},
@@ -351,7 +371,8 @@ bool FtpServer::commandUsesVfs(const char* line) {
   command[used] = 0;
   static constexpr const char* kVfsCommands[] = {
       "CWD", "XCWD", "CDUP", "SIZE", "LIST", "NLST",
-      "RETR", "STOR", "DELE", "MKD", "XMKD"};
+      "RETR", "STOR", "DELE", "MKD", "XMKD",
+      "MDTM", "MFMT", "MLSD", "MLST"};
   for (const char* candidate : kVfsCommands) {
     if (strcmp(command, candidate) == 0) {
       return true;
@@ -697,6 +718,22 @@ bool FtpServer::requestVfs(VfsOperation operation, const char* path,
     snprintf(lastVfsError_, sizeof(lastVfsError_), "bridge-busy");
     return false;
   }
+  return awaitVfs(operation, result, timeoutMs, hook, hookContext);
+}
+
+bool FtpServer::requestMetadata(const VfsMetadata& metadata,
+                                VfsResult& result) {
+  memset(&result, 0, sizeof(result));
+  if (!bridge_.submitMetadata(metadata)) {
+    snprintf(lastVfsError_, sizeof(lastVfsError_), "bridge-busy");
+    return false;
+  }
+  return awaitVfs(VfsOperation::kSetMetadata, result, kVfsMutateTimeoutMs);
+}
+
+bool FtpServer::awaitVfs(VfsOperation operation, VfsResult& result,
+                         uint32_t timeoutMs, WaitHook hook,
+                         void* hookContext) {
   const uint32_t started = millis();
   while (static_cast<uint32_t>(millis() - started) < timeoutMs) {
     if (hook != nullptr) {
@@ -711,7 +748,9 @@ bool FtpServer::requestVfs(VfsOperation operation, const char* path,
       return true;
     }
     serviceSessions(vfsOwner_);
-    vTaskDelay(1);
+    // До тика, но готовый ответ Z80 будит сразу: листинг каталога — это
+    // обмен с мостом на каждую запись, и целый тик на каждую был заметен.
+    bridge_.waitForResult(1);
   }
   snprintf(lastVfsError_, sizeof(lastVfsError_), "bridge-timeout-%u",
            static_cast<unsigned>(operation));
@@ -753,9 +792,192 @@ void FtpServer::sendSize(Session& session, const char* argument) {
               static_cast<unsigned long>(result.size));
 }
 
-void FtpServer::list(Session& session, bool namesOnly) {
+// Дата строки LIST — как у «ls -l»: «Mar 15 14:30» для файлов моложе полугода
+// и «Mar 15  2024» для прочих, в том числе когда часы ESP ещё не сверены.
+// Время местное — как на карте и в панели WC. Без даты (старый плагин) —
+// прежнее «Jan 01 00:00».
+void FtpServer::formatListDate(const VfsResult& entry, char* output,
+                               size_t capacity) const {
+  static const char* const kMonths[12] = {"Jan", "Feb", "Mar", "Apr",
+                                          "May", "Jun", "Jul", "Aug",
+                                          "Sep", "Oct", "Nov", "Dec"};
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  if (!fatStampToCivil(writeStamp(entry), year, month, day, hour, minute,
+                       second)) {
+    snprintf(output, capacity, "Jan 01 00:00");
+    return;
+  }
+  bool recent = false;
+  const time_t now = time(nullptr);
+  if (now >= kClockValidSince) {
+    const int64_t age = static_cast<int64_t>(now) + timezoneSeconds_ -
+                        civilToUnix(year, month, day, hour, minute, second);
+    recent = age >= -kListFutureSkewSeconds && age < kListRecentSeconds;
+  }
+  if (recent) {
+    snprintf(output, capacity, "%s %2d %02d:%02d", kMonths[month - 1], day,
+             hour, minute);
+  } else {
+    snprintf(output, capacity, "%s %2d  %4d", kMonths[month - 1], day, year);
+  }
+}
+
+// Факты MLSD/MLST (RFC 3659) без завершающего пробела и имени. modify — UTC;
+// без даты факт опускается, клиент тогда не делает выводов о свежести.
+int FtpServer::formatFacts(const VfsResult& entry, const char* name,
+                           char* output, size_t capacity) const {
+  const char* type = entry.isDirectory ? "dir" : "file";
+  if (name != nullptr && strcmp(name, ".") == 0) {
+    type = "cdir";
+  } else if (name != nullptr && strcmp(name, "..") == 0) {
+    type = "pdir";
+  }
+  int used = snprintf(output, capacity, "type=%s;", type);
+  if (used < 0 || static_cast<size_t>(used) >= capacity) {
+    return -1;
+  }
+  if (!entry.isDirectory) {
+    const int size = snprintf(output + used, capacity - used, "size=%lu;",
+                              static_cast<unsigned long>(entry.size));
+    if (size < 0 || static_cast<size_t>(used + size) >= capacity) {
+      return -1;
+    }
+    used += size;
+  }
+  int64_t modified = 0;
+  if (fatStampToUnix(writeStamp(entry), timezoneSeconds_, modified)) {
+    char value[15];
+    formatFtpTimeVal(modified, value);
+    const int modify =
+        snprintf(output + used, capacity - used, "modify=%s;", value);
+    if (modify < 0 || static_cast<size_t>(used + modify) >= capacity) {
+      return -1;
+    }
+    used += modify;
+  }
+  return used;
+}
+
+void FtpServer::listSingle(Session& session, const char* argument) {
+  char path[kMaxPath + 1];
   VfsResult result;
-  if (!requestVfs(VfsOperation::kOpenDirectory, session.cwd, 0, result,
+  if (!normalizePath(session, argument, path) || !statPath(path, result)) {
+    reply(session, "550 No such file or directory\r\n");
+    return;
+  }
+  char facts[96];
+  if (formatFacts(result, nullptr, facts, sizeof(facts)) < 0) {
+    reply(session, "550 No such file or directory\r\n");
+    return;
+  }
+  replyFormat(session, "250-Listing %s\r\n %s %s\r\n250 End\r\n", path,
+              facts, path);
+}
+
+void FtpServer::sendModificationTime(Session& session,
+                                     const char* argument) {
+  char path[kMaxPath + 1];
+  VfsResult result;
+  if (!normalizePath(session, argument, path) || !statPath(path, result) ||
+      result.isDirectory) {
+    reply(session, "550 File not found\r\n");
+    return;
+  }
+  int64_t modified = 0;
+  if (!fatStampToUnix(writeStamp(result), timezoneSeconds_, modified)) {
+    reply(session, "550 Modification time not available\r\n");
+    return;
+  }
+  char value[15];
+  formatFtpTimeVal(modified, value);
+  replyFormat(session, "213 %s\r\n", value);
+}
+
+// MFMT YYYYMMDDhhmmss путь — записать время изменения в запись WC (UTC в
+// местное по поясу). Так FileZilla сохраняет дату закачанного файла.
+void FtpServer::setModificationTime(Session& session, const char* argument) {
+  int64_t requested = 0;
+  const char* rest = nullptr;
+  if (!parseFtpTimeVal(argument, requested, &rest) || *rest != ' ') {
+    reply(session, "501 Usage: MFMT YYYYMMDDhhmmss path\r\n");
+    return;
+  }
+  while (*rest == ' ') {
+    ++rest;
+  }
+  char path[kMaxPath + 1];
+  VfsResult result;
+  if (*rest == 0 || !normalizePath(session, rest, path) ||
+      !statPath(path, result)) {
+    reply(session, "550 File not found\r\n");
+    return;
+  }
+  // Прежний плагин любой ненулевой режим OPEN понимал как запись, то есть
+  // удалил бы файл на OPEN=3. Метаданные в STAT отдаёт только новый плагин,
+  // и только ему можно слать режим 3.
+  if (!result.hasMetadata) {
+    reply(session,
+          "550 Setting dates needs newer ZIFIFTP.WMF and WC Improved\r\n");
+    return;
+  }
+  FatStamp stamp;
+  if (!unixToFatStamp(requested, timezoneSeconds_, stamp)) {
+    reply(session, "501 Time is outside the FAT range 1980-2107\r\n");
+    return;
+  }
+  VfsResult opened;
+  if (!requestVfs(VfsOperation::kOpenRandom, path, 0, opened,
+                  kVfsNormalTimeoutMs)) {
+    replyFormat(session, "550 Cannot open for metadata (%s)\r\n",
+                lastVfsError_);
+    return;
+  }
+  VfsMetadata metadata;
+  metadata.timeMask = kMetadataWriteTime;
+  metadata.writeDate = stamp.date;
+  metadata.writeTime = stamp.time;
+  VfsResult applied;
+  const bool set = requestMetadata(metadata, applied);
+  char failure[sizeof(lastVfsError_)];
+  snprintf(failure, sizeof(failure), "%s", lastVfsError_);
+  VfsResult closed;
+  requestVfs(VfsOperation::kCloseCommit, nullptr, 0, closed,
+             kVfsCloseTimeoutMs);
+  if (!set) {
+    replyFormat(session, "550 Cannot set modification time (%s)\r\n",
+                failure);
+    return;
+  }
+  // FAT хранит секунды с шагом 2 — отвечаем тем, что записано на самом деле.
+  int64_t stored = requested;
+  fatStampToUnix(stamp, timezoneSeconds_, stored);
+  char value[15];
+  formatFtpTimeVal(stored, value);
+  replyFormat(session, "213 Modify=%s; %s\r\n", value, rest);
+}
+
+void FtpServer::list(Session& session, ListFormat format,
+                     const char* argument) {
+  // LIST и NLST аргумент не разбирают: клиенты шлют туда ключи «-la». MLSD
+  // по RFC 3659 принимает только путь каталога.
+  char path[kMaxPath + 1];
+  const char* directory = session.cwd;
+  if (format == ListFormat::kMachine && argument != nullptr &&
+      *argument != 0) {
+    if (!normalizePath(session, argument, path)) {
+      closePassive(session);
+      reply(session, "550 Cannot list directory\r\n");
+      return;
+    }
+    directory = path;
+  }
+  VfsResult result;
+  if (!requestVfs(VfsOperation::kOpenDirectory, directory, 0, result,
                   kVfsNormalTimeoutMs)) {
     closePassive(session);
     reply(session, "550 Cannot list directory\r\n");
@@ -778,7 +1000,7 @@ void FtpServer::list(Session& session, bool namesOnly) {
     if (result.atEnd) {
       break;
     }
-    if (namesOnly) {
+    if (format == ListFormat::kNames) {
       failed = !sendAll(session.dataClient,
                         reinterpret_cast<const uint8_t*>(result.name),
                         strlen(result.name), kDataIdleTimeoutMs) ||
@@ -787,10 +1009,24 @@ void FtpServer::list(Session& session, bool namesOnly) {
                         kDataIdleTimeoutMs);
     } else {
       char listing[384];
-      const int length = snprintf(
-          listing, sizeof(listing), "%crwxr-xr-x 1 zx zx %lu Jan 01 00:00 %s\r\n",
-          result.isDirectory ? 'd' : '-',
-          static_cast<unsigned long>(result.size), result.name);
+      int length = 0;
+      if (format == ListFormat::kLong) {
+        char date[16];
+        formatListDate(result, date, sizeof(date));
+        length = snprintf(listing, sizeof(listing),
+                          "%crwxr-xr-x 1 zx zx %lu %s %s\r\n",
+                          result.isDirectory ? 'd' : '-',
+                          static_cast<unsigned long>(result.size), date,
+                          result.name);
+      } else {
+        const int facts =
+            formatFacts(result, result.name, listing, sizeof(listing));
+        length = facts < 0 ? facts
+                           : facts + snprintf(listing + facts,
+                                              sizeof(listing) -
+                                                  static_cast<size_t>(facts),
+                                              " %s\r\n", result.name);
+      }
       failed = length < 0 || static_cast<size_t>(length) >= sizeof(listing) ||
                !sendAll(session.dataClient,
                         reinterpret_cast<const uint8_t*>(listing),
@@ -1118,7 +1354,8 @@ void FtpServer::executeCommand(Session& session, char* line) {
     reply(session, "215 ZX Spectrum\r\n");
   } else if (strcmp(line, "FEAT") == 0) {
     reply(session,
-          "211-Features:\r\n EPSV\r\n UTF8\r\n SIZE\r\n211 End\r\n");
+          "211-Features:\r\n EPSV\r\n UTF8\r\n SIZE\r\n MDTM\r\n"
+          " MFMT\r\n MLST type*;size*;modify*;\r\n211 End\r\n");
   } else if (strcmp(line, "OPTS") == 0 || strcmp(line, "NOOP") == 0) {
     reply(session, "200 OK\r\n");
   } else if (strcmp(line, "TYPE") == 0) {
@@ -1140,9 +1377,17 @@ void FtpServer::executeCommand(Session& session, char* line) {
   } else if (strcmp(line, "SIZE") == 0) {
     sendSize(session, argument);
   } else if (strcmp(line, "LIST") == 0) {
-    list(session, false);
+    list(session, ListFormat::kLong, argument);
   } else if (strcmp(line, "NLST") == 0) {
-    list(session, true);
+    list(session, ListFormat::kNames, argument);
+  } else if (strcmp(line, "MLSD") == 0) {
+    list(session, ListFormat::kMachine, argument);
+  } else if (strcmp(line, "MLST") == 0) {
+    listSingle(session, argument);
+  } else if (strcmp(line, "MDTM") == 0) {
+    sendModificationTime(session, argument);
+  } else if (strcmp(line, "MFMT") == 0) {
+    setModificationTime(session, argument);
   } else if (strcmp(line, "RETR") == 0) {
     retrieve(session, argument);
   } else if (strcmp(line, "STOR") == 0) {

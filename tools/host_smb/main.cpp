@@ -19,6 +19,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <timeapi.h>
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <cstring>
@@ -28,6 +29,9 @@
 #include "zifi/vfs_bridge.hpp"
 
 #include "z80_sim.hpp"
+
+// timeBeginPeriod живёт в winmm; сборочный скрипт её не перечисляет.
+#pragma comment(lib, "winmm.lib")
 
 namespace zifi {
 namespace host {
@@ -76,6 +80,10 @@ int main(int argc, char** argv) {
 
   // Windows требует инициализировать WinSock до первого сокета. На ESP этого
   // шага нет, поэтому в самой прошивке его никто не делает.
+  // Шаг системного таймера Windows по умолчанию 15,6 мс: без этого каждый
+  // select() и sleep стенда длились бы на порядок дольше, чем на ESP32.
+  timeBeginPeriod(1);
+
   WSADATA winsock = {};
   if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) {
     std::printf("WSAStartup не удался\n");
@@ -112,6 +120,11 @@ int main(int argc, char** argv) {
   }
 
   zifi::SmbServer server(bridge, printEvent, nullptr);
+  // Пояс ESP из zifi.ini (time:). В FAT эмулятор хранит поля как есть, а SMB
+  // передаёт UTC, поэтому пояс сдвигает время в обе стороны.
+  if (const char* timezone = std::getenv("ZIFI_HOST_TZ_HOURS")) {
+    server.setTimezoneHours(static_cast<int8_t>(std::atoi(timezone)));
+  }
 
   // Тело команды SMB_START повторяет то, что шлёт плагин: порт, ресурс, имя,
   // рабочая группа, логин и пароль. Так проверяется и разбор этой команды.
@@ -139,11 +152,12 @@ int main(int argc, char** argv) {
   std::printf("Вход: zx / zx. Остановка — Ctrl+C.\n");
   std::fflush(stdout);
 
-  // Мост исполняется на «ядре 1»: на хосте это просто главный поток.
+  // Мост исполняется на «ядре 1»: на хосте это просто главный поток. Пауза
+  // та же, что в прошивке: до 1 мс, но заявка SMB-потока будит сразу.
   while (true) {
     bridge.pollCore1();
     server.pollDiscovery();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    bridge.waitForRequest(1);
   }
   return 0;
 }

@@ -8,6 +8,9 @@ namespace zifi {
 constexpr uint8_t kSync = 0x5A;
 constexpr size_t kMaxPayload = 1024;
 constexpr uint32_t kFrameTimeoutMs = 500;
+// Наибольшее тело события ESP -> Z80 (kEvent*): столько вмещает очередь
+// событий между ядрами.
+constexpr size_t kMaxEventPayload = 63;
 
 enum Command : uint8_t {
   kEcho = 0x00,
@@ -38,6 +41,16 @@ enum Command : uint8_t {
   // Запись погоды для заставки WC: место из zifi.ini (country:, zip:),
   // payload пуст. Ответ kRespWeatherGet, формат в weather_parse.hpp.
   kWeatherGet = 0x24,
+  // Проверка и обновление Wild Commander по каталогу на GitHub (плагин
+  // WCUPDATE.WMF). START: [repo]\0[ветка]\0[каталог]\0[защищённые пути]\0\0;
+  // затем ESP сам читает SD через VFS-запросы и шлёт kEventWcuState/Entry.
+  // APPLY: номера файлов по байту; STOP завершает сеанс.
+  kWcuStart = 0x25,
+  kWcuApply = 0x26,
+  kWcuStop = 0x27,
+  // Выдать заново все строки списка и последнее состояние: плагин заметил,
+  // что событие потерялось (дыра в номерах, итог не пришёл).
+  kWcuSync = 0x28,
 
   kVfsStat = 0x40,
   kVfsOpenDir = 0x41,
@@ -72,6 +85,11 @@ enum Command : uint8_t {
   // Готовая ASCII-шкала уровня Wi-Fi для поля Status FTP/SMB-плагина. Отдельное
   // событие не вызывает SYS_INFO и не смешивается с его диагностическим текстом.
   kEventWifiSignal = 0x66,
+  // Обновлятор WC: [этап][текущий LE16][всего LE16][процент][текст] и запись
+  // файла [номер][состояние][флаги][длина на SD LE24][длина на GitHub LE24]
+  // [путь]; путь длиннее события — его хвост. Формат — docs/PROTOCOL.md.
+  kEventWcuState = 0x67,
+  kEventWcuEntry = 0x68,
 
   kRespSysInfo = 0x82,
   kRespWifiConnect = 0x81,
@@ -96,6 +114,10 @@ enum Command : uint8_t {
   kRespNetNtp = 0xA2,
   kRespNetProxyStatus = 0xA3,
   kRespWeatherGet = 0xA4,
+  kRespWcuStart = 0xA5,  // [1 — сеанс запущен]
+  kRespWcuApply = 0xA6,  // [1 — принято]
+  kRespWcuStop = 0xA7,   // [1 — сеанс остановлен]
+  kRespWcuSync = 0xA8,   // [1 — повтор списка поставлен в очередь]
   kReady = 0xF0,
   kError = 0xEE,
   kAck = 0xFE,

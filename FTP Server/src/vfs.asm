@@ -3,10 +3,11 @@
 ; FTP-протокол разбирает ESP, поэтому здесь нет ни одной строки FTP. Приходят
 ; только файловые приказы, ответ уходит с тем же кодом команды:
 ;
-;   #40 STAT     путь,0            -> [статус][каталог][размер:4]
-;   #41 OPENDIR  путь,0            -> [статус]
-;   #42 READDIR  —                 -> [статус][каталог][размер:4][имя…]
-;   #50 OPEN     [режим]путь,0     -> [статус]   режим 0=чтение, 1=запись
+;   #40 STAT     путь,0            -> [статус][каталог][размер:4][мета:16]
+;   #41 OPENDIR  путь,0            -> [статус][возможности]
+;   #42 READDIR  —                 -> [статус][каталог][размер:4][имя…][0][дата:2][время:2]
+;                [число]           -> до «числа» таких кадров, затем итог [2] или [1]
+;   #50 OPEN     [режим]путь,0     -> [статус][окна][FILEX]  0=чтение, 1=запись, 3=метаданные
 ;   #51 READ     [сколько:2]       -> [статус][данные…]
 ;   #52 WRITE    устаревший raw     -> [отказ]
 ;   #53 CLOSE    —                 -> [статус]
@@ -15,9 +16,27 @@
 ;   #56 BLOCK    LZ4/RAW-фрагмент   -> [статус][seq][принято:2]
 ;   #57 WRITEWIN raw-окно 16 КиБ    -> один [статус][seq][принято:2]
 ;   #58 READWIN  [seq][сколько:2]   -> поток кадров одного окна
+;   #5E SETMETA  [мета:16]          -> [статус][атрибут]   после OPEN режима 3
 ;
 ; Статус 0 — успех, иначе отказ. Для READDIR ненулевой статус означает конец
 ; каталога, для READ — конец файла.
+;
+; Даты. [мета:16] — структура FILEX SET_METADATA/GET_METADATA Wild Commander
+; Improved: size=16, маска и значение атрибута, маска времён, create tenth,
+; create time, create date, access date, write time, write date (LE16),
+; применённый атрибут. Времена FAT — местные, как их пишут WC и Windows.
+; STAT отдаёт её, только если FILEX умеет GET_METADATA; иначе ответ прежний,
+; 6 байт, и ESP считает даты неизвестными. В READDIR дата и время — поля
+; API 58: с битом 6 маски это время ИЗМЕНЕНИЯ, как в панели WC; старое ядро
+; бит не знает и отдаёт время создания. Старая прошивка берёт имя до конца
+; пакета — на нуле перед датой C-строка имени и кончается.
+;
+; Пачки. Бит 0 байта возможностей OPENDIR — READDIR умеет пачку (старая
+; прошивка читает из ответа только статус). Тогда ESP шлёт READDIR с числом
+; записей, и плагин отвечает кадрами READDIR прежнего вида подряд — FINDNEXT
+; следующей записи идёт, пока предыдущая уходит по линии, — и кадром-итогом:
+; [2] — пачка полна, каталог продолжается; [1] — каталог кончился. Обмен
+; «запрос — ответ» остаётся один на пачку, а не на каждую запись.
 ;
 ; Ограничение записи задано самим API: создать файл нулевой длины и дописывать
 ; в конец (MKFILE + APPEND). Перезаписи середины нет, поэтому загрузка идёт
@@ -35,9 +54,12 @@ VFS_MKDIR       equ #55
 VFS_BLOCK       equ #56
 VFS_WRITE_WINDOW equ #57
 VFS_READ_WINDOW equ #58
+VFS_SET_METADATA equ #5E
 
 VFS_OK          equ 0
 VFS_FAIL        equ 1
+VFS_DIR_BATCH   equ %00000001          ; OPENDIR: READDIR умеет пачку
+VFS_DIR_MORE    equ 2                   ; итог пачки: каталог продолжается
 VFS_CAP_WINDOWS equ %00000011          ; биты 0/1: окна записи и чтения
 VFS_WIRE_SIZE   equ 256                 ; один подтверждаемый пакет ESP -> Z80
 VFS_BLOCK_SIZE  equ #0200               ; независимый исходный блок: до 512 байт
@@ -87,6 +109,8 @@ Vfs_Dispatch:
         jp z,Vfs_WriteWindow
         cp VFS_READ_WINDOW
         jp z,Vfs_ReadWindow
+        cp VFS_SET_METADATA
+        jp z,Vfs_SetMetadata
         or a                            ; не наш пакет
         ret
 
@@ -104,16 +128,19 @@ Vfs_Reply1:
         scf
         ret
 
-; Успешный OPEN возвращает второй байт с возможностями нового транспорта.
-; Старые прошивки проверяют только status[0] и безопасно игнорируют хвост.
+; Успешный OPEN возвращает второй байт с возможностями нового транспорта и
+; третий — маску FILEX (QUERY_CAPS). Прошивка смотрит на маску только в режиме
+; 3; старые прошивки проверяют лишь status[0] и безопасно игнорируют хвост.
 Vfs_OpenReply:
         xor a
         ld (VfsBuf),a
         ld a,VFS_CAP_WINDOWS
         ld (VfsBuf+1),a
+        ld a,(VfsFilexCaps)
+        ld (VfsBuf+2),a
         ld a,VFS_OPEN
         ld hl,VfsBuf
-        ld bc,2
+        ld bc,3
         call Proto_Send
         scf
         ret
@@ -296,6 +323,7 @@ Vfs_Locate:
 Vfs_Stat:
         ld a,VFS_STAT
         ld (VfsCmd),a
+        call Vfs_FilexCapsOnce          ; до FENTRY: QUERY_CAPS контекста не трогает
         xor a                           ; ищем сначала как файл
         call Vfs_Locate
         jp c,Vfs_Refuse
@@ -324,8 +352,16 @@ Vfs_Stat:
         ld (VfsBuf+4),de
         xor a
         ld (VfsBuf),a                   ; статус: успех
+        ; Атрибут и времена — FILEX GET_METADATA по контексту этого же FENTRY.
+        ; Нет операции (старый FILEX) — ответ прежний, 6 байт: ESP считает
+        ; даты неизвестными, а не нулевыми.
+        call Vfs_GetMetadata
+        ld bc,6
+        jr nz,.send
+        ld bc,6+FILEX_META_SIZE
         jr .send
 .root:
+        ; У корня нет записи каталога, а значит и дат.
         xor a
         ld (VfsBuf),a
         ld a,1
@@ -333,10 +369,10 @@ Vfs_Stat:
         ld hl,0
         ld (VfsBuf+2),hl
         ld (VfsBuf+4),hl
+        ld bc,6
 .send:
         ld a,VFS_STAT
         ld hl,VfsBuf
-        ld bc,6
         call Proto_Send
         scf
         ret
@@ -367,21 +403,58 @@ Vfs_OpenDir:
         call Fs_SelectWork
         ld a,1
         call WC_ADIR
+        xor a
+        ld (VfsBuf),a                   ; статус: успех
+        ld a,VFS_DIR_BATCH
+        ld (VfsBuf+1),a                 ; возможности обхода
         ld a,VFS_OPENDIR
-        ld c,VFS_OK
-        jp Vfs_Reply1
+        ld hl,VfsBuf
+        ld bc,2
+        call Proto_Send
+        scf
+        ret
 
 Vfs_ReadDir:
         ld a,VFS_READDIR
         ld (VfsCmd),a
-        call Fs_SelectWork
-        ; FINDNEXT принимает буфер в DE, а в A — набор запрошенных полей.
-        ; #1C = размер, дата и время, любая запись. Раскладка ответа WC:
-        ; 0..3 размер, 4..7 дата и время, 8 атрибут, 9 имя с нулём.
-        ld de,DirEntryBuffer
-        ld a,#1C
-        call WC_FINDNEXT
+        ; Пустой запрос — прежний протокол: одна запись или конец каталога.
+        ld hl,(ProtoRxLen)
+        ld a,h
+        or l
+        jr z,.single
+        ld a,(ProtoBuf)
+        or a
+        jr z,.single
+        ld (VfsDirLeft),a
+.batch:
+        call Vfs_DirEntry
+        jp z,Vfs_Refuse                 ; каталог кончился: итог [1]
+        ld hl,VfsDirLeft
+        dec (hl)
+        jr nz,.batch
+        ld a,VFS_READDIR
+        ld c,VFS_DIR_MORE               ; пачка полна, каталог продолжается
+        jp Vfs_Reply1
+.single:
+        call Vfs_DirEntry
         jp z,Vfs_Refuse                 ; каталог кончился
+        scf
+        ret
+
+; Следующая запись каталога — кадром READDIR.
+; Выход: Z — каталог кончился, ничего не отправлено; NZ — запись отправлена.
+Vfs_DirEntry:
+        call Fs_SelectWork
+        ; FINDNEXT принимает буфер в DE, а в A — набор запрошенных полей:
+        ; размер, дата и время, любая запись. Бит 6 просит время и дату
+        ; ИЗМЕНЕНИЯ (+22/+24), которые показывает панель WC, а не создания:
+        ; у файла, скопированного на SD с ПК, создание — это момент
+        ; копирования. Раскладка ответа WC от бита не зависит:
+        ; 0..3 размер, 4..5 дата, 6..7 время, 8 атрибут, 9 имя с нулём.
+        ld de,DirEntryBuffer
+        ld a,FINDNEXT_WRITE_TIME|FINDNEXT_TIME|FINDNEXT_DATE|FINDNEXT_SIZE
+        call WC_FINDNEXT
+        ret z                           ; каталог кончился
 
         xor a
         ld (VfsBuf),a                   ; статус: успех
@@ -399,19 +472,24 @@ Vfs_ReadDir:
         ld hl,DirEntryBuffer+9
         ld de,VfsBuf+6
         call Oem_CopyUtf8NoTerm
-        ; Длина ответа = 6 служебных байт плюс длина имени.
-        ld hl,VfsBuf+6
-        or a
+        ; За именем — ноль, затем дата и время FAT как их дал API 58.
+        xor a
+        ld (de),a
+        inc de
+        ld hl,DirEntryBuffer+4
+        ld bc,4
+        ldir
+        ; Длина ответа — всё, что записано от начала VfsBuf.
         ex de,hl
+        ld de,VfsBuf
+        or a
         sbc hl,de
-        ld bc,6
-        add hl,bc
         ld b,h
         ld c,l
         ld a,VFS_READDIR
         ld hl,VfsBuf
         call Proto_Send
-        scf
+        or 1                            ; NZ: запись отправлена
         ret
 
 ; --- OPEN, READ, WRITE, CLOSE: работа с одним файлом -------------------------
@@ -439,6 +517,10 @@ Vfs_Open:
         ; также сбрасывает ещё не опубликованный остаток предыдущего STOR.
         call Vfs_WriteReset
         ld a,(VfsMode)
+        cp 3
+        jr z,.for_metadata
+        cp 2
+        jp nc,Vfs_Refuse                ; неизвестный режим нельзя считать записью
         or a
         jr nz,.for_write
 
@@ -456,6 +538,32 @@ Vfs_Open:
         ldir
         jp Vfs_OpenReply
 
+.for_metadata:
+        ; Режим 3 — только контекст FILEX для SET_METADATA (MFMT): файл не
+        ; открывается и не меняется. Метаданные допустимы и для каталога.
+        ; Прежде любой ненулевой режим считался записью, то есть старый плагин
+        ; на OPEN=3 УДАЛИЛ бы файл, — поэтому прошивка шлёт режим 3, только
+        ; если STAT уже вернул метаданные: так отвечает лишь этот плагин.
+        ld hl,0
+        ld (FileRemaining),hl
+        ld (FileRemaining+2),hl
+        call Vfs_FilexCapsOnce
+        call Fs_SelectWork
+        ld hl,FsEntry
+        call WC_FENTRY
+        jr nz,.metadata_found
+        ld a,#10
+        ld (FsEntry),a
+        call Fs_SelectWork
+        ld hl,FsEntry
+        call WC_FENTRY
+        jp z,Vfs_Refuse
+.metadata_found:
+        ld a,(VfsFilexCaps)
+        and FILEX_CAP_SET_METADATA
+        jp z,Vfs_Refuse
+        jp Vfs_OpenReply
+
 .for_write:
         ; Запись: старый файл удалить, создать пустой, зафиксировать FENTRY.
         ; С этого места диск меняется (даже если MKFILE потом откажет), и при
@@ -463,12 +571,18 @@ Vfs_Open:
         ld a,1
         ld (VfsChanged),a
         call Fs_SelectWork
+        ; Обновлятор WC (VFS_WRITE_NEW_ONLY) прежний файл не удаляет: занятое
+        ; имя — отказ MKFILE, а WC Improved отказывает и при ошибке чтения
+        ; каталога. Остаток прошлой замены (WCUPD.TMP может делить цепочку с
+        ; файлом), не замеченный описью, так не освобождается записью поверх.
+        IFNDEF VFS_WRITE_NEW_ONLY
         ld hl,FsEntry
         call WC_FENTRY
         jr z,.create
         ld hl,FsEntry
         call WC_DELETE
         jp z,Vfs_Refuse
+        ENDIF
 .create:
         call Vfs_BuildMkFile
         ld hl,MkFileBuffer
@@ -496,6 +610,111 @@ Vfs_BuildMkFile:
         djnz .zero_size
         ld hl,VfsName
         jp Vfs_CopyZ
+
+; --- FILEX: возможности и метаданные -------------------------------------------
+
+; Подготовить статический 32-байтовый блок API 77. Блок и все его буферы обязаны
+; лежать в #8000..#BFFF — это страница кода плагина.
+Vfs_FilexReset:
+        ld hl,VfsFilexBlock
+        ld de,VfsFilexBlock+1
+        ld bc,FILEX_BLOCK_SIZE-1
+        xor a
+        ld (hl),a
+        ldir
+        ld a,FILEX_BLOCK_SIZE
+        ld (VfsFilexBlock),a
+        ld a,FILEX_API_VERSION
+        ld (VfsFilexBlock+1),a
+        ret
+
+; Узнать возможности FILEX один раз за запуск. QUERY_CAPS не требует FENTRY и
+; контекста не трогает. Нет провайдера или чужая версия — возможности нулевые.
+Vfs_FilexCapsOnce:
+        ld a,(VfsFilexKnown)
+        or a
+        ret nz
+        inc a
+        ld (VfsFilexKnown),a
+        call Vfs_FilexReset
+        ld a,FILEX_OP_QUERY_CAPS
+        ld (VfsFilexBlock+FILEX_P_OPERATION),a
+        ld hl,VfsFilexBlock
+        call WC_FILEX
+        ret nz
+        ld a,(VfsFilexBlock+FILEX_P_RESULT_FLAGS)
+        cp FILEX_API_VERSION
+        ret nz
+        ld a,(VfsFilexBlock+FILEX_P_RESULT_COUNT)
+        ld (VfsFilexCaps),a
+        ld a,(VfsFilexBlock+FILEX_P_RESULT_COUNT+1)
+        ld (VfsFilexCaps2),a
+        ret
+
+; Прочитать атрибут и времена записи последнего FENTRY в VfsBuf+6 (структура
+; SET_METADATA, 16 байт). Выход: Z — прочитано; NZ — операции нет или отказ.
+; FILEX разрушает AF/BC/DE/HL/IX.
+Vfs_GetMetadata:
+        ld a,(VfsFilexCaps2)
+        and FILEX_CAP2_GET_METADATA
+        jr z,.absent
+        call Vfs_FilexReset
+        ld a,FILEX_OP_GET_METADATA
+        ld (VfsFilexBlock+FILEX_P_OPERATION),a
+        ld hl,VfsBuf+6
+        ld (VfsFilexBlock+FILEX_P_BUFFER),hl
+        ld hl,FILEX_META_SIZE
+        ld (VfsFilexBlock+FILEX_P_LENGTH),hl
+        ld hl,VfsFilexBlock
+        jp WC_FILEX                     ; Z только при статусе OK
+.absent:
+        or 1
+        ret
+
+; SET_METADATA: [мета:16] -> [статус][применённый атрибут]. Только после OPEN
+; режима 3: FILEX применяет структуру к записи последнего FENTRY. Отказ несёт
+; статус FILEX — ESP различит «только чтение», «нет места» и прочее.
+Vfs_SetMetadata:
+        ld a,VFS_SET_METADATA
+        ld (VfsCmd),a
+        ld hl,(ProtoRxLen)
+        ld de,FILEX_META_SIZE
+        or a
+        sbc hl,de
+        jp nz,Vfs_Refuse
+        ld a,(VfsMode)
+        cp 3
+        jp nz,Vfs_Refuse
+        ld hl,ProtoBuf
+        ld de,VfsMetaBuffer
+        ld bc,FILEX_META_SIZE
+        ldir
+        call Vfs_FilexReset
+        ld a,FILEX_OP_SET_METADATA
+        ld (VfsFilexBlock+FILEX_P_OPERATION),a
+        ld hl,VfsMetaBuffer
+        ld (VfsFilexBlock+FILEX_P_BUFFER),hl
+        ld hl,FILEX_META_SIZE
+        ld (VfsFilexBlock+FILEX_P_LENGTH),hl
+        ld hl,VfsFilexBlock
+        call WC_FILEX
+        jr nz,.failed
+        ld a,1
+        ld (VfsChanged),a               ; дата в записи новая: панели WC перечитать
+        xor a
+        ld (VfsBuf),a
+        ld a,(VfsMetaBuffer+15)
+        ld (VfsBuf+1),a
+        ld a,VFS_SET_METADATA
+        ld hl,VfsBuf
+        ld bc,2
+        call Proto_Send
+        scf
+        ret
+.failed:
+        ld c,a
+        ld a,VFS_SET_METADATA
+        jp Vfs_Reply1
 
 Vfs_Read:
         ld a,VFS_READ
@@ -1675,8 +1894,14 @@ Vfs_Mkdir:
 ; --- данные ------------------------------------------------------------------
 
 VfsCmd:         db 0                    ; обрабатываемая команда
+VfsDirLeft:     db 0                    ; сколько записей пачки READDIR осталось
 VfsAttr:        db 0                    ; атрибут для FENTRY
-VfsMode:        db 0                    ; режим OPEN: 0=чтение, 1=запись
+VfsMode:        db 0                    ; режим OPEN: 0=чтение, 1=запись, 3=метаданные
+VfsFilexKnown:  db 0                    ; QUERY_CAPS уже спрошен в этом запуске
+VfsFilexCaps:   db 0                    ; FILEX QUERY_CAPS: result_count, байт 0
+VfsFilexCaps2:  db 0                    ; FILEX QUERY_CAPS: result_count, байт 1
+VfsFilexBlock:  ds FILEX_BLOCK_SIZE     ; блок параметров API 77
+VfsMetaBuffer:  ds FILEX_META_SIZE      ; структура SET_METADATA
 VfsHasName:     db 0
 VfsPath:        ds PATH_SIZE
 VfsName:        ds PATH_SIZE

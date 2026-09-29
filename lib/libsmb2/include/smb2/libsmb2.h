@@ -1460,6 +1460,13 @@ struct smb2_server_request_handlers {
          * asynchronous STATUS_PENDING response without touching a context
          * from a second task. */
         int (*service_event)(struct smb2_server *srvr);
+        /* ZiFi: how long the listener may sleep in select() before the next
+         * service_event, in microseconds; a negative value keeps the default
+         * 100 ms.  A server that waits for its own worker rather than for a
+         * socket asks for a short interval: otherwise the finished result
+         * sits unnoticed until the default timeout, because the client is
+         * silent while it waits for our reply. */
+        long (*service_wait_us)(struct smb2_server *srvr);
         int (*authorize_user)(struct smb2_server *srvr, struct smb2_context *smb2,
                             const char *user,
                             const char *domain,

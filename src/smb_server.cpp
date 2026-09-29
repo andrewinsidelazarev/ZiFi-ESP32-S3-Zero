@@ -1,5 +1,6 @@
 #include "zifi/smb_server.hpp"
 #include "zifi/directory_cache.hpp"
+#include "zifi/fat_time.hpp"
 #include "zifi/ws_discovery.hpp"
 #include "zifi/diagnostic_log.hpp"
 
@@ -154,14 +155,23 @@ constexpr size_t kAsyncIoBaseSlotSize = kSmbAdvertisedReadSize;
 // IRP по 512 КиБ и задерживает шкалу из-за поздно отправленных ранних диапазонов.
 // Сопоставление: SMB Server/docs/testing/2026-09-05-real091-explorer-fileio.md.
 // Готовый PSRAM-снимок можно сериализовать пакетом: физических обращений к
-// Z80 здесь нет. Холодный каталог принципиально другой — каждая запись требует
-// отдельного WC_FINDNEXT через UART. Связанный запрос Проводника содержит два
-// QUERY_DIRECTORY, поэтому пакет из 16 записей задерживал единый compound-ответ
-// до 32 физических операций. MS-SMB2 задаёт OutputBufferLength как максимум,
-// а не минимальное заполнение; возвращаем одну физическую запись и продолжаем
-// тем же курсором в следующем запросе.
+// Z80 здесь нет.
 constexpr size_t kDirectoryBatchCapacity = 16;
-constexpr size_t kDirectoryStreamingEntriesPerReply = 1;
+// Холодный каталог требует отдельного WC_FINDNEXT на каждую запись. Прежде
+// ответ нёс одну запись: пачка из 16 записей задерживала единый compound-ответ
+// Проводника (в нём два QUERY_DIRECTORY) до 32 физических операций, а каждая
+// тогда стоила больше 0,1 с. Но и одна запись на ответ стоила Windows
+// отдельного запроса — по Wi-Fi ещё ~15 мс на запись. Теперь пачку ограничивает
+// время: ответ уходит, как только первая запись в нём ждёт бюджет, — и
+// compound не задерживается дольше двух бюджетов при любой скорости Z80.
+// MS-SMB2 задаёт OutputBufferLength как максимум, а не минимальное заполнение.
+constexpr size_t kAsyncDirectoryBatchCapacity = 64;
+constexpr uint32_t kColdDirectoryReplyBudgetMs = 250;
+// Пока мост к Z80 занят, цикл libsmb2 спит в select() не дольше этого. Иначе
+// готовый результат лежал до конца стандартного тайм-аута 100 мс: сокеты в это
+// время молчат, потому что Windows ждёт нашего ответа. На холодном каталоге,
+// где каждая запись — отдельный физический шаг, это и стоило 0,1 с на запись.
+constexpr long kServiceBusyWaitUs = 1000;
 
 uint32_t longIoInterimPendingMs() {
 #ifdef ZIFI_HOST_BUILD
@@ -632,35 +642,59 @@ uint32_t smbStatusFromFilex(uint8_t status) {
   }
 }
 
-bool fileTimeToFat(uint64_t value, uint16_t& date, uint16_t& timeValue,
-                   uint8_t* createTenth = nullptr) {
+// FILETIME клиента (UTC) -> местный штамп FAT: так его пишут WC и Windows и
+// так его показывает панель WC. Прежде перевод шёл через gmtime без пояса, и
+// на карту ложилось UTC — дата в WC расходилась с Проводником на пояс.
+bool fileTimeToFat(uint64_t value, int32_t timezoneSeconds, uint16_t& date,
+                   uint16_t& timeValue, uint8_t* createTenth = nullptr) {
   constexpr uint64_t kTicksPerSecond = 10000000ULL;
-  constexpr uint64_t kUnixEpochSeconds = 11644473600ULL;
-  if (value == 0 || value == UINT64_MAX) {
+  int64_t unixSeconds = 0;
+  FatStamp stamp;
+  if (!fileTimeToUnix(value, unixSeconds) ||
+      !unixToFatStamp(unixSeconds, timezoneSeconds, stamp)) {
     return false;
   }
-  const uint64_t wholeSeconds = value / kTicksPerSecond;
-  if (wholeSeconds < kUnixEpochSeconds) {
-    return false;
-  }
-  const time_t unixSeconds =
-      static_cast<time_t>(wholeSeconds - kUnixEpochSeconds);
-  struct tm parts = {};
-  if (gmtime_r(&unixSeconds, &parts) == nullptr || parts.tm_year < 80 ||
-      parts.tm_year > 207) {
-    return false;
-  }
-  date = static_cast<uint16_t>(((parts.tm_year - 80) << 9) |
-                               ((parts.tm_mon + 1) << 5) | parts.tm_mday);
-  timeValue = static_cast<uint16_t>((parts.tm_hour << 11) |
-                                    (parts.tm_min << 5) |
-                                    (parts.tm_sec / 2));
+  date = stamp.date;
+  timeValue = stamp.time;
   if (createTenth != nullptr) {
+    // Сотые доли создания: нечётная секунда (FAT хранит чётные) и дробь.
     const uint64_t subSecond = value % kTicksPerSecond;
-    *createTenth = static_cast<uint8_t>((parts.tm_sec & 1) * 100 +
+    *createTenth = static_cast<uint8_t>((unixSeconds & 1) * 100 +
                                         subSecond / 100000ULL);
   }
   return true;
+}
+
+// До сверки по NTP часы ESP показывают 1970-й: «сейчас» тогда неизвестно.
+constexpr time_t kClockValidSince = 1577836800;  // 2020-01-01
+
+FatTimes timesOf(const VfsResult& result) {
+  FatTimes times;
+  times.write.date = result.writeDate;
+  times.write.time = result.writeTime;
+  times.full = result.hasMetadata;
+  times.create.date = result.createDate;
+  times.create.time = result.createTime;
+  times.createTenth = result.createTenth;
+  times.accessDate = result.accessDate;
+  return times;
+}
+
+FatTimes timesOf(const DirectoryCache::EntryView& entry) {
+  FatTimes times;
+  times.write.date = entry.writeDate;
+  times.write.time = entry.writeTime;
+  return times;
+}
+
+void storeTimes(const FatTimes& times, VfsResult& result) {
+  result.writeDate = times.write.date;
+  result.writeTime = times.write.time;
+  result.hasMetadata = times.full;
+  result.createDate = times.create.date;
+  result.createTime = times.create.time;
+  result.createTenth = times.createTenth;
+  result.accessDate = times.accessDate;
 }
 
 }  // namespace
@@ -742,6 +776,7 @@ struct SmbServer::Impl {
     uint32_t directoryPendingSize = 0;
     uint32_t directoryPendingIndex = 0;
     char directoryPendingName[kMaxPath + 1] = {};
+    FatTimes directoryPendingTimes{};
     // Холодный каталог возвращается по одной записи. Сразу после ответа
     // Проводник открывает показанный объект, одновременно уже поставив
     // следующий QUERY_DIRECTORY. В этот момент FILEX занят FINDNEXT, поэтому
@@ -751,11 +786,15 @@ struct SmbServer::Impl {
     bool directoryLastIsDirectory = false;
     uint32_t directoryLastSize = 0;
     char directoryLastName[kMaxPath + 1] = {};
+    FatTimes directoryLastTimes{};
     DirectoryCache::Cursor directoryCursor{};
     uint16_t rpcContextId = 0xFFFF;
     uint32_t pipeResponseLength = 0;
     uint32_t pipeResponseOffset = 0;
     VfsMetadata pendingMetadata{};
+    // Штампы FAT открытого объекта: из STAT при CREATE, «сейчас» для нового и
+    // записанного. Из них собираются времена CREATE, QUERY_INFO и CLOSE.
+    FatTimes times{};
     // Ответ принадлежит конкретному открытому экземпляру srvsvc. Общий буфер
     // смешивал WRITE/READ и PIPE_TRANSCEIVE разных дескрипторов.
     uint8_t pipeResponse[kSrvsvcResponseCapacity] = {};
@@ -903,6 +942,11 @@ struct SmbServer::Impl {
     bool hasName = false;
     AsyncDirectoryPhase phase = AsyncDirectoryPhase::kPrepare;
     char name[kMaxPath + 1] = {};
+    // Пачка записей ответа: сколько собрано, сколько байт займёт ответ и когда
+    // собрана первая запись — от неё отсчитывается бюджет ответа.
+    uint32_t batchCount = 0;
+    size_t batchEncoded = 0;
+    uint32_t batchStartedMs = 0;
   };
 
   enum class AsyncCreatePhase : uint8_t {
@@ -931,6 +975,7 @@ struct SmbServer::Impl {
     uint32_t desiredAccess = 0;
     uint32_t createOptions = 0;
     uint32_t existingSize = 0;
+    FatTimes existingTimes{};
     bool createNewDirectory = true;
     bool leaseResponse = false;
     uint32_t lastProgressMs = 0;
@@ -1064,6 +1109,8 @@ struct SmbServer::Impl {
         progressStampMs(0),
         directoryBatch(nullptr),
         directoryBatchNames(nullptr),
+        asyncDirectoryEntries(nullptr),
+        asyncDirectoryNames(nullptr),
         directoryInfo{},
         directoryName{},
         infoName{},
@@ -1107,6 +1154,7 @@ struct SmbServer::Impl {
 
     handlers.destruction_event = destructionHandler;
     handlers.service_event = serviceHandler;
+    handlers.service_wait_us = serviceWaitHandler;
     handlers.authorize_user = authorizeHandler;
     handlers.session_established = sessionHandler;
     handlers.logoff_cmd = logoffHandler;
@@ -1214,6 +1262,8 @@ struct SmbServer::Impl {
   char user[33];
   char password[65];
   char lastVfsError[64];
+  // Пояс из zifi.ini: FAT хранит местное время, SMB передаёт UTC.
+  int32_t timezoneSeconds = 0;
   char volumeLabel[12];
   // Последние отправленные строки индикации: одинаковый текст повторно по
   // UART не гоняется, а прогресс дополнительно ограничен по частоте.
@@ -1223,6 +1273,12 @@ struct SmbServer::Impl {
 
   uint8_t* directoryBatch;
   char* directoryBatchNames;
+  // Пачка холодного QUERY_DIRECTORY копится через несколько витков цикла, а
+  // между ними синхронный ответ из снимка пользуется directoryBatch. Поэтому у
+  // пачки свой массив записей и свои копии имён: libsmb2 кодирует их, только
+  // когда ответ уходит целиком.
+  uint8_t* asyncDirectoryEntries;
+  char* asyncDirectoryNames;
   smb2_fileidbothdirectoryinformation directoryInfo;
   char directoryName[kMaxPath + 1];
   char infoName[kMaxPath + 2];
@@ -1421,6 +1477,7 @@ struct SmbServer::Impl {
   // Обновляет размер записи в снимке родителя без сброса всего снимка. Именно
   // отсюда Проводник берёт размер растущего файла во время копирования.
   void refreshCachedSize(const char* path, uint32_t size);
+  void refreshCachedStamp(const char* path, FatStamp stamp);
   bool activateRead(int slot, uint32_t offset);
   bool fetchReadWindow(Handle& handle);
   bool activateWrite(int slot, uint32_t offset);
@@ -1444,8 +1501,12 @@ struct SmbServer::Impl {
   bool queueAsyncDirectoryReply(const AsyncDirectory& pending,
                                 Handle& handle, const char* name,
                                 bool directory, uint32_t size,
-                                uint32_t fileIndex);
+                                uint32_t fileIndex, const FatTimes& times);
   void completeAsyncDirectory(int index, uint32_t status);
+  bool appendAsyncDirectoryBatch(AsyncDirectory& pending, Handle& handle,
+                                 const VfsResult& result, size_t encoded);
+  bool asyncDirectoryBatchDue(const AsyncDirectory& pending) const;
+  void flushAsyncDirectoryBatch(int index, Handle& handle);
   void failAsyncDirectories(uint32_t status);
   void dropAsyncDirectoriesForOwner(smb2_context* owner);
   bool cancelAsyncDirectory(smb2_context* owner, uint64_t messageId);
@@ -1507,13 +1568,18 @@ struct SmbServer::Impl {
   uint64_t directoryFileId(const char* path) const;
   uint64_t directoryChildFileId(const char* parentPath,
                                 const char* name) const;
-  ReportedMetadata reportedMetadata(const char* path, bool directory) const;
+  ReportedMetadata reportedMetadata(const char* path, bool directory,
+                                    const FatTimes& times) const;
+  // «Изменено сейчас» по часам ESP — для только что созданных и записанных
+  // объектов, чей точный штамп WC сервер не перечитывает.
+  FatTimes currentTimes() const;
+  void applyTimes(const FatTimes& times, ReportedMetadata& result) const;
   ReportedMetadata reportedChildMetadata(const char* parentPath,
-                                          const char* name,
-                                          bool directory) const;
+                                          const char* name, bool directory,
+                                          const FatTimes& times) const;
   void rememberMetadata(const char* path, bool directory,
                         const VfsMetadata& metadata,
-                        uint8_t appliedAttributes);
+                        uint8_t appliedAttributes, const FatTimes& times);
   void forgetMetadata(const char* path);
   void renameMetadata(const char* oldPath, const char* newPath);
   void fillCreateContextReply(const RequestedCreateContexts& requested,
@@ -1527,7 +1593,8 @@ struct SmbServer::Impl {
   smb2_timeval currentSmb2Time() const;
   void fillDirectoryInfo(smb2_fileidbothdirectoryinformation& info,
                          uint32_t index, bool directory, uint32_t size,
-                         const char* parentPath, const char* name) const;
+                         const char* parentPath, const char* name,
+                         const FatTimes& times) const;
   int queryCachedDirectory(smb2_context* smb2, Handle& handle,
                            smb2_query_directory_request* request,
                            smb2_query_directory_reply* reply);
@@ -1549,6 +1616,7 @@ struct SmbServer::Impl {
 
   static int destructionHandler(smb2_server*, smb2_context*);
   static int serviceHandler(smb2_server*);
+  static long serviceWaitHandler(smb2_server*);
   static int authorizeHandler(smb2_server*, smb2_context*, const char*,
                               const char*, const char*);
   static int sessionHandler(smb2_server*, smb2_context*);
@@ -3278,6 +3346,19 @@ bool SmbServer::Impl::allocateDirectoryBatch() {
     directoryBatchNames = nullptr;
     return false;
   }
+  // Без этой памяти холодный каталог отвечает, как прежде, по одной записи.
+  asyncDirectoryEntries = static_cast<uint8_t*>(heap_caps_calloc(
+      kAsyncDirectoryBatchCapacity, stride,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  asyncDirectoryNames = static_cast<char*>(heap_caps_calloc(
+      kAsyncDirectoryBatchCapacity, kMaxPath + 1,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (asyncDirectoryEntries == nullptr || asyncDirectoryNames == nullptr) {
+    heap_caps_free(asyncDirectoryEntries);
+    heap_caps_free(asyncDirectoryNames);
+    asyncDirectoryEntries = nullptr;
+    asyncDirectoryNames = nullptr;
+  }
   return true;
 }
 
@@ -3286,6 +3367,10 @@ void SmbServer::Impl::releaseDirectoryBatch() {
   heap_caps_free(directoryBatchNames);
   directoryBatch = nullptr;
   directoryBatchNames = nullptr;
+  heap_caps_free(asyncDirectoryEntries);
+  heap_caps_free(asyncDirectoryNames);
+  asyncDirectoryEntries = nullptr;
+  asyncDirectoryNames = nullptr;
   // Копия файла живёт в той же PSRAM и вне работающего сервера смысла не имеет.
   dropFileCache();
 }
@@ -4165,7 +4250,7 @@ bool SmbServer::Impl::requestVfs(VfsOperation operation, const char* path,
       snprintf(lastVfsError, sizeof(lastVfsError), "none");
       return true;
     }
-    vTaskDelay(pdMS_TO_TICKS(1));
+    bridge.waitForResult(1);
   }
   snprintf(lastVfsError, sizeof(lastVfsError), "bridge-timeout-%u",
            static_cast<unsigned>(operation));
@@ -4205,7 +4290,7 @@ bool SmbServer::Impl::requestVfsAt(VfsOperation operation, uint32_t offset,
       snprintf(lastVfsError, sizeof(lastVfsError), "none");
       return true;
     }
-    vTaskDelay(pdMS_TO_TICKS(1));
+    bridge.waitForResult(1);
   }
   snprintf(lastVfsError, sizeof(lastVfsError), "bridge-timeout-at-%u",
            static_cast<unsigned>(operation));
@@ -4233,7 +4318,7 @@ bool SmbServer::Impl::requestRename(const char* oldPath, const char* newName,
       snprintf(lastVfsError, sizeof(lastVfsError), "none");
       return true;
     }
-    vTaskDelay(pdMS_TO_TICKS(1));
+    bridge.waitForResult(1);
   }
   snprintf(lastVfsError, sizeof(lastVfsError), "bridge-timeout-rename");
   return false;
@@ -4257,7 +4342,7 @@ bool SmbServer::Impl::requestMoveRename(const char* oldPath,
       snprintf(lastVfsError, sizeof(lastVfsError), "none");
       return true;
     }
-    vTaskDelay(pdMS_TO_TICKS(1));
+    bridge.waitForResult(1);
   }
   snprintf(lastVfsError, sizeof(lastVfsError), "bridge-timeout-move");
   return false;
@@ -4280,7 +4365,7 @@ bool SmbServer::Impl::requestMetadata(const VfsMetadata& metadata,
       snprintf(lastVfsError, sizeof(lastVfsError), "none");
       return true;
     }
-    vTaskDelay(pdMS_TO_TICKS(1));
+    bridge.waitForResult(1);
   }
   snprintf(lastVfsError, sizeof(lastVfsError), "bridge-timeout-metadata");
   return false;
@@ -4354,6 +4439,7 @@ bool SmbServer::Impl::statPath(const char* path, VfsResult& result) {
     result.success = true;
     result.isDirectory = handle.directory;
     result.size = visibleSize(handle);
+    storeTimes(handle.times, result);
     snprintf(lastVfsError, sizeof(lastVfsError), "none");
     return true;
   }
@@ -4376,8 +4462,26 @@ bool SmbServer::Impl::statPath(const char* path, VfsResult& result) {
       result.success = true;
       result.isDirectory = directoryHandle.directoryLastIsDirectory;
       result.size = directoryHandle.directoryLastSize;
+      storeTimes(directoryHandle.directoryLastTimes, result);
       snprintf(result.name, sizeof(result.name), "%s",
                directoryHandle.directoryLastName);
+      snprintf(lastVfsError, sizeof(lastVfsError), "none");
+      return true;
+    }
+  }
+  if (hasParent) {
+    // Запись, уже прочитанная идущим обходом каталога, — точный STAT, как и
+    // последняя выданная выше. С ответами пачкой Проводник открывает любую
+    // запись пачки, пока обход продолжается; физический STAT закрыл бы курсор
+    // каталога, и обход пришлось бы начинать с повтора всех прочитанных записей.
+    DirectoryCache::EntryView building;
+    if (directoryCache.findBuildingEntry(parent, name, building)) {
+      result.success = true;
+      result.isDirectory = building.isDirectory;
+      result.size = building.size;
+      result.writeDate = building.writeDate;
+      result.writeTime = building.writeTime;
+      snprintf(result.name, sizeof(result.name), "%s", building.name);
       snprintf(lastVfsError, sizeof(lastVfsError), "none");
       return true;
     }
@@ -4388,6 +4492,8 @@ bool SmbServer::Impl::statPath(const char* path, VfsResult& result) {
       result.success = true;
       result.isDirectory = cached.isDirectory;
       result.size = cached.size;
+      result.writeDate = cached.writeDate;
+      result.writeTime = cached.writeTime;
       snprintf(result.name, sizeof(result.name), "%s", cached.name);
       snprintf(lastVfsError, sizeof(lastVfsError), "none");
       return true;
@@ -4522,7 +4628,8 @@ SmbServer::Impl::ensureDirectoryCached(const char* path) {
       return CacheLoadResult::kReady;
     }
     if (!directoryCache.append(result.isDirectory, result.size,
-                               result.name)) {
+                               result.name, result.writeDate,
+                               result.writeTime)) {
       // Один слишком большой каталог не должен ломать SMB. Освобождаем его
       // неполный снимок и ниже используем прежнее потоковое чтение с Z80.
       // Заглушка помнит решение, чтобы следующее обращение сразу пошло
@@ -4560,7 +4667,8 @@ bool SmbServer::Impl::appendDirectoryCacheBuild(
       directoryCacheBuildGeneration != handle.generation) {
     return true;
   }
-  if (directoryCache.append(result.isDirectory, result.size, result.name)) {
+  if (directoryCache.append(result.isDirectory, result.size, result.name,
+                            result.writeDate, result.writeTime)) {
     return true;
   }
 
@@ -4718,6 +4826,29 @@ void SmbServer::Impl::refreshCachedSize(const char* path, uint32_t size) {
   }
   const size_t parentLength = name == path ? 1 : static_cast<size_t>(name - path);
   directoryCache.updateEntrySizeAt(path, parentLength, name + 1, size);
+  // Размер меняется только записью и SET_EOF, а их WC отмечает временем
+  // изменения по своим часам. Сервер его не перечитывает (STAT посреди
+  // записи сбил бы единственный контекст FILEX) и ставит «сейчас» по ESP.
+  refreshCachedStamp(path, currentTimes().write);
+}
+
+void SmbServer::Impl::refreshCachedStamp(const char* path, FatStamp stamp) {
+  if (path == nullptr || *path != '/' || !stamp.known()) {
+    return;
+  }
+  for (Handle& handle : handles) {
+    if (handle.used && !handle.directory &&
+        asciiEqualNoCase(handle.path, path)) {
+      handle.times.write = stamp;
+    }
+  }
+  const char* name = strrchr(path, '/');
+  if (name == nullptr || name[1] == 0) {
+    return;
+  }
+  const size_t parentLength = name == path ? 1 : static_cast<size_t>(name - path);
+  directoryCache.updateEntryStampAt(path, parentLength, name + 1, stamp.date,
+                                    stamp.time);
 }
 
 void SmbServer::Impl::invalidateFsInfo() { fsInfoValid = false; }
@@ -5152,12 +5283,16 @@ uint64_t SmbServer::Impl::directoryChildFileId(
 }
 
 SmbServer::Impl::ReportedMetadata SmbServer::Impl::reportedMetadata(
-    const char* path, bool directory) const {
+    const char* path, bool directory, const FatTimes& times) const {
+  // Времена записи FAT, если плагин их отдал. Без них (старый плагин, корень)
+  // остаётся прежнее постоянное время — оно не должно «тикать», иначе
+  // Notepad++ бесконечно перечитывает файл. Настоящие штампы тоже стабильны.
   ReportedMetadata result;
   result.creationTime = currentFileTime();
   result.lastAccessTime = result.creationTime;
   result.lastWriteTime = result.creationTime;
   result.changeTime = result.creationTime;
+  applyTimes(times, result);
   result.attributes = directory ? SMB2_FILE_ATTRIBUTE_DIRECTORY
                                 : SMB2_FILE_ATTRIBUTE_ARCHIVE;
   for (const CachedMetadata& cached : metadataCache) {
@@ -5169,7 +5304,8 @@ SmbServer::Impl::ReportedMetadata SmbServer::Impl::reportedMetadata(
 }
 
 SmbServer::Impl::ReportedMetadata SmbServer::Impl::reportedChildMetadata(
-    const char* parentPath, const char* name, bool directory) const {
+    const char* parentPath, const char* name, bool directory,
+    const FatTimes& times) const {
   char path[kMaxPath + 1] = {};
   const char* parent = parentPath == nullptr || parentPath[0] == 0
                            ? "/"
@@ -5178,14 +5314,56 @@ SmbServer::Impl::ReportedMetadata SmbServer::Impl::reportedChildMetadata(
                          ? snprintf(path, sizeof(path), "/%s", name)
                          : snprintf(path, sizeof(path), "%s/%s", parent, name);
   if (length < 0 || static_cast<size_t>(length) >= sizeof(path)) {
-    return reportedMetadata("", directory);
+    return reportedMetadata("", directory, times);
   }
-  return reportedMetadata(path, directory);
+  return reportedMetadata(path, directory, times);
+}
+
+FatTimes SmbServer::Impl::currentTimes() const {
+  FatTimes times;
+  const time_t now = time(nullptr);
+  FatStamp stamp;
+  if (now >= kClockValidSince &&
+      unixToFatStamp(static_cast<int64_t>(now), timezoneSeconds, stamp)) {
+    times.write = stamp;
+  }
+  return times;
+}
+
+void SmbServer::Impl::applyTimes(const FatTimes& times,
+                                 ReportedMetadata& result) const {
+  int64_t written = 0;
+  if (!fatStampToUnix(times.write, timezoneSeconds, written)) {
+    return;
+  }
+  // FAT не хранит отдельного ChangeTime. Создание и доступ без STAT нового
+  // плагина неизвестны — тогда они равны изменению, а не постоянной дате.
+  const uint64_t writeTime = unixToFileTime(written);
+  result.lastWriteTime = writeTime;
+  result.changeTime = writeTime;
+  result.creationTime = writeTime;
+  result.lastAccessTime = writeTime;
+  if (!times.full) {
+    return;
+  }
+  int64_t created = 0;
+  if (fatStampToUnix(times.create, timezoneSeconds, created)) {
+    result.creationTime = unixToFileTime(created) +
+                          static_cast<uint64_t>(times.createTenth % 200) *
+                              100000ULL;
+  }
+  FatStamp access;
+  access.date = times.accessDate;
+  int64_t accessed = 0;
+  if (fatStampToUnix(access, timezoneSeconds, accessed)) {
+    result.lastAccessTime = unixToFileTime(accessed);  // только дата
+  }
 }
 
 void SmbServer::Impl::rememberMetadata(const char* path, bool directory,
                                        const VfsMetadata& metadata,
-                                       uint8_t appliedAttributes) {
+                                       uint8_t appliedAttributes,
+                                       const FatTimes& times) {
   CachedMetadata* selected = nullptr;
   for (CachedMetadata& cached : metadataCache) {
     if (cached.used && asciiEqualNoCase(cached.path, path)) {
@@ -5203,7 +5381,7 @@ void SmbServer::Impl::rememberMetadata(const char* path, bool directory,
     return;
   }
   if (!selected->used || !asciiEqualNoCase(selected->path, path)) {
-    selected->value = reportedMetadata(path, directory);
+    selected->value = reportedMetadata(path, directory, times);
     snprintf(selected->path, sizeof(selected->path), "%s", path);
     selected->used = true;
   }
@@ -5379,10 +5557,10 @@ smb2_timeval SmbServer::Impl::currentSmb2Time() const {
 void SmbServer::Impl::fillDirectoryInfo(
     smb2_fileidbothdirectoryinformation& info, uint32_t index,
     bool directory, uint32_t size, const char* parentPath,
-    const char* name) const {
+    const char* name, const FatTimes& times) const {
   memset(&info, 0, sizeof(info));
   const ReportedMetadata metadata =
-      reportedChildMetadata(parentPath, name, directory);
+      reportedChildMetadata(parentPath, name, directory, times);
   smb2_win_to_timeval(metadata.creationTime, &info.creation_time);
   smb2_win_to_timeval(metadata.lastAccessTime, &info.last_access_time);
   smb2_win_to_timeval(metadata.lastWriteTime, &info.last_write_time);
@@ -5539,7 +5717,22 @@ bool SmbServer::Impl::applyPendingMetadata(int slot) {
     return false;
   }
   rememberMetadata(handle.path, handle.directory, handle.pendingMetadata,
-                   result.appliedAttributes);
+                   result.appliedAttributes, handle.times);
+  // Те же штампы — в дескриптор и в кэш каталога: запись переопределений
+  // невелика и вытесняется, а листинг после неё должен показывать новую дату.
+  if ((handle.pendingMetadata.timeMask & 0x04) != 0) {
+    handle.times.write.date = handle.pendingMetadata.writeDate;
+    handle.times.write.time = handle.pendingMetadata.writeTime;
+    refreshCachedStamp(handle.path, handle.times.write);
+  }
+  if ((handle.pendingMetadata.timeMask & 0x01) != 0 && handle.times.full) {
+    handle.times.create.date = handle.pendingMetadata.createDate;
+    handle.times.create.time = handle.pendingMetadata.createTime;
+    handle.times.createTenth = handle.pendingMetadata.createTenth;
+  }
+  if ((handle.pendingMetadata.timeMask & 0x02) != 0 && handle.times.full) {
+    handle.times.accessDate = handle.pendingMetadata.accessDate;
+  }
   handle.metadataPending = false;
   handle.pendingMetadata = {};
   handle.metadataDirty = true;
@@ -6305,14 +6498,15 @@ bool SmbServer::Impl::enqueueAsyncDirectory(
 
 bool SmbServer::Impl::queueAsyncDirectoryReply(
     const AsyncDirectory& pending, Handle& handle, const char* name,
-    bool directory, uint32_t size, uint32_t fileIndex) {
+    bool directory, uint32_t size, uint32_t fileIndex,
+    const FatTimes& times) {
   if (pending.context == nullptr || name == nullptr || name[0] == 0) {
     return false;
   }
   snprintf(directoryName, sizeof(directoryName), "%s", name);
   memset(&directoryInfo, 0, sizeof(directoryInfo));
   fillDirectoryInfo(directoryInfo, fileIndex, directory, size, handle.path,
-                    directoryName);
+                    directoryName, times);
 
   smb2_query_directory_request request = {};
   request.file_information_class = pending.informationClass;
@@ -6332,6 +6526,7 @@ bool SmbServer::Impl::queueAsyncDirectoryReply(
   handle.directoryLastValid = true;
   handle.directoryLastIsDirectory = directory;
   handle.directoryLastSize = size;
+  handle.directoryLastTimes = times;
   snprintf(handle.directoryLastName, sizeof(handle.directoryLastName), "%s",
            name);
   smb2_set_pdu_message_id(pending.context, pdu, pending.messageId);
@@ -6364,6 +6559,84 @@ void SmbServer::Impl::completeAsyncDirectory(int index, uint32_t status) {
   }
   if (detached) {
     releaseDetachedOwnerIfIdle(ownerId);
+  }
+}
+
+bool SmbServer::Impl::appendAsyncDirectoryBatch(AsyncDirectory& pending,
+                                                Handle& handle,
+                                                const VfsResult& result,
+                                                size_t encoded) {
+  if (asyncDirectoryEntries == nullptr || asyncDirectoryNames == nullptr ||
+      pending.batchCount >= kAsyncDirectoryBatchCapacity) {
+    return false;
+  }
+  const size_t stride = padTo8(sizeof(smb2_fileidbothdirectoryinformation));
+  // Имя копируем: указатель в структуре должен жить до кодирования ответа.
+  char* name = asyncDirectoryNames + pending.batchCount * (kMaxPath + 1);
+  snprintf(name, kMaxPath + 1, "%s", result.name);
+  auto* info = reinterpret_cast<smb2_fileidbothdirectoryinformation*>(
+      asyncDirectoryEntries + pending.batchCount * stride);
+  const FatTimes times = timesOf(result);
+  fillDirectoryInfo(*info, handle.directoryIndex, result.isDirectory,
+                    result.size, handle.path, name, times);
+  if (pending.batchCount == 0) {
+    pending.batchStartedMs = millis();
+  }
+  ++pending.batchCount;
+  pending.batchEncoded += encoded;
+  // Как и прежде, последнюю выданную запись запоминаем до ответа в TCP:
+  // CREATE Проводника по ней может прийти раньше, чем кончится пачка.
+  handle.directoryLastValid = true;
+  handle.directoryLastIsDirectory = result.isDirectory;
+  handle.directoryLastSize = result.size;
+  handle.directoryLastTimes = times;
+  snprintf(handle.directoryLastName, sizeof(handle.directoryLastName), "%s",
+           result.name);
+  return true;
+}
+
+bool SmbServer::Impl::asyncDirectoryBatchDue(
+    const AsyncDirectory& pending) const {
+  return pending.batchCount != 0 &&
+         static_cast<uint32_t>(millis() - pending.batchStartedMs) >=
+             kColdDirectoryReplyBudgetMs;
+}
+
+void SmbServer::Impl::flushAsyncDirectoryBatch(int index, Handle& handle) {
+  AsyncDirectory& pending = asyncDirectories[index];
+  const size_t stride = padTo8(sizeof(smb2_fileidbothdirectoryinformation));
+  bool queued = false;
+  if (pending.context != nullptr && pending.batchCount != 0 &&
+      asyncDirectoryEntries != nullptr) {
+    smb2_query_directory_request request = {};
+    request.file_information_class = pending.informationClass;
+    request.flags = pending.flags;
+    request.output_buffer_length = pending.outputBufferLength;
+    smb2_query_directory_reply reply = {};
+    // Массив одинаковых C-структур; записи переменной длины UTF-16 из него
+    // libsmb2 собирает сама, прямо здесь, при создании PDU.
+    reply.output_buffer = asyncDirectoryEntries;
+    reply.output_buffer_length =
+        static_cast<uint32_t>(pending.batchCount * stride);
+    smb2_pdu* pdu = smb2_cmd_query_directory_reply_async(
+        pending.context, &request, &reply, nullptr, nullptr);
+    if (pdu != nullptr) {
+      smb2_set_pdu_message_id(pending.context, pdu, pending.messageId);
+      smb2_queue_pdu(pending.context, pdu);
+      sendOperation("DIR", handle.path);
+      directoryContinuationOwnerId = pending.ownerId;
+      directoryContinuationUntilMs = millis() + kDirectoryContinuationGraceMs;
+      queued = true;
+    }
+  }
+  smb2_context* context = pending.context;
+  pending = {};
+  if (asyncDirectoryCount != 0) {
+    --asyncDirectoryCount;
+  }
+  activeAsyncDirectory = -1;
+  if (!queued && context != nullptr) {
+    smb2_close_context(context);
   }
 }
 
@@ -6513,10 +6786,13 @@ bool SmbServer::Impl::queueAsyncCreateReply(AsyncCreate& pending) {
   handle.physicalSize = pending.existingSize;
   handle.openedSize = pending.existingSize;
   snprintf(handle.path, sizeof(handle.path), "%s", pending.path);
+  handle.times = pending.createNewDirectory ? currentTimes()
+                                            : pending.existingTimes;
 
   smb2_create_reply reply = {};
   memcpy(reply.file_id, handle.fileId, SMB2_FD_SIZE);
-  const ReportedMetadata metadata = reportedMetadata(handle.path, true);
+  const ReportedMetadata metadata =
+      reportedMetadata(handle.path, true, handle.times);
   reply.creation_time = metadata.creationTime;
   reply.last_access_time = metadata.lastAccessTime;
   reply.last_write_time = metadata.lastWriteTime;
@@ -6741,6 +7017,7 @@ void SmbServer::Impl::pollAsyncCreate() {
           return;
         }
         pending.existingSize = result.size;
+        pending.existingTimes = timesOf(result);
         const bool queued = queueAsyncCreateReply(pending);
         smb2_context* const context = pending.context;
         pending = {};
@@ -7566,6 +7843,12 @@ void SmbServer::Impl::pollAsyncDirectory() {
 
       case AsyncDirectoryPhase::kRead: {
         if (!result.success) {
+          // Собранные записи уже учтены в directoryIndex. Отдаём их, а ошибка
+          // повторится на следующем запросе — ни одно имя не теряется.
+          if (pending.batchCount != 0) {
+            flushAsyncDirectoryBatch(index, *handle);
+            return;
+          }
           completeAsyncDirectory(index,
                                  result.status != 0
                                      ? smbStatusFromFilex(result.status)
@@ -7575,29 +7858,55 @@ void SmbServer::Impl::pollAsyncDirectory() {
         if (result.atEnd) {
           finishDirectoryCacheBuild(pending.slot, *handle);
           handle->directoryEnded = true;
+          // Следующий QUERY_DIRECTORY получит NO_MORE_FILES по directoryEnded.
+          if (pending.batchCount != 0) {
+            flushAsyncDirectoryBatch(index, *handle);
+            return;
+          }
           completeAsyncDirectory(index, SMB2_STATUS_NO_MORE_FILES);
           return;
         }
         appendDirectoryCacheBuild(pending.slot, *handle, result);
         ++handle->directoryIndex;
         if (!wildcardMatch(handle->pattern, result.name)) {
+          if (asyncDirectoryBatchDue(pending)) {
+            flushAsyncDirectoryBatch(index, *handle);
+            return;
+          }
           break;
         }
         const size_t encoded =
             directoryEncodedSize(pending.informationClass, result.name);
-        if (encoded == 0 || encoded > pending.outputBufferLength) {
+        if (encoded == 0 ||
+            encoded > pending.outputBufferLength - pending.batchEncoded) {
           handle->directoryPending = true;
           handle->directoryPendingIsDirectory = result.isDirectory;
           handle->directoryPendingSize = result.size;
+          handle->directoryPendingTimes = timesOf(result);
           handle->directoryPendingIndex = handle->directoryIndex;
           snprintf(handle->directoryPendingName,
                    sizeof(handle->directoryPendingName), "%s", result.name);
+          // Не влезла в этот ответ — уйдёт первой в следующем.
+          if (pending.batchCount != 0) {
+            flushAsyncDirectoryBatch(index, *handle);
+            return;
+          }
           completeAsyncDirectory(index, SMB2_STATUS_BUFFER_TOO_SMALL);
           return;
         }
+        if (appendAsyncDirectoryBatch(pending, *handle, result, encoded)) {
+          if ((pending.flags & SMB2_RETURN_SINGLE_ENTRY) != 0 ||
+              pending.batchCount >= kAsyncDirectoryBatchCapacity ||
+              asyncDirectoryBatchDue(pending)) {
+            flushAsyncDirectoryBatch(index, *handle);
+            return;
+          }
+          break;
+        }
+        // Памяти под пачку нет (без PSRAM) — прежний ответ одной записью.
         const bool queued = queueAsyncDirectoryReply(
             pending, *handle, result.name, result.isDirectory, result.size,
-            handle->directoryIndex);
+            handle->directoryIndex, timesOf(result));
         if (queued) {
           directoryContinuationOwnerId = pending.ownerId;
           directoryContinuationUntilMs =
@@ -7621,6 +7930,13 @@ void SmbServer::Impl::pollAsyncDirectory() {
   }
 
   if (pending.cancelRequested) {
+    // Записи пачки уже сняты с курсора каталога: отдать их вернее, чем
+    // потерять. Пустой запрос отменяется как прежде.
+    Handle* batchHandle = pending.batchCount != 0 ? validHandle() : nullptr;
+    if (batchHandle != nullptr) {
+      flushAsyncDirectoryBatch(index, *batchHandle);
+      return;
+    }
     completeAsyncDirectory(index, SMB2_STATUS_CANCELLED);
     return;
   }
@@ -7666,7 +7982,7 @@ void SmbServer::Impl::pollAsyncDirectory() {
     const bool queued = queueAsyncDirectoryReply(
         pending, *handle, handle->directoryPendingName,
         handle->directoryPendingIsDirectory, handle->directoryPendingSize,
-        handle->directoryPendingIndex);
+        handle->directoryPendingIndex, handle->directoryPendingTimes);
     if (queued) {
       directoryContinuationOwnerId = pending.ownerId;
       directoryContinuationUntilMs = millis() + kDirectoryContinuationGraceMs;
@@ -7760,6 +8076,14 @@ int SmbServer::Impl::destructionHandler(smb2_server* serverValue,
     self->cleanupClient(smb2);
   }
   return 0;
+}
+
+long SmbServer::Impl::serviceWaitHandler(smb2_server* serverValue) {
+  Impl* self = from(serverValue);
+  // Результат моста забирает только serviceHandler. Пока core 1 работает с
+  // Z80, просыпаться нужно по его готовности, а не по сокету.
+  return self != nullptr && self->bridge.requestPending() ? kServiceBusyWaitUs
+                                                         : -1;
 }
 
 int SmbServer::Impl::serviceHandler(smb2_server* serverValue) {
@@ -8204,6 +8528,10 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
   // Материализовать оставшийся хвост вправе только Open, получивший SET_EOF.
   handle.ownsSizeReservation = false;
   snprintf(handle.path, sizeof(handle.path), "%s", path);
+  // Существующий объект — со штампами из STAT; созданный или усечённый только
+  // что — «сейчас»: WC поставил ему время по своим часам.
+  handle.times = action == kCreateOpened ? timesOf(statResult)
+                                         : self->currentTimes();
   memcpy(reply->file_id, handle.fileId, SMB2_FD_SIZE);
 
   // Служебный metadata-only Open остаётся только представлением уже открытого
@@ -8222,7 +8550,7 @@ int SmbServer::Impl::createHandler(smb2_server* serverValue,
       requestedContexts.lease;
 
   const ReportedMetadata metadata =
-      self->reportedMetadata(handle.path, directory);
+      self->reportedMetadata(handle.path, directory, handle.times);
   reply->creation_time = metadata.creationTime;
   reply->last_access_time = metadata.lastAccessTime;
   reply->last_write_time = metadata.lastWriteTime;
@@ -8377,7 +8705,7 @@ uint32_t SmbServer::Impl::finalizeClose(int slot, uint32_t generation,
   memset(&reply, 0, sizeof(reply));
   if ((flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB) != 0) {
     const ReportedMetadata metadata =
-        reportedMetadata(handle.path, handle.directory);
+        reportedMetadata(handle.path, handle.directory, handle.times);
     reply.flags = SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB;
     reply.creation_time = metadata.creationTime;
     reply.last_access_time = metadata.lastAccessTime;
@@ -9189,7 +9517,7 @@ int SmbServer::Impl::queryCachedDirectory(
     auto* info = reinterpret_cast<smb2_fileidbothdirectoryinformation*>(
         entries + count * stride);
     fillDirectoryInfo(*info, handle.directoryIndex, cached.isDirectory,
-                      cached.size, handle.path, cached.name);
+                      cached.size, handle.path, cached.name, timesOf(cached));
     encoded += entrySize;
     ++count;
     if ((request->flags & SMB2_RETURN_SINGLE_ENTRY) != 0) {
@@ -9252,7 +9580,7 @@ int SmbServer::Impl::queryStreamedDirectory(
   snprintf(directoryName, sizeof(directoryName), "%s", result.name);
   fillDirectoryInfo(directoryInfo, handle.directoryIndex,
                     result.isDirectory, result.size,
-                    handle.path, directoryName);
+                    handle.path, directoryName, timesOf(result));
   reply->output_buffer = reinterpret_cast<uint8_t*>(&directoryInfo);
   reply->output_buffer_length =
       static_cast<uint32_t>(padTo8(sizeof(directoryInfo)));
@@ -9430,7 +9758,7 @@ int SmbServer::Impl::queryInfoHandler(smb2_server* serverValue,
                       handle->path);
   const uint32_t size = self->visibleSize(*handle);
   const ReportedMetadata metadata =
-      self->reportedMetadata(handle->path, handle->directory);
+      self->reportedMetadata(handle->path, handle->directory, handle->times);
   const uint32_t attributes = metadata.attributes;
   void* output = nullptr;
   uint32_t outputLength = 0;
@@ -9719,17 +10047,19 @@ int SmbServer::Impl::setInfoHandler(smb2_server* serverValue,
         metadata.createFileTime = readLe64Local(data);
         metadata.accessFileTime = readLe64Local(data + 8);
         metadata.writeFileTime = readLe64Local(data + 16);
-        if (fileTimeToFat(metadata.createFileTime, fatDate, fatTime,
-                          &metadata.createTenth)) {
+        if (fileTimeToFat(metadata.createFileTime, self->timezoneSeconds,
+                          fatDate, fatTime, &metadata.createTenth)) {
           metadata.timeMask |= 0x01;
           metadata.createDate = fatDate;
           metadata.createTime = fatTime;
         }
-        if (fileTimeToFat(metadata.accessFileTime, fatDate, fatTime)) {
+        if (fileTimeToFat(metadata.accessFileTime, self->timezoneSeconds,
+                          fatDate, fatTime)) {
           metadata.timeMask |= 0x02;
           metadata.accessDate = fatDate;
         }
-        if (fileTimeToFat(metadata.writeFileTime, fatDate, fatTime)) {
+        if (fileTimeToFat(metadata.writeFileTime, self->timezoneSeconds,
+                          fatDate, fatTime)) {
           metadata.timeMask |= 0x04;
           metadata.writeDate = fatDate;
           metadata.writeTime = fatTime;
@@ -9984,6 +10314,10 @@ bool SmbServer::start(const uint8_t* payload, uint16_t length,
   }
   return impl_->start(payload, length, actualPort, netbiosActive, error,
                       errorSize);
+}
+
+void SmbServer::setTimezoneHours(int8_t hours) {
+  impl_->timezoneSeconds = static_cast<int32_t>(hours) * 3600;
 }
 
 bool SmbServer::stop() {

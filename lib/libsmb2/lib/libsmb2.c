@@ -4866,6 +4866,14 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                 /* 100ms select timeout to allow periodic pdu timeouts */
                 timeout.tv_sec = 0;
                 timeout.tv_usec = 100000;
+                /* ZiFi: a pending VFS result is not a socket event.  Let the
+                 * server shorten the sleep while it waits for core 1. */
+                if (server->handlers && server->handlers->service_wait_us) {
+                        long wait_us = server->handlers->service_wait_us(server);
+                        if (wait_us >= 0 && wait_us < timeout.tv_usec) {
+                                timeout.tv_usec = wait_us;
+                        }
+                }
 
                 ready = select(
                             maxfd + 1,

@@ -44,7 +44,7 @@ class WifiSignalTest(unittest.TestCase):
 
         self.assertIn("ld hl,UiWifiWaiting", plugin)
         self.assertIn("cp EVT_WIFI_SIGNAL", plugin)
-        self.assertIn("call Ui_SetStatus", handler)
+        self.assertIn("call Ui_SetSignal", handler)
         self.assertNotIn("CMD_SYS_INFO", handler)
         self.assertIn(
             'UiWifiWaiting:     db "Wi-Fi [................]   0%",0', ui
@@ -64,7 +64,7 @@ class WifiSignalTest(unittest.TestCase):
 
         self.assertIn("ld hl,UiWifiWaiting", plugin)
         self.assertIn("cp EVT_WIFI_SIGNAL", plugin)
-        self.assertIn("call Ui_SetStatus", handler)
+        self.assertIn("call Ui_SetSignal", handler)
         self.assertNotIn("CMD_SYS_INFO", handler)
         self.assertIn(
             'UiWifiWaiting:     db "Wi-Fi [................]   0%",0', ui

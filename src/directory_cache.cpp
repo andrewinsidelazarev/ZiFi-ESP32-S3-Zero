@@ -16,6 +16,8 @@ namespace zifi {
 struct DirectoryCache::Entry {
   Entry* next;
   uint32_t size;
+  uint16_t writeDate;
+  uint16_t writeTime;
   bool isDirectory;
   char name[1];
 };
@@ -205,8 +207,34 @@ bool DirectoryCache::markUncacheable(const char* path) {
 
 bool DirectoryCache::updateEntrySizeAt(const char* path, size_t parentLength,
                                        const char* name, uint32_t size) {
-  if (!enabled_ || path == nullptr || name == nullptr || parentLength == 0) {
+  Entry* entry = findFileAt(path, parentLength, name);
+  if (entry == nullptr) {
     return false;
+  }
+  entry->size = size;
+  return true;
+}
+
+bool DirectoryCache::updateEntryStampAt(const char* path, size_t parentLength,
+                                        const char* name, uint16_t writeDate,
+                                        uint16_t writeTime) {
+  if (writeDate == 0) {
+    return false;
+  }
+  Entry* entry = findFileAt(path, parentLength, name);
+  if (entry == nullptr) {
+    return false;
+  }
+  entry->writeDate = writeDate;
+  entry->writeTime = writeTime;
+  return true;
+}
+
+DirectoryCache::Entry* DirectoryCache::findFileAt(const char* path,
+                                                  size_t parentLength,
+                                                  const char* name) {
+  if (!enabled_ || path == nullptr || name == nullptr || parentLength == 0) {
+    return nullptr;
   }
   // Сравниваем родителя прямо в исходной строке, не копируя её.
   Snapshot* snapshot = nullptr;
@@ -230,16 +258,15 @@ bool DirectoryCache::updateEntrySizeAt(const char* path, size_t parentLength,
     }
   }
   if (snapshot == nullptr) {
-    return false;
+    return nullptr;
   }
   snapshot->lastUse = ++useCounter_;
   for (Entry* entry = snapshot->first; entry != nullptr; entry = entry->next) {
     if (!entry->isDirectory && equalNoCase(entry->name, name)) {
-      entry->size = size;
-      return true;
+      return entry;
     }
   }
-  return false;
+  return nullptr;
 }
 
 bool DirectoryCache::updateEntrySize(const char* path, const char* name,
@@ -315,8 +342,8 @@ bool DirectoryCache::beginSnapshot(const char* path) {
   return true;
 }
 
-bool DirectoryCache::append(bool isDirectory, uint32_t size,
-                            const char* name) {
+bool DirectoryCache::append(bool isDirectory, uint32_t size, const char* name,
+                            uint16_t writeDate, uint16_t writeTime) {
   if (building_ == nullptr || name == nullptr || name[0] == 0 ||
       strlen(name) > 255) {
     return false;
@@ -328,6 +355,8 @@ bool DirectoryCache::append(bool isDirectory, uint32_t size,
   }
   memset(entry, 0, bytes);
   entry->size = size;
+  entry->writeDate = writeDate;
+  entry->writeTime = writeTime;
   entry->isDirectory = isDirectory;
   memcpy(entry->name, name, strlen(name) + 1);
   if (building_->last == nullptr) {
@@ -431,6 +460,8 @@ bool DirectoryCache::next(Cursor& cursor, EntryView& view) const {
   const auto* entry = static_cast<const Entry*>(cursor.next);
   view.isDirectory = entry->isDirectory;
   view.size = entry->size;
+  view.writeDate = entry->writeDate;
+  view.writeTime = entry->writeTime;
   view.name = entry->name;
   cursor.next = entry->next;
   return true;
@@ -446,6 +477,28 @@ bool DirectoryCache::findEntry(const char* path, const char* name,
     if (equalNoCase(entry->name, name)) {
       view.isDirectory = entry->isDirectory;
       view.size = entry->size;
+      view.writeDate = entry->writeDate;
+      view.writeTime = entry->writeTime;
+      view.name = entry->name;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool DirectoryCache::findBuildingEntry(const char* path, const char* name,
+                                       EntryView& view) const {
+  if (!enabled_ || building_ == nullptr || name == nullptr ||
+      !equalNoCase(building_->path, path)) {
+    return false;
+  }
+  for (Entry* entry = building_->first; entry != nullptr;
+       entry = entry->next) {
+    if (equalNoCase(entry->name, name)) {
+      view.isDirectory = entry->isDirectory;
+      view.size = entry->size;
+      view.writeDate = entry->writeDate;
+      view.writeTime = entry->writeTime;
       view.name = entry->name;
       return true;
     }

@@ -18,6 +18,9 @@ class DirectoryCache {
   struct EntryView {
     bool isDirectory = false;
     uint32_t size = 0;
+    // Штамп изменения записи FAT (местное время); дата 0 — неизвестен.
+    uint16_t writeDate = 0;
+    uint16_t writeTime = 0;
     const char* name = nullptr;
   };
 
@@ -43,7 +46,8 @@ class DirectoryCache {
 
   bool contains(const char* path) const;
   bool beginSnapshot(const char* path);
-  bool append(bool isDirectory, uint32_t size, const char* name);
+  bool append(bool isDirectory, uint32_t size, const char* name,
+              uint16_t writeDate = 0, uint16_t writeTime = 0);
   bool finishSnapshot();
   void abortSnapshot();
 
@@ -63,6 +67,11 @@ class DirectoryCache {
   // стек SMB-задачи ограничен, а два буфера по 257 байт там уже опасны.
   bool updateEntrySizeAt(const char* path, size_t parentLength,
                          const char* name, uint32_t size);
+  // Запись в файл меняет и его штамп изменения: WC ставит его по часам. Дата 0
+  // оставляет прежний штамп — время ESP ещё не сверено по NTP.
+  bool updateEntryStampAt(const char* path, size_t parentLength,
+                          const char* name, uint16_t writeDate,
+                          uint16_t writeTime);
 
   // invalidate удаляет один каталог, invalidateSubtree — каталог и все
   // вложенные снимки. Второй вариант нужен при удалении/переименовании папки.
@@ -73,6 +82,10 @@ class DirectoryCache {
   bool cursorCurrent(const Cursor& cursor) const;
   bool next(Cursor& cursor, EntryView& entry) const;
   bool findEntry(const char* path, const char* name, EntryView& entry) const;
+  // Поиск в снимке, который ещё строится. Отсутствие имени в нём ничего не
+  // доказывает, но найденная запись — такой же точный результат FINDNEXT.
+  bool findBuildingEntry(const char* path, const char* name,
+                         EntryView& entry) const;
 
  private:
   struct Entry;
@@ -82,6 +95,8 @@ class DirectoryCache {
   void release(void* memory, size_t bytes);
   void freeSnapshot(Snapshot* snapshot);
   Snapshot* findSnapshot(const char* path) const;
+  // Файл в полном снимке его родителя; родитель задан длиной внутри path.
+  Entry* findFileAt(const char* path, size_t parentLength, const char* name);
   Snapshot* findAnySnapshot(const char* path) const;
   // Освобождает снимок, к которому дольше всего не обращались. Строящийся
   // снимок не вытесняется никогда: он ещё не является цельными данными.

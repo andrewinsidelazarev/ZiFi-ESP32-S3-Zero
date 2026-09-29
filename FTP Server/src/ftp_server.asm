@@ -17,6 +17,7 @@ PLUGIN:
         ; изменений на диске обнуляем здесь, а не полагаемся на db 0.
         xor a
         ld (VfsChanged),a
+        ld (VfsFilexKnown),a             ; возможности FILEX спросить заново
         ld a,1
         call WC_INT_PL                   ; WC не должен перерисовывать часы под окном
         call Vfs_Crc16Init               ; таблицы CRC — до первого файлового обмена
@@ -42,12 +43,13 @@ PLUGIN:
 
 .server_loop:
         ; Vfs_Serve разбирает всё, что уже пришло, и отвечает на файловые
-        ; запросы. HALT отдаёт время WC и не создаёт busy-loop на Z80.
+        ; запросы. Link_WaitRx ждёт следующих байтов не дольше кадра, так что
+        ; Esc проверяется не реже, чем прежде при HALT.
         ei
         call Vfs_Serve
         call WC_ESC
         jr nz,.exit
-        halt
+        call Link_WaitRx
         jr .server_loop
 
 .config_error:
@@ -366,6 +368,36 @@ Link_Stop:
         ld de,LINK_TRY
         jp Proto_WaitCmd
 
+; Ждать данных от ESP, но не дольше конца текущего кадра.
+;
+; Прежде здесь стоял HALT. Он будил плагин только следующим прерыванием, а ESP
+; присылает следующий файловый запрос через 1-3 мс после ответа: плагин к тому
+; времени уже спал, и каждый запрос простаивал до конца кадра. Каталог ESP
+; читал по одной записи за запрос, поэтому 500 записей стоили 10 секунд одних
+; ожиданий. Теперь очередь приёма ZiFi опрашивается непрерывно, и пришедший
+; байт разбирается сразу. Без данных выход — на смене кадрового таймера WC
+; (#6009, растёт в каждом прерывании). Предел витков нужен, только если
+; прерываний нет вовсе: он больше кадра и при 14 МГц.
+LINK_SPIN       equ 8192
+
+Link_WaitRx:
+        ld a,(WC_FRAMES)
+        ld e,a
+        ld hl,LINK_SPIN
+        ld bc,ZIFI_RX_COUNT
+.spin:
+        in a,(c)
+        or a
+        ret nz                          ; байт пришёл — разбирать сразу
+        ld a,(WC_FRAMES)
+        cp e
+        ret nz                          ; кадр сменился
+        dec hl
+        ld a,h
+        or l
+        jr nz,.spin
+        ret
+
 ; --- обслуживание файловых запросов -----------------------------------------
 
 ; Разобрать всё, что уже пришло от ESP, и ответить на файловые запросы.
@@ -423,6 +455,8 @@ FtpEvent_Command:
 
 ; Уровень Wi-Fi приходит отдельной готовой ASCII-строкой. Поле Status
 ; заменяет Listening; SYS_INFO для этого не вызывается и его текст не меняется.
+; Клетки шкалы и процент — цветом уровня: зелёный, жёлтый или красный
+; (wifi_signal.asm).
 FtpEvent_WifiSignal:
         ld hl,(ProtoRxLen)
         ld a,h
@@ -432,7 +466,7 @@ FtpEvent_WifiSignal:
         add hl,de
         ld (hl),0
         ld hl,ProtoBuf
-        call Ui_SetStatus
+        call Ui_SetSignal
         call Ui_Draw
         jp Vfs_Serve
 
@@ -462,3 +496,4 @@ LocalIp:        ds 4                     ; IP, выданный роутером
         INCLUDE "proto.asm"
         INCLUDE "vfs.asm"
         INCLUDE "fs.asm"
+        INCLUDE "wifi_signal.asm"

@@ -33,6 +33,13 @@ CMD_NET_IPCONFIG equ #21               ; текущие IP, маска, шлюз
 CMD_NET_NTP     equ #22                ; точное время; ESP уже учла time: из ini
 CMD_NET_PROXY_STATUS equ #23           ; статус HTTP-прокси (0=выкл, 1=вкл, 2=недоступен)
 CMD_WEATHER_GET equ #24                ; запись погоды для заставки, без payload
+; Проверка и обновление Wild Commander с GitHub (плагин WC Update).
+; START: репозиторий,0,ветка,0,каталог,0,защищённые пути,0...,0 — ESP сама
+; сверяет SHA и шлёт события; APPLY: номера строк списка по байту.
+CMD_WCU_START   equ #25
+CMD_WCU_APPLY   equ #26
+CMD_WCU_STOP    equ #27
+CMD_WCU_SYNC    equ #28                ; выдать заново список и состояние
 ; TCP-клиент: подключиться, отправить, забрать порцию, закрыть. Данные тянет
 ; Z80 — приёмная очередь ZiFi всего 256 байт, и непрошеный поток её переполнит.
 CMD_NET_OPEN    equ #10                ; адрес,0,порт LE16 (без порта — 80)
@@ -51,6 +58,8 @@ EVT_SMB_COMMAND equ #63
 EVT_SMB_PROGRESS equ #64               ; готовая строка хода передачи файла
 EVT_ONLINE_UPDATE_PROGRESS equ #65     ; [этап][проценты]
 EVT_WIFI_SIGNAL equ #66                ; готовая ASCII-шкала для Status
+EVT_WCU_STATE   equ #67                ; [этап][тек LE16][всего LE16][%][текст]
+EVT_WCU_ENTRY   equ #68                ; [№][состояние][флаги][SD LE24][GitHub LE24][путь]
 
 RESP_SYS_INFO   equ #82
 RESP_WIFI_INI   equ #83
@@ -72,6 +81,10 @@ RESP_NET_PING   equ #A1
 RESP_NET_NTP    equ #A2                ; ГГГГММДДЧЧММСС, 14 символов ASCII
 RESP_NET_PROXY_STATUS equ #A3          ; [status(1B)][endpoint(ASCII)]
 RESP_WEATHER    equ #A4                 ; запись погоды (см. Weather screensaver/src/weather.asm)
+RESP_WCU_START  equ #A5                 ; [1 — проверка запущена]
+RESP_WCU_APPLY  equ #A6                 ; [1 — список принят]
+RESP_WCU_STOP   equ #A7                 ; [1 — задача остановлена]
+RESP_WCU_SYNC   equ #A8                 ; [1 — повтор поставлен в очередь]
 RESP_NET_OPEN   equ #90
 RESP_NET_SEND   equ #91
 ; Первый байт: 0 — порция (пустая значит «данных пока нет, спроси снова»),

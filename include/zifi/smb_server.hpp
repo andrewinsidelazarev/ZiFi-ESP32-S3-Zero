@@ -26,6 +26,10 @@ class SmbServer {
              bool& netbiosActive, char* error, size_t errorSize);
   bool stop();
 
+  // Пояс из zifi.ini (time:, целые часы). В FAT хранится местное время, а SMB
+  // передаёт FILETIME в UTC: пояс нужен для перевода в обе стороны.
+  void setTimezoneHours(int8_t hours);
+
   // NBNS и WS-Discovery обслуживаются из уже существующей сетевой задачи.
   // Сам SMB listener живёт отдельно, потому что цикл libsmb2 блокирующий.
   void pollDiscovery();

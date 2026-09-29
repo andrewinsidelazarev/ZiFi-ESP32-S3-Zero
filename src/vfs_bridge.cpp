@@ -253,6 +253,15 @@ bool VfsBridge::takeResult(VfsResult& result) {
   return true;
 }
 
+void VfsBridge::waitForResult(uint32_t timeoutMs) {
+  if (!ready_ || !requestPending_) {
+    vTaskDelay(pdMS_TO_TICKS(timeoutMs));
+    return;
+  }
+  uint8_t token = 0;
+  xQueuePeek(responseQueue_, &token, pdMS_TO_TICKS(timeoutMs));
+}
+
 size_t VfsBridge::writeFromNetwork(const uint8_t* data, size_t length) {
   return networkToVfs_.write(data, length);
 }
@@ -348,6 +357,17 @@ bool VfsBridge::writeNetworkWindow(void* context, const uint8_t* data,
   return self->vfsToNetwork_.write(data, length) == length;
 }
 
+void VfsBridge::copyDates(const VfsEntry& entry, VfsResult& result) {
+  result.writeDate = entry.writeDate;
+  result.writeTime = entry.writeTime;
+  result.hasMetadata = entry.hasMetadata;
+  result.attributes = entry.attributes;
+  result.createTenth = entry.createTenth;
+  result.createTime = entry.createTime;
+  result.createDate = entry.createDate;
+  result.accessDate = entry.accessDate;
+}
+
 void VfsBridge::processCore1() {
   memset(&exchange_->result, 0, sizeof(exchange_->result));
   VfsEntry entry;
@@ -365,6 +385,7 @@ void VfsBridge::processCore1() {
       if (vfs_.stat(exchange_->request.path, entry)) {
         exchange_->result.isDirectory = entry.isDirectory;
         exchange_->result.size = entry.size;
+        copyDates(entry, exchange_->result);
         finish(true);
       } else {
         finish(false);
@@ -378,6 +399,7 @@ void VfsBridge::processCore1() {
         exchange_->result.atEnd = atEnd;
         exchange_->result.isDirectory = entry.isDirectory;
         exchange_->result.size = entry.size;
+        copyDates(entry, exchange_->result);
         if (!atEnd) {
           snprintf(exchange_->result.name, sizeof(exchange_->result.name),
                    "%s", entry.name);
@@ -533,6 +555,16 @@ void VfsBridge::pollCore1() {
   }
   processCore1();
   xQueueOverwrite(responseQueue_, &token);
+}
+
+void VfsBridge::waitForRequest(uint32_t timeoutMs) {
+  if (!ready_) {
+    delay(timeoutMs);
+    return;
+  }
+  // Только подсмотреть: саму заявку заберёт pollCore1 на следующем витке.
+  uint8_t token = 0;
+  xQueuePeek(requestQueue_, &token, pdMS_TO_TICKS(timeoutMs));
 }
 
 }  // namespace zifi

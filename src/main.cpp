@@ -26,6 +26,7 @@
 #include "zifi/smb_server.hpp"
 #include "zifi/uart_transport.hpp"
 #include "zifi/vfs_bridge.hpp"
+#include "zifi/wc_update_service.hpp"
 
 // Arduino по умолчанию подтверждает новую OTA-прошивку ещё до setup(). Для
 // настоящего rollback откладываем подтверждение до запуска UART, VFS и второго
@@ -46,6 +47,14 @@ constexpr uint32_t kNetworkStackBytes = 16384;
 constexpr UBaseType_t kNetworkPriority = 2;
 constexpr BaseType_t kNetworkCore = 0;
 constexpr uint32_t kWifiSignalIntervalMs = 2000;
+// Сколько файловый сервер может молчать, прежде чем радио снова начнёт спать.
+constexpr uint32_t kWifiAwakeIdleMs = 10UL * 60UL * 1000UL;
+// Сколько сетевая задача ждёт конца сеанса обновления WC по команде STOP.
+// Задача заканчивает текущий обмен с SD; его пределы — до трёх минут, но
+// плагин дольше не ждёт: следующий запуск всё равно начнётся с перезапуска ESP.
+constexpr uint32_t kWcuStopTimeoutMs = 20000;
+// Событие обновлятора теряться не должно: это строки списка файлов.
+constexpr uint32_t kWcuEventWaitMs = 5000;
 constexpr size_t kWifiSignalBarWidth = 16;
 
 uint8_t wifiSignalPercent(int32_t rssi) {
@@ -168,7 +177,7 @@ struct IntercoreExchange {
 struct IntercoreEvent {
   uint8_t command;
   uint16_t length;
-  uint8_t data[31];
+  uint8_t data[kMaxEventPayload];
 };
 
 static_assert(sizeof(IntercoreExchange) < 3 * 1024,
@@ -185,9 +194,12 @@ class Application {
   static void networkTaskEntry(void* context);
   static bool networkEventEntry(void* context, uint8_t command,
                                  const uint8_t* data, uint16_t length);
+  static bool wcuEventEntry(void* context, uint8_t command,
+                            const uint8_t* data, uint16_t length);
   static bool onlineUpdateProgressEntry(void* context, uint8_t stage,
                                         uint8_t percent);
   void networkTaskLoop();
+  void updateWifiPowerSave(bool fileServerRunning, uint32_t now);
   void processNetworkRequest();
   void processWifiConnect();
   void processWifiIni();
@@ -198,6 +210,10 @@ class Application {
   void processFtpRamStats();
   void processSmbStart();
   void processSmbStop();
+  void processWcuStart();
+  void processWcuApply();
+  void processWcuStop();
+  void processWcuSync();
   void processUpdateStart();
   void processUpdateStop();
   void processOnlineUpdateCheck();
@@ -242,6 +258,7 @@ class Application {
   WeatherService weather_;
   FtpServer ftp_;
   SmbServer smb_;
+  WcUpdateService wcu_;
   OtaServer ota_;
   IntercoreExchange* exchange_;
   QueueHandle_t requestQueue_;
@@ -259,6 +276,11 @@ class Application {
   char activePassword_[64];
   uint8_t proxyStatus_;
   char activeProxy_[64];
+  // Последний обмен с файловым сервером: событие клиента FTP/SMB. Пишут SMB-
+  // задача и сетевая задача, читает сетевая — обе на ядре 0.
+  volatile uint32_t fileActivityMs_;
+  bool fileServerWasRunning_;
+  bool wifiAwake_;
   uint8_t configCache_[ConfigStore::kMaxIniSize];
   uint8_t response_[kMaxPayload];
 };
@@ -276,6 +298,7 @@ Application::Application()
       weather_(netClient_),
       ftp_(vfsBridge_, networkEventEntry, this),
       smb_(vfsBridge_, networkEventEntry, this),
+      wcu_(vfsBridge_, wcuEventEntry, this),
       ota_(),
       exchange_(nullptr),
       requestQueue_(nullptr),
@@ -293,6 +316,9 @@ Application::Application()
       activePassword_{},
       proxyStatus_(0),
       activeProxy_{},
+      fileActivityMs_(0),
+      fileServerWasRunning_(false),
+      wifiAwake_(false),
       configCache_{},
       response_{} {}
 
@@ -433,8 +459,60 @@ void Application::networkTaskEntry(void* context) {
 
 bool Application::networkEventEntry(void* context, uint8_t command,
                                      const uint8_t* data, uint16_t length) {
-  return static_cast<Application*>(context)->enqueueNetworkEvent(
-      command, data, length);
+  auto* self = static_cast<Application*>(context);
+  // Клиент подключился, дал команду или идёт передача — это обмен. Шкала Wi-Fi
+  // (kEventWifiSignal) обменом не считается: её шлёт сама прошивка.
+  if (command >= kEventFtpClient && command <= kEventSmbProgress) {
+    self->fileActivityMs_ = millis();
+  }
+  return self->enqueueNetworkEvent(command, data, length);
+}
+
+bool Application::wcuEventEntry(void* context, uint8_t command,
+                                const uint8_t* data, uint16_t length) {
+  auto* self = static_cast<Application*>(context);
+  self->fileActivityMs_ = millis();
+  if (self->eventQueue_ == nullptr || length > sizeof(IntercoreEvent::data) ||
+      (length != 0 && data == nullptr)) {
+    return false;
+  }
+  IntercoreEvent event{};
+  event.command = command;
+  event.length = length;
+  if (length != 0) {
+    memcpy(event.data, data, length);
+  }
+  // В отличие от индикации FTP/SMB, строки списка терять нельзя: ждём место.
+  return xQueueSend(self->eventQueue_, &event,
+                    pdMS_TO_TICKS(kWcuEventWaitMs)) == pdTRUE;
+}
+
+void Application::updateWifiPowerSave(bool fileServerRunning, uint32_t now) {
+  if (fileServerRunning && !fileServerWasRunning_) {
+    fileActivityMs_ = now;  // запуск сервера — тоже обмен
+  }
+  fileServerWasRunning_ = fileServerRunning;
+  bool awake = false;
+  if (fileServerRunning) {
+    // Обмен — это и событие клиента, и любой файловый запрос к Z80: мост
+    // запоминает время каждой заявки. Длинная передача FTP идёт без команд,
+    // но окна чтения и записи уходят через мост постоянно.
+    uint32_t last = fileActivityMs_;
+    const uint32_t vfs = vfsBridge_.pendingSinceMs();
+    if (static_cast<int32_t>(vfs - last) > 0) {
+      last = vfs;
+    }
+    awake = static_cast<uint32_t>(now - last) < kWifiAwakeIdleMs;
+  }
+  if (awake == wifiAwake_) {
+    return;
+  }
+  // Без энергосбережения радио слушает эфир постоянно: запрос не ждёт маяка
+  // точки доступа, а на занятом эфире ESP не теряет кадры. Цена — больший ток,
+  // поэтому только пока с сервером работают.
+  WiFi.setSleep(!awake);
+  wifiAwake_ = awake;
+  diagnosticLogEvent("NET wifi-power-save=%u", awake ? 0U : 1U);
 }
 
 bool Application::onlineUpdateProgressEntry(void* context, uint8_t stage,
@@ -518,6 +596,7 @@ void Application::networkTaskLoop() {
     } else if (!fileServerRunning) {
       wifiSignalActive = false;
     }
+    updateWifiPowerSave(fileServerRunning || wcu_.running(), signalNow);
 #if ZIFI_DIAGNOSTIC_LOG
     // LittleFS блокирует flash cache. Сохранять журнал можно только когда ни
     // один сетевой файловый сервер и UART/VFS не способны принять работу.
@@ -724,6 +803,12 @@ void Application::processFtpStart() {
     return;
   }
   netClient_.close();
+  // Обновлятор WC — тоже пользователь VFS-моста: пока его задача жива,
+  // FTP запускать нельзя.
+  if (!wcu_.stop(kWcuStopTimeoutMs)) {
+    setNetworkError("ftp:wc update stopping");
+    return;
+  }
   if (!smb_.stop()) {
     setNetworkError("ftp:smb stopping");
     return;
@@ -731,6 +816,7 @@ void Application::processFtpStart() {
   ftp_.stop();
   char error[64] = {};
   uint16_t port = 0;
+  ftp_.setTimezoneHours(config_.timezoneHours());
   const bool started = ftp_.start(exchange_->request, exchange_->requestLength,
                                   port, error, sizeof(error));
   if (started) {
@@ -766,6 +852,10 @@ void Application::processSmbStart() {
   }
   netClient_.close();
   ftp_.stop();
+  if (!wcu_.stop(kWcuStopTimeoutMs)) {
+    setNetworkError("smb:wc update stopping");
+    return;
+  }
   if (!smb_.stop()) {
     setNetworkError("smb:previous stopping");
     return;
@@ -773,6 +863,7 @@ void Application::processSmbStart() {
   char error[64] = {};
   uint16_t port = 0;
   bool netbios = false;
+  smb_.setTimezoneHours(config_.timezoneHours());
   if (!smb_.start(exchange_->request, exchange_->requestLength, port, netbios,
                   error, sizeof(error))) {
     setNetworkError("smb:%s", error);
@@ -790,6 +881,52 @@ void Application::processSmbStop() {
   if (exchange_->response[0] == 0) {
     setNetworkError("smb:stop timeout");
   }
+}
+
+void Application::processWcuStart() {
+  exchange_->responseCommand = kRespWcuStart;
+  exchange_->responseLength = 1;
+  exchange_->response[0] = 0;
+  if (ota_.running()) {
+    setNetworkError("wcu:ota active");
+    return;
+  }
+  netClient_.close();
+  ftp_.stop();
+  if (!smb_.stop() || !wcu_.stop(kWcuStopTimeoutMs)) {
+    setNetworkError("wcu:previous stopping");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    setNetworkError("wcu:no wifi");
+    return;
+  }
+  char error[64] = {};
+  if (!wcu_.start(exchange_->request, exchange_->requestLength, error,
+                  sizeof(error))) {
+    setNetworkError("wcu:%s", error);
+    return;
+  }
+  exchange_->response[0] = 1;
+}
+
+void Application::processWcuApply() {
+  exchange_->responseCommand = kRespWcuApply;
+  exchange_->responseLength = 1;
+  exchange_->response[0] =
+      wcu_.apply(exchange_->request, exchange_->requestLength) ? 1 : 0;
+}
+
+void Application::processWcuStop() {
+  exchange_->responseCommand = kRespWcuStop;
+  exchange_->responseLength = 1;
+  exchange_->response[0] = wcu_.stop(kWcuStopTimeoutMs) ? 1 : 0;
+}
+
+void Application::processWcuSync() {
+  exchange_->responseCommand = kRespWcuSync;
+  exchange_->responseLength = 1;
+  exchange_->response[0] = wcu_.sync() ? 1 : 0;
 }
 
 void Application::processUpdateStart() {
@@ -1110,6 +1247,18 @@ void Application::processNetworkRequest() {
     case kSmbStop:
       processSmbStop();
       break;
+    case kWcuStart:
+      processWcuStart();
+      break;
+    case kWcuApply:
+      processWcuApply();
+      break;
+    case kWcuStop:
+      processWcuStop();
+      break;
+    case kWcuSync:
+      processWcuSync();
+      break;
     case kUpdateStart:
       processUpdateStart();
       break;
@@ -1199,6 +1348,18 @@ void Application::sendNetworkFailure(uint8_t command) {
       break;
     case kSmbStop:
       transport_.send(kRespSmbStop, failed, 1);
+      break;
+    case kWcuStart:
+      transport_.send(kRespWcuStart, failed, 1);
+      break;
+    case kWcuApply:
+      transport_.send(kRespWcuApply, failed, 1);
+      break;
+    case kWcuStop:
+      transport_.send(kRespWcuStop, failed, 1);
+      break;
+    case kWcuSync:
+      transport_.send(kRespWcuSync, failed, 1);
       break;
     case kUpdateStart:
       transport_.send(kRespUpdateStart, failed, 7);
@@ -1375,6 +1536,10 @@ void Application::handle(const PacketView& packet) {
     case kFtpRamStats:
     case kSmbStart:
     case kSmbStop:
+    case kWcuStart:
+    case kWcuApply:
+    case kWcuStop:
+    case kWcuSync:
     case kUpdateStart:
     case kUpdateStop:
     case kOnlineUpdateCheck:
@@ -1419,7 +1584,8 @@ void Application::pollUart() {
   if (transport_.poll(packet)) {
     handle(packet);
   } else {
-    delay(1);
+    // Та же пауза до 1 мс, что прежний delay(1), но заявка моста будит сразу.
+    vfsBridge_.waitForRequest(1);
   }
 }
 
